@@ -30,19 +30,19 @@ vkbd_module/
 
 tools/
   PackageMaker/
-	payload/				  - Your files, organised under the `mnt/` prefix (see below). Not committed — project-specific.
+	payload/				- Your files, organised under the `mnt/` prefix (see below). Not committed — project-specific.
 		mnt/
 			korg/
 				rw/
 		md5sum/
-			md5sum 	  	 - Kronos executable required for validating package md5
+			md5sum 	   		- Kronos executable required for validating package md5
 	build_auto.py 			- auto-builds using default values
 	build_package.py  		- Interactive package builder. Run this to produce a USB package.
-	README.md				 - README on how to use the PackageMaker
-	runPackageBuilder.bat	 - Batch file to run python script automatically
-	sign_package.py		   - Standalone signature generator. Re-sign or verify any package's scripts.
+	README.md				- README on how to use the PackageMaker
+	runPackageBuilder.bat	- Batch file to run python script automatically
+	sign_package.py		   	- Standalone signature generator. Re-sign or verify any package's scripts.
 
-patch_init_offset.py      - fixes struct module init offset mismatch (see below)
+patch_init_offset.py      	- fixes struct module init offset mismatch (see below)
 ```
 
 ---
