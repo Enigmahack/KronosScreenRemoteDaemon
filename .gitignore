@@ -1,0 +1,29 @@
+# Editor / IDE state
+.ferrite/
+.vscode/
+.idea/
+
+# Daemon build output
+build/
+
+# Kernel module build artifacts
+vkbd_module/*.ko
+vkbd_module/*.o
+vkbd_module/*.mod
+vkbd_module/*.mod.c
+vkbd_module/.*.cmd
+vkbd_module/Module.symvers
+vkbd_module/modules.order
+
+# Generated header (produced by Makefile.module via xxd)
+source/vkbd_ko.h
+
+# PackageMaker generated packages and payload binaries
+tools/PackageMaker/dist/
+tools/PackageMaker/payload/mnt/
+tools/PackageMaker/payload/md5sum/
+
+# OS metadata
+.DS_Store
+Thumbs.db
+desktop.ini

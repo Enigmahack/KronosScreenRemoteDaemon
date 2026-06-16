@@ -20,13 +20,13 @@ source/
   screenremote.cfg.example- example config file
   Makefile                - builds the screenremote binary
   palette_data.h          - Kronos display palette table
-  vkbd_ko.h               - generated: embedded vkbd.ko as a C array (do not edit)
+  vkbd_ko.h               - generated: embedded vkbd.ko as a C array (do not edit; not committed)
 
 vkbd_module/
   vkbd.c                  - virtual keyboard kernel module source
   Kbuild                  - kernel build descriptor
   Makefile.module         - builds vkbd.ko, patches it, then generates vkbd_ko.h
-  vkbd.ko                 - pre-built module (committed for convenience)
+  vkbd.ko                 - built by Makefile.module (not committed; generated)
 
 patch_init_offset.py      - fixes struct module init offset mismatch (see below)
 ```
@@ -119,7 +119,7 @@ make -C vkbd_module -f Makefile.module
 
 This runs `make modules` against the 2.6.32.11 kernel tree, runs `patch_init_offset.py` on the resulting `vkbd.ko`, and then uses `xxd -i` to regenerate `source/vkbd_ko.h`.
 
-If you skip this step the pre-built `vkbd.ko` and the committed `vkbd_ko.h` are used.
+Step 1 is required — `vkbd.ko` and `vkbd_ko.h` are not committed and must be built before Step 2.
 
 ### Step 2 - build the daemon
 
