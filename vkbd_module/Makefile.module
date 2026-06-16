@@ -1,0 +1,13 @@
+KDIR   ?= ../linux-2.6.32.11
+PWD    := $(shell pwd)
+PATCH  := ../patch_init_offset.py
+KO_HDR := ../source/vkbd_ko.h
+
+all:
+	$(MAKE) -C $(KDIR) M=$(PWD) modules
+	python3 $(PATCH) vkbd.ko
+	xxd -i vkbd.ko $(KO_HDR)
+
+clean:
+	$(MAKE) -C $(KDIR) M=$(PWD) clean
+	rm -f $(KO_HDR)
