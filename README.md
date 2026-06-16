@@ -1,5 +1,13 @@
 # KronosScreenRemoteDaemon
 
+> **BETA SOFTWARE — USE AT YOUR OWN RISK**
+>
+> This software is provided in beta form and is **not production-ready**. It is distributed **as-is**, without any express or implied warranty of any kind, including but not limited to warranties of merchantability, fitness for a particular purpose, or non-infringement. The authors and contributors make no guarantees regarding stability, correctness, security, or suitability for any use case.
+>
+> **No support is offered or implied.** There is no commitment to fix bugs, respond to issues, or maintain compatibility with any hardware or software version. Use of this software is entirely at your own risk. The authors accept no liability for any damage to hardware, data loss, or any other consequence — direct or indirect — arising from the use or misuse of this software.
+>
+> By using this software you acknowledge that you understand and accept these terms.
+
 A framebuffer streaming daemon and virtual keyboard kernel module for the **Korg Kronos** synthesizer. It streams the Kronos display (`/dev/fb1`, 8bpp 800x600) over TCP, and accepts remote control commands for touch, buttons, the data wheel, and keyboard input injection.
 
 ---
