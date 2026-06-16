@@ -8,7 +8,7 @@ This script patches the .rel.gnu.linkonce.this_module relocation
 entry for init_module from offset 0xbc -> 0xd4 so the kernel
 actually calls init_module when the module is loaded.
 
-Usage: python3 patch_init_offset.py chip_extract.ko
+Usage: python3 patch_init_offset.py path_to_module.ko
 """
 import struct, sys, os
 
@@ -80,7 +80,7 @@ def patch(path):
         if sname == 'init_module':
             print(f"Found init_module relocation at r_offset=0x{r_off:x}")
             if r_off == CORRECT_INIT_OFFSET:
-                print("Already at correct offset 0xd4 — no patch needed.")
+                print("Already at correct offset 0xd4 - no patch needed.")
                 return
             # Zero out the value at the OLD offset in the section data
             # (the compiler put 0 there anyway for a relocation, but be safe)
