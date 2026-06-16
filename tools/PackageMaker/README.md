@@ -206,10 +206,13 @@ fields can be changed freely without re-signing.
 ## Installing on the Korg Kronos
 
 ************ WARNING *****************
-I am not responsible if your Kronos stops booting. 
+
+`I am not responsible if your Kronos stops booting. 
 This is currently BETA, and comes with inherent risk. 
-Use this software at your own risk. 
+Use this software at your own risk. `
+
 ************ WARNING *****************
+
 
 To install the Kronos ScreenRemote daemon (the thing that runs on the Kronos): 
 Extract the zip file. There will be two folders: 
@@ -228,17 +231,24 @@ You should see:
 	pretar.sh
 	ScreenRemoteBETA_version.tar.gz
 
+
 Once those are on the root of the USB stick, put that into the Kronos. (Should be up and running already. If not, boot it up.)
 
 Then, on the Kronos, go to: 
 GLOBAL MODE
 Under the Basic > Basic tab, tap the top-right drop down menu, and select "Update System Software"
-Tap "OK"
+
+<img width="800" height="600" alt="kronos_20260615_135925" src="https://github.com/user-attachments/assets/fc593696-911c-451e-a4b7-44f5b271e3e5" />
+
+Tap "OK" once the USB stick has been inserted. 
+<img width="800" height="600" alt="kronos_20260615_135930" src="https://github.com/user-attachments/assets/ef710fcf-b258-49d9-af1d-3ac3d47fbc44" />
 
 
 It will scan for the updater files.
 Tap OK or "Install" to install the update to the version number mentioned. This does not change your operating system. This installs the ScreenRemote software daemon. 
-
+<img width="800" height="600" alt="kronos_20260615_135940" src="https://github.com/user-attachments/assets/cd348355-646f-46df-8929-0f2399b8311b" />
+<img width="800" height="600" alt="kronos_20260615_135943" src="https://github.com/user-attachments/assets/e2137c2f-9b28-4e70-b090-f1fd9f5b631a" />
+<img width="800" height="600" alt="kronos_20260615_135950" src="https://github.com/user-attachments/assets/55ca1549-32f9-4f0a-878f-637229fd3560" />
 
 You will be asked to reboot. Do that once it is complete. 
 
