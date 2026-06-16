@@ -16,17 +16,31 @@ A framebuffer streaming daemon and virtual keyboard kernel module for the **Korg
 
 ```
 source/
-  screenremote.c          - main daemon source (C99, i686, static)
-  screenremote.cfg.example- example config file
-  Makefile                - builds the screenremote binary
-  palette_data.h          - Kronos display palette table
-  vkbd_ko.h               - generated: embedded vkbd.ko as a C array (do not edit; not committed)
+  screenremote.c          	- main daemon source (C99, i686, static)
+  screenremote.cfg.example	- example config file
+  Makefile                	- builds the screenremote binary
+  palette_data.h          	- Kronos display palette table
+  vkbd_ko.h               	- generated: embedded vkbd.ko as a C array (do not edit; not committed)
 
 vkbd_module/
-  vkbd.c                  - virtual keyboard kernel module source
-  Kbuild                  - kernel build descriptor
-  Makefile.module         - builds vkbd.ko, patches it, then generates vkbd_ko.h
-  vkbd.ko                 - built by Makefile.module (not committed; generated)
+  vkbd.c                  	- virtual keyboard kernel module source
+  Kbuild                  	- kernel build descriptor
+  Makefile.module         	- builds vkbd.ko, patches it, then generates vkbd_ko.h
+  vkbd.ko                 	- built by Makefile.module (not committed; generated)
+
+tools/
+  PackageMaker/
+	payload/				  - Your files, organised under the `mnt/` prefix (see below). Not committed — project-specific.
+		mnt/
+			korg/
+				rw/
+		md5sum/
+			md5sum 	  	 - Kronos executable required for validating package md5
+	build_auto.py 			- auto-builds using default values
+	build_package.py  		- Interactive package builder. Run this to produce a USB package.
+	README.md				 - README on how to use the PackageMaker
+	runPackageBuilder.bat	 - Batch file to run python script automatically
+	sign_package.py		   - Standalone signature generator. Re-sign or verify any package's scripts.
 
 patch_init_offset.py      - fixes struct module init offset mismatch (see below)
 ```
@@ -163,9 +177,9 @@ Copy `source/screenremote.cfg.example` to `/korg/rw/screenremote/screenremote.cf
 
 ## Deployment
 
-1. Copy `build/screenremote` to `/korg/rw/screenremote/screenremote` on the Kronos.
-2. Copy the config file if desired.
-3. The daemon is launched at boot by `kronosmods_init` via `OA.clonos.rc` (rooted) or via `inittab`/`clontab`.
+On a rooted Kronos, files can be SCP'd directly to `/korg/rw/screenremote`, however the recommended path is still to generate a package using the `Package Maker` under the `tools` directory, and install via USB + Kronos installer. 
+
+Review the Package Maker readme for more detailed instructions.
 
 An access log is written to `/korg/rw/screenremote/access.log`.
 
