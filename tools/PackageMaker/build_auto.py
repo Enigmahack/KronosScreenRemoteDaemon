@@ -36,7 +36,7 @@ _build_tarball(payload_dir, tarball_path, extra_files)
 tarball_md5  = _md5_file(tarball_path)
 
 pretar_text  = _make_pretar(tarball_name, tarball_md5, pkg_name)
-posttar_text = _make_posttar(pkg_name, install_cmds, True)
+posttar_text = _make_posttar(pkg_name, install_cmds, True, debug_log)
 sig          = _sha1_signature(pretar_text.encode(), posttar_text.encode())
 
 install_info = (

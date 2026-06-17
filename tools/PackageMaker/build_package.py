@@ -368,7 +368,17 @@ def _make_posttar(pkg_name: str, install_cmds: list, boot_hook: bool,
         lines.append("")
 
     lines += [
+        "sync",
+        "echo 'set 0' > /proc/OmapNKS4ProgressBar",
+        "_p=10",
+        "for _i in 1 2 3 4 5 6 7 8 9 10; do",
+        "    echo \"set $_p\" > /proc/OmapNKS4ProgressBar",
+        "    sleep 1",
+        "    _p=$(( _p + 9 ))",
+        "done",
         "echo 'set 100' > /proc/OmapNKS4ProgressBar",
+        "",
+        "exit 0",
         "",
     ]
     return "\n".join(lines)
@@ -464,7 +474,17 @@ def _make_uninstall_posttar(pkg_name: str, installed_files: list,
             lines.append("")
 
     lines += [
+        "sync",
+        "echo 'set 0' > /proc/OmapNKS4ProgressBar",
+        "_p=10",
+        "for _i in 1 2 3 4 5 6 7 8 9 10; do",
+        "    echo \"set $_p\" > /proc/OmapNKS4ProgressBar",
+        "    sleep 1",
+        "    _p=$(( _p + 9 ))",
+        "done",
         "echo 'set 100' > /proc/OmapNKS4ProgressBar",
+        "",
+        "exit 0",
         "",
     ]
     return "\n".join(lines)
