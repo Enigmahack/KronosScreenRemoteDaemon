@@ -6,7 +6,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from build_package import (
     _make_kronosmods_init, _make_kronos_init, _make_pretar, _make_posttar,
     _sha1_signature, _md5_file, _build_tarball, _build_uninstaller,
-    _auto_detect_commands, _MD5SUM_PAYLOAD_REL,
+    _auto_detect_commands, _MD5SUM_PAYLOAD_REL, _DISPLAY_MSG_PAYLOAD_REL,
 )
 
 pkg_name    = "ScreenRemote"
@@ -55,12 +55,17 @@ install_info = (
 md5sum_src = payload_dir.joinpath(*_MD5SUM_PAYLOAD_REL)
 shutil.copy2(md5sum_src, out_dir / "md5sum")
 
+display_msg_src = payload_dir.joinpath(*_DISPLAY_MSG_PAYLOAD_REL)
+if display_msg_src.is_file():
+    shutil.copy2(display_msg_src, out_dir / "DisplayUpdaterMessage")
+
 installed_files = [
     "/korg/rw/screenremote/screenremote",
     "/korg/rw/kronosmods_init",
     "/korg/kronos_init",
 ]
-_build_uninstaller(pkg_name, version, installed_files, True, uninstall_cmds, md5sum_src)
+_build_uninstaller(pkg_name, version, installed_files, True, uninstall_cmds,
+                   md5sum_src, display_msg_src)
 
 print("Signature: {}".format(sig))
 print("Built: dist/{}/".format(pkg_id))

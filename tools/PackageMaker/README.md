@@ -25,8 +25,12 @@ Python 3.6 or later. No third-party packages — standard library only.
 
 ### 1. Organise your payload
 
-Files must be placed under a `mnt/` prefix that maps to the Kronos filesystem root
-This example uses the KSCR daemon (Kronos Screen Remote)
+Files must be placed under a `mnt/` prefix that maps 1:1 to the Kronos filesystem
+root. **The payload directory structure IS the install structure** — every path under
+`payload/mnt/` is extracted verbatim to the Kronos filesystem. The auto-detected
+boot command will execute the exact path where you placed the binary.
+
+This example uses the KSCR daemon (Kronos Screen Remote):
 
 ```
 payload/
@@ -34,10 +38,19 @@ payload/
     korg/
       rw/
         screenremote/
-          screenremote        ← your binary
+          screenremote        ← binary at /korg/rw/screenremote/screenremote
         mymodule/
-          mymodule.ko         ← kernel module
+          mymodule.ko         ← module at /korg/rw/mymodule/mymodule.ko
 ```
+
+The boot command generated for the above layout would be
+`/korg/rw/screenremote/screenremote &`. If you placed the binary directly at
+`payload/mnt/korg/rw/screenremote` instead (no subdirectory), the boot command
+would be `/korg/rw/screenremote &` — which would fail if a directory of the same
+name already exists on the Kronos from a previous install.
+
+**Put each executable in its own subdirectory** under `/korg/rw/` to avoid name
+collisions with directories and to keep `/korg/rw/` clean.
 
 **Only `/korg/rw/` survives Korg OS updates.** Do not install to `/etc/`, `/usr/`, or
 anywhere else — those paths are wiped on every official Korg firmware update.
@@ -133,12 +146,13 @@ so normal Kronos startup continues unmodified.
 **Gotcha:** `grub.conf` is reset on every official Korg OS update. Re-run the USB
 package after any firmware update to restore the hook.
 
-### Scenario 2 — Root-hacked Kronos (OA.clonos.rc present)
+### Scenario 2 — Root-hacked Kronos (/bin/busybox present)
 
-**Detected by:** both `/etc/OA.clonos.rc` **and** `/etc/clontab` exist.
-`OA.clonos.rc` alone is not sufficient — it can be a ghost left behind after a
-Korg firmware reinstall wipes `clontab`. Without `clontab`, `OA.clonos.rc` is
-never invoked at boot, so injecting into it would have no effect.
+**Detected by:** `/bin/busybox` is executable **and** both `/etc/OA.clonos.rc`
+and `/etc/clontab` exist. `/bin/busybox` is the definitive indicator — the
+root-hack replaces `/bin/init` with a busybox symlink. `OA.clonos.rc` and
+`clontab` can exist as ghost files on a non-rooted Kronos after a Korg firmware
+reinstall, so checking them alone would inject into a dead script.
 
 `posttar.sh` injects a call to `/korg/rw/kronosmods_init` into `OA.clonos.rc`
 immediately after the `STATUS=$?` line (i.e. after `loadoa` returns).
@@ -277,6 +291,14 @@ extraction. The builder reads it from `<payload_dir>/md5sum/md5sum` and copies i
 to the USB root automatically. If it is absent, the builder warns and `pretar.sh`
 will fail the checksum check, calling `kill -9` on UpdateOS and aborting the
 install. Place a Kronos-compatible i386 `md5sum` ELF at that path before building.
+
+### Executable placed directly under `mnt/korg/rw/` without a subdirectory
+If a binary named `screenremote` is placed at `payload/mnt/korg/rw/screenremote`
+(no subdirectory), the boot command will be `/korg/rw/screenremote &`. If a
+*directory* named `screenremote` already exists at `/korg/rw/screenremote/` on
+the Kronos (from a previous install with a different layout), the shell will
+report `is a directory` and the daemon will not start. Always place executables
+in their own subdirectory: `payload/mnt/korg/rw/screenremote/screenremote`.
 
 ### Payload files outside `mnt/korg/rw/`
 Files installed to `/etc/`, `/usr/`, `/bin/`, or anywhere else on the root

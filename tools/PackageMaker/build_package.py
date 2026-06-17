@@ -35,10 +35,12 @@ Scenario 1 -- Factory (non-rooted) Kronos, standard grub.conf:
     NOTE: Korg OS updates reset grub.conf.  Re-run this USB package after
     any official firmware update to restore the grub hook.
 
-Scenario 2 -- Root-hacked Kronos (OA.clonos.rc AND clontab present):
+Scenario 2 -- Root-hacked Kronos (/bin/busybox + OA.clonos.rc + clontab):
     posttar.sh injects a call to /korg/rw/kronosmods_init into OA.clonos.rc
     after the STATUS=$? line (i.e. after loadoa returns).  Clontab parallel
     entries can disrupt loadoa on the RTAI kernel; injection here is safe.
+    /bin/busybox is the definitive root-hack indicator -- OA.clonos.rc and
+    clontab can exist as ghost files on a non-rooted Kronos.
 
 Scenario 3 -- Non-rooted Kronos with customised grub.conf:
     grub.conf exists but isn't factory-state (more than one entry, non-zero
@@ -87,6 +89,15 @@ UPDATER_SCRIPTS_KEY = bytes.fromhex("13d0afefe03c9b92162faeff775355e1")
 # Must be an i386 Linux ELF compatible with the Kronos (Linux 2.6.32.11, x86).
 # Place it at:  <payload_dir>/md5sum/md5sum
 _MD5SUM_PAYLOAD_REL = ("md5sum", "md5sum")
+
+# DisplayUpdaterMessage binary -- controls Kronos display text and palette mode
+# during the UpdateOS install process.  Without it, no status messages appear and
+# OmapNKS4ProgressBar writes are invisible (requires SetDefaultPalette first).
+# Place it at:  <payload_dir>/DisplayUpdaterMessage/DisplayUpdaterMessage
+_DISPLAY_MSG_PAYLOAD_REL = ("DisplayUpdaterMessage", "DisplayUpdaterMessage")
+
+# Shorthand used in generated shell scripts.
+_DUM = "/mnt/updaterSource/DisplayUpdaterMessage"
 
 # UpdateOS accepts any VERSION string — it only checks the field is present and
 # does not compare it against the running firmware.  Kept here for reference only;
@@ -194,14 +205,19 @@ def _make_pretar(tarball_name: str, tarball_md5: str, pkg_name: str) -> str:
         "#!/bin/sh",
         f"# pretar.sh -- {pkg_name}",
         "",
-        "echo 'Verifying install media...' > /tmp/installer_status",
+        "echo 'Verifying installer files...' > /tmp/installer_status",
+        f"{_DUM} 'Verifying installer files...' 2>/dev/null",
         "",
         "# Abort if tarball is corrupted",
         "checksum=`/mnt/updaterSource/md5sum \"/mnt/updaterSource/" + tarball_name
         + "\" | awk '{ print $1; }'`",
         "if [ \"" + tarball_md5 + "\" != \"$checksum\" ]; then",
+        "    echo 'Checksum Error! Update failed, please restart the system.' > /tmp/installer_status",
+        f"    {_DUM} 'Checksum Error! Update failed, please restart the system.' 2>/dev/null",
         "    kill -9 $(/sbin/pidof UpdateOS)",
         "fi",
+        "",
+        f"{_DUM} 'SetTextPalette' 2>/dev/null",
         "",
         "# UpdateOS requires this directory to exist before extraction",
         "if [ ! -e /mnt/updaterSource/mnt ]; then",
@@ -250,15 +266,16 @@ def _make_posttar(pkg_name: str, install_cmds: list, boot_hook: bool,
         lines += [
             "chmod 755 /korg/rw/kronosmods_init /korg/kronos_init 2>/dev/null || true",
             "",
-            "# -- Scenario 2: inject into OA.clonos.rc if root-hack files are present -------",
-            "# Both OA.clonos.rc AND clontab must exist.  OA.clonos.rc alone can be a ghost",
-            "# left by a prior root-hack after a Korg firmware reinstall -- clontab is the",
-            "# actual caller (via /bin/init), so without it OA.clonos.rc is never invoked.",
+            "# -- Scenario 2: inject into OA.clonos.rc if root-hack is actually active ------",
+            "# /bin/busybox is the definitive indicator: the root-hack replaces /bin/init with",
+            "# a busybox symlink.  OA.clonos.rc and clontab can exist as ghost files on a",
+            "# non-rooted Kronos after a Korg firmware reinstall -- checking them alone would",
+            "# inject into a dead script.  All three must be present.",
             "# NOTE: even when Scenario 2 fires we still check grub.conf below, because a",
             "# Korg firmware update resets grub.conf to factory state (no init=/bin/init),",
             "# leaving the root-hack files present but inactive via GRUB.",
-            "if [ -f /etc/OA.clonos.rc ] && [ -f /etc/clontab ]; then",
-            *_diag("posttar: root-hack files present (OA.clonos.rc + clontab) - injecting"),
+            "if [ -x /bin/busybox ] && [ -f /etc/OA.clonos.rc ] && [ -f /etc/clontab ]; then",
+            *_diag("posttar: root-hack confirmed (busybox + OA.clonos.rc + clontab) - injecting"),
             "    if ! grep -q 'kronosmods' /etc/OA.clonos.rc; then",
             "        awk '/^STATUS=/{print; print \"/korg/rw/kronosmods_init\"; next}1' \\",
             "            /etc/OA.clonos.rc > /tmp/_rc_new \\",
@@ -368,6 +385,9 @@ def _make_posttar(pkg_name: str, install_cmds: list, boot_hook: bool,
         lines.append("")
 
     lines += [
+        "echo 'Verifying installation...' > /tmp/installer_status",
+        f"{_DUM} 'Verifying installation...' 2>/dev/null",
+        f"{_DUM} 'SetDefaultPalette' 2>/dev/null",
         "sync",
         "echo 'set 0' > /proc/OmapNKS4ProgressBar",
         "_p=10",
@@ -377,6 +397,7 @@ def _make_posttar(pkg_name: str, install_cmds: list, boot_hook: bool,
         "    _p=$(( _p + 9 ))",
         "done",
         "echo 'set 100' > /proc/OmapNKS4ProgressBar",
+        f"{_DUM} 'SetTextPalette' 2>/dev/null",
         "",
         "exit 0",
         "",
@@ -401,7 +422,7 @@ def _make_uninstall_posttar(pkg_name: str, installed_files: list,
         lines += [
             "# -- Remove boot hook (mirrors the three install scenarios) -------------------",
             "",
-            "if [ -f /etc/OA.clonos.rc ] && [ -f /etc/clontab ]; then",
+            "if [ -x /bin/busybox ] && [ -f /etc/OA.clonos.rc ] && [ -f /etc/clontab ]; then",
             "    # Scenario 2: remove injection from OA.clonos.rc",
             "    awk '!/kronosmods/' /etc/OA.clonos.rc > /tmp/_rc_new \\",
             "        && mv /tmp/_rc_new /etc/OA.clonos.rc",
@@ -474,6 +495,9 @@ def _make_uninstall_posttar(pkg_name: str, installed_files: list,
             lines.append("")
 
     lines += [
+        "echo 'Verifying uninstall...' > /tmp/installer_status",
+        f"{_DUM} 'Verifying uninstall...' 2>/dev/null",
+        f"{_DUM} 'SetDefaultPalette' 2>/dev/null",
         "sync",
         "echo 'set 0' > /proc/OmapNKS4ProgressBar",
         "_p=10",
@@ -483,6 +507,7 @@ def _make_uninstall_posttar(pkg_name: str, installed_files: list,
         "    _p=$(( _p + 9 ))",
         "done",
         "echo 'set 100' > /proc/OmapNKS4ProgressBar",
+        f"{_DUM} 'SetTextPalette' 2>/dev/null",
         "",
         "exit 0",
         "",
@@ -492,7 +517,8 @@ def _make_uninstall_posttar(pkg_name: str, installed_files: list,
 
 def _build_uninstaller(pkg_name: str, version: str, installed_files: list,
                        boot_hook: bool, uninstall_cmds: list,
-                       md5sum_src: Path = None) -> Path:
+                       md5sum_src: Path = None,
+                       display_msg_src: Path = None) -> Path:
     upkg_id       = f"{pkg_name.replace(' ', '_').replace('/', '_')}_{version.replace('.', '_')}_Uninstall"
     utarball_name = f"{upkg_id}.tar.gz"
     uout_dir      = Path(__file__).parent / "dist" / upkg_id
@@ -523,6 +549,8 @@ def _build_uninstaller(pkg_name: str, version: str, installed_files: list,
 
     if md5sum_src and md5sum_src.is_file():
         shutil.copy2(md5sum_src, uout_dir / "md5sum")
+    if display_msg_src and display_msg_src.is_file():
+        shutil.copy2(display_msg_src, uout_dir / "DisplayUpdaterMessage")
 
     print(f"  Uninstaller: {uout_dir}/  (sig: {usig[:16]}...)")
     return uout_dir
@@ -674,7 +702,8 @@ def main() -> None:
 
     version = _prompt("Version", "1.0.0")
 
-    payload_str = _prompt("Payload directory (files organised under mnt/ prefix)")
+    default_payload = str(Path(__file__).parent / "payload")
+    payload_str = _prompt("Payload directory (files organised under mnt/ prefix)", default_payload)
     payload_dir = Path(payload_str)
     if not payload_dir.is_dir():
         sys.exit(f"Error: '{payload_dir}' is not a directory.")
@@ -759,6 +788,14 @@ def main() -> None:
         print(f"  WARNING: md5sum binary not found at payload/{'/'.join(_MD5SUM_PAYLOAD_REL)}")
         print(f"           pretar.sh will fail on install -- place the i386 Linux md5sum there.")
 
+    display_msg_src = payload_dir.joinpath(*_DISPLAY_MSG_PAYLOAD_REL)
+    if display_msg_src.is_file():
+        shutil.copy2(display_msg_src, out_dir / "DisplayUpdaterMessage")
+        print(f"  DisplayUpdaterMessage: copied from payload/{'/'.join(_DISPLAY_MSG_PAYLOAD_REL)}")
+    else:
+        print(f"  WARNING: DisplayUpdaterMessage binary not found at payload/{'/'.join(_DISPLAY_MSG_PAYLOAD_REL)}")
+        print(f"           Install will work but display no status text or progress bar.")
+
     installed_files: list = []
     for root, _, files in os.walk(payload_dir):
         for fname in files:
@@ -771,7 +808,8 @@ def main() -> None:
         installed_files.append("/korg/kronos_init")
 
     print("\nBuilding uninstaller ...")
-    _build_uninstaller(pkg_name, version, installed_files, boot_hook, uninstall_cmds, md5sum_src)
+    _build_uninstaller(pkg_name, version, installed_files, boot_hook, uninstall_cmds,
+                       md5sum_src, display_msg_src)
 
     print()
     print("=" * 52)
@@ -790,7 +828,7 @@ def main() -> None:
         print("Boot hook (auto-detected at install time on the Kronos):")
         print("  Scenario 1 -- factory grub.conf (1 entry, default=0, no init=)")
         print("    -> appends  init=/korg/kronos_init  to the kernel line")
-        print("  Scenario 2 -- root-hacked Kronos (OA.clonos.rc + clontab both present)")
+        print("  Scenario 2 -- root-hacked Kronos (/bin/busybox + OA.clonos.rc + clontab)")
         print("    -> injects kronosmods_init call into OA.clonos.rc after loadoa")
         print("  Scenario 3 -- non-rooted Kronos with custom grub.conf")
         print(f"    -> adds new '{GRUB_ENTRY_TITLE}' entry (copy of default + init=)")
