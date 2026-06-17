@@ -518,7 +518,7 @@ Response: VER=<version> BUILD=<build_id>\n
 Example:
 
 ```
-VER=1.5.3 BUILD=20240901-1.5.3\n
+VER=1.5.4 BUILD=20240901-1.5.4\n
 ```
 
 `BUILD` is set at compile time from the date and version string.

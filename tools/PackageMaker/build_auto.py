@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One-shot build script -- reads version from first argument (default 1.5.5)."""
+"""One-shot build script -- reads version from first argument (default 1.5.4)."""
 import sys, shutil
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
@@ -11,7 +11,7 @@ from build_package import (
 
 pkg_name    = "ScreenRemote"
 pkg_name_id = "ScreenRemote"
-version     = sys.argv[1] if len(sys.argv) > 1 else "1.5.5"
+version     = sys.argv[1] if len(sys.argv) > 1 else "1.5.4"
 debug_log   = "/korg/rw/HD/ScreenRemote/kronosmods_boot.log"
 payload_dir = Path(__file__).parent / "payload"
 

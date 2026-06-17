@@ -73,7 +73,7 @@
 #define KBD_EV_KEY  1
 
 /* ── Version ─────────────────────────────────────────────────── */
-#define SCREENREMOTE_VERSION "1.5.3"
+#define SCREENREMOTE_VERSION "1.5.4"
 #ifndef BUILD_ID
 #define BUILD_ID "dev"
 #endif
@@ -237,6 +237,10 @@ static const struct btn_def btn_table[] = {
 /* IP (network byte order) of the current stream client. Only that host is
  * allowed to send control commands. 0 = no stream client yet → allow any. */
 static uint32_t g_ctrl_allowed_ip = 0;
+
+/* Currently bound listen address (network byte order). Tracked so we can
+ * detect IP changes and rebind the stream/ctrl listeners. */
+static uint32_t g_bound_ip = INADDR_ANY;
 
 /* ── Persistent control connection ──────────────────────────── */
 static int  ctrl_fd     = -1;   /* accepted persistent ctrl socket, -1 if none */
@@ -1841,6 +1845,7 @@ int main(void)
                     g_stream_port, g_ctrl_port, CFG_PATH);
             return 1;
         }
+        g_bound_ip = lan_ip;
         if (lan_ip != INADDR_ANY) {
             struct in_addr ia; ia.s_addr = lan_ip;
             fprintf(stderr, "screenremote: bound to %s\n", inet_ntoa(ia));
@@ -1864,9 +1869,41 @@ int main(void)
             last_mirror_chk = now;
         }
 
-        /* Periodic network check — re-bind if link came back after going down */
+        /* Periodic network check — re-bind if IP changed (DHCP, link down/up) */
         if (now - last_net_chk >= 10) {
             last_net_chk = now;
+            uint32_t cur_ip = find_lan_ip();
+            if (cur_ip != g_bound_ip) {
+                if (client_fd >= 0) { close(client_fd); client_fd = -1; }
+                if (ctrl_fd  >= 0) { close(ctrl_fd);  ctrl_fd = -1; ctrl_lb_n = 0; }
+                shadow_valid      = 0;
+                g_ctrl_allowed_ip = 0;
+                g_si_prev_valid   = 0;
+
+                if (stream_listen >= 0) { close(stream_listen); stream_listen = -1; }
+                if (ctrl_listen   >= 0) { close(ctrl_listen);   ctrl_listen   = -1; }
+
+                if (cur_ip == INADDR_ANY) {
+                    g_bound_ip = INADDR_ANY;
+                    fprintf(stderr, "screenremote: network down, listeners closed\n");
+                } else {
+                    struct in_addr dbg;
+                    dbg.s_addr = cur_ip;
+                    fprintf(stderr, "screenremote: IP changed → %s, rebinding\n",
+                            inet_ntoa(dbg));
+                    stream_listen = make_listen(g_stream_port, cur_ip);
+                    ctrl_listen   = make_listen(g_ctrl_port,   cur_ip);
+                    if (stream_listen >= 0 && ctrl_listen >= 0) {
+                        g_bound_ip = cur_ip;
+                        fprintf(stderr, "screenremote: rebound to %s\n", inet_ntoa(dbg));
+                    } else {
+                        if (stream_listen >= 0) { close(stream_listen); stream_listen = -1; }
+                        if (ctrl_listen   >= 0) { close(ctrl_listen);   ctrl_listen   = -1; }
+                        g_bound_ip = INADDR_ANY;
+                        fprintf(stderr, "screenremote: rebind failed, retry next tick\n");
+                    }
+                }
+            }
         }
 
         /* Mirror update (screensaver blanks fb0 after idle timeout) */
@@ -1930,11 +1967,17 @@ int main(void)
             }
         }
 
-        /* Build select set */
+        /* Build select set — listeners may be -1 during rebind */
         FD_ZERO(&rfds);
-        FD_SET(stream_listen, &rfds);
-        FD_SET(ctrl_listen,   &rfds);
-        maxfd = stream_listen > ctrl_listen ? stream_listen : ctrl_listen;
+        maxfd = -1;
+        if (stream_listen >= 0) {
+            FD_SET(stream_listen, &rfds);
+            if (stream_listen > maxfd) maxfd = stream_listen;
+        }
+        if (ctrl_listen >= 0) {
+            FD_SET(ctrl_listen, &rfds);
+            if (ctrl_listen > maxfd) maxfd = ctrl_listen;
+        }
         if (disc_fd >= 0) {
             FD_SET(disc_fd, &rfds);
             if (disc_fd > maxfd) maxfd = disc_fd;
@@ -1971,11 +2014,12 @@ int main(void)
             tv.tv_usec = 0;
         }
 
+        if (maxfd < 0) { usleep(500000); continue; }
         r = select(maxfd + 1, &rfds, NULL, NULL, &tv);
         if (r < 0) continue;
 
         /* New streaming client */
-        if (FD_ISSET(stream_listen, &rfds)) {
+        if (stream_listen >= 0 && FD_ISSET(stream_listen, &rfds)) {
             struct timeval send_to = {5, 0};
             struct sockaddr_in peer;
             socklen_t plen = sizeof(peer);
@@ -2024,7 +2068,7 @@ int main(void)
 
         /* Control command — only accept from the stream client's IP (or any if no
          * stream client has ever connected yet). */
-        if (FD_ISSET(ctrl_listen, &rfds)) {
+        if (ctrl_listen >= 0 && FD_ISSET(ctrl_listen, &rfds)) {
             struct sockaddr_in cpeer;
             socklen_t cplen = sizeof(cpeer);
             int cfd = accept(ctrl_listen, (struct sockaddr *)&cpeer, &cplen);
@@ -2120,8 +2164,8 @@ int main(void)
     /* Clean shutdown: clear fb0 so fbcon can resume, close sockets. */
     if (client_fd >= 0) close(client_fd);
     if (ctrl_fd   >= 0) close(ctrl_fd);
-    close(stream_listen);
-    close(ctrl_listen);
+    if (stream_listen >= 0) close(stream_listen);
+    if (ctrl_listen   >= 0) close(ctrl_listen);
     if (disc_fd >= 0) close(disc_fd);
     if (touch_fd >= 0) { close(touch_fd); touch_fd = -1; }
     if (vkbd_fd  >= 0) { close(vkbd_fd);  vkbd_fd  = -1; }
