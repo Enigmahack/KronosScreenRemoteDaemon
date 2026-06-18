@@ -77,7 +77,7 @@
 #define KBD_EV_KEY  1
 
 /* ── Version ─────────────────────────────────────────────────── */
-#define SCREENREMOTE_VERSION "1.6.0"
+#define SCREENREMOTE_VERSION "1.6.1"
 #ifndef BUILD_ID
 #define BUILD_ID "dev"
 #endif
@@ -1545,18 +1545,39 @@ static void process_ctrl_cmd(const char *line, int fd)
         }
 
     } else if (strncmp(line, "CHORD ", 6) == 0) {
-        char n1[16] = {0}, n2[16] = {0};
-        if (sscanf(line + 6, "%15s %15s", n1, n2) == 2) {
-            const struct btn_def *b1 = NULL, *b2 = NULL, *b;
+        char names[8][16];
+        const struct btn_def *btns[8];
+        int count = 0, hold_ms = 0;
+        const char *p = line + 6;
+        while (*p == ' ') p++;
+        /* Optional leading number = hold duration in ms (max 5000) */
+        if (*p >= '0' && *p <= '9') {
+            hold_ms = atoi(p);
+            if (hold_ms > 5000) hold_ms = 5000;
+            while (*p && *p != ' ') p++;
+        }
+        while (count < 8) {
+            while (*p == ' ') p++;
+            if (*p == '\0') break;
+            int i = 0;
+            while (*p && *p != ' ' && i < 15) names[count][i++] = *p++;
+            names[count][i] = '\0';
+            btns[count] = NULL;
+            const struct btn_def *b;
             for (b = btn_table; b->name; b++) {
-                if (strcmp(n1, b->name) == 0) b1 = b;
-                if (strcmp(n2, b->name) == 0) b2 = b;
+                if (strcmp(names[count], b->name) == 0) { btns[count] = b; break; }
             }
-            if (b1 && b2) {
-                send_rtf5_event(b1->dev, b1->code, 0x7fu);
-                send_rtf5_event(b2->dev, b2->code, 0x7fu);
-                send_rtf5_event(b2->dev, b2->code, 0x00u);
-                send_rtf5_event(b1->dev, b1->code, 0x00u);
+            count++;
+        }
+        if (count >= 2) {
+            int ok = 1;
+            for (int i = 0; i < count; i++) { if (!btns[i]) { ok = 0; break; } }
+            if (ok) {
+                for (int i = 0; i < count; i++)
+                    send_rtf5_event(btns[i]->dev, btns[i]->code, 0x7fu);
+                if (hold_ms > 0) usleep(hold_ms * 1000);
+                for (int i = count - 1; i >= 0; i--)
+                    send_rtf5_event(btns[i]->dev, btns[i]->code, 0x00u);
                 REPLY("OK\n", 3);
             } else {
                 REPLY("ERR\n", 4);

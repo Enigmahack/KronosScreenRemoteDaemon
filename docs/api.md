@@ -386,20 +386,22 @@ pkt[4] = 0x7f         (press) or 0x00 (release)
 
 ### CHORD
 
-Press two buttons as a chord: press the first, press the second, release the second, release the first.
+Press two or more buttons as a chord: buttons are pressed left-to-right, then released right-to-left, so all buttons are held simultaneously at the midpoint.
 
 ```
-Request:  CHORD <name1> <name2>\n
-Response: OK\n  (both buttons found)
-          ERR\n (either button name not recognised)
+Request:  CHORD [<hold_ms>] <name1> <name2> [<name3> ... <name8>]\n
+Response: OK\n  (all buttons found)
+          ERR\n (any button name not recognised)
 ```
 
 | Argument | Type | Description |
 |----------|------|-------------|
+| hold_ms | integer | Optional hold duration in milliseconds (0–5000) before releasing. If omitted, buttons are released immediately after all are pressed. |
 | name1 | string | First button (held down first, released last) |
-| name2 | string | Second button (pressed and released while name1 is held) |
+| name2 | string | Second button |
+| name3..name8 | string | Optional additional buttons (up to 8 total) |
 
-Four `/dev/rtf5` packets are sent in sequence.
+For N buttons, 2×N `/dev/rtf5` packets are sent: N presses in order, then N releases in reverse order. If `hold_ms` is specified, the daemon sleeps that duration between the press and release phases (blocks the main loop for the duration).
 
 ---
 
