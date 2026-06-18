@@ -432,6 +432,63 @@ pkt[3] = 0x00000100   (CW)  or  0x0000FF00 (CCW)
 
 ---
 
+### SLIDER
+
+Set the position of a CC slider or RT knob (1–8).
+
+```
+Request:  SLIDER <n> <value>\n
+Response: OK\n
+          ERR\n (n not 1-8, value not 0-127, or parse failure)
+```
+
+| Argument | Type | Range | Description |
+|----------|------|-------|-------------|
+| n | integer | 1–8 | Controller index (1 = leftmost slider/knob) |
+| value | integer | 0–127 | Absolute position |
+
+The physical effect depends on the active Control Assign page on the Kronos. In RT KNOBS/KARMA mode, `SLIDER n` moves knob n. In a slider-active mode, it moves slider n. In TIMBRE/TRACK mode the raw position event may not be interpreted (that mode uses processed 44-byte parameter packets internally).
+
+#### Wire encoding (internal, `/dev/rtf5`)
+
+```
+pkt[0] = 0x00010014   (fixed header)
+pkt[1] = 0x00000000   (reserved)
+pkt[2] = 0x0000000e   (CC slider/knob device)
+pkt[3] = n - 1        (0-based controller index)
+pkt[4] = value        (0-127)
+```
+
+---
+
+### VSLIDER
+
+Set the value slider position.
+
+```
+Request:  VSLIDER <value>\n
+Response: OK\n
+          ERR\n (value not 0-127 or parse failure)
+```
+
+| Argument | Type | Range | Description |
+|----------|------|-------|-------------|
+| value | integer | 0–127 | Absolute slider position |
+
+The value slider changes the currently selected on-screen parameter proportionally. Moving to 0 sets the parameter minimum; 127 sets the maximum.
+
+#### Wire encoding (internal, `/dev/rtf5`)
+
+```
+pkt[0] = 0x00010014   (fixed header)
+pkt[1] = 0x00000000   (reserved)
+pkt[2] = 0x0000000f   (value slider device)
+pkt[3] = 0x00000009   (value slider code)
+pkt[4] = value        (0-127)
+```
+
+---
+
 ### KEY
 
 Inject a raw Linux key event by keycode.

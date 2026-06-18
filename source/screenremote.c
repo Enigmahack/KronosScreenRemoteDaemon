@@ -23,6 +23,10 @@
  *   BUTTON name            — press + release a named front-panel button (see btn_table[])
  *   CHORD name1 name2      — press name1, press name2, release name2, release name1
  *   WHEEL CW|CCW           — one data-wheel tick clockwise or counter-clockwise
+ *   SLIDER n value         — set CC slider/knob n (1–8) to value (0–127)
+ *                            Effect depends on active Control Assign page:
+ *                            RT KNOBS/KARMA → moves knob n; slider-active → moves slider n
+ *   VSLIDER value          — set value slider position (0–127)
  *   KEY code val           — raw key inject: code 1–511, val 0=release 1=press
  *   REFRESH                — force full-frame resend (clears shadow_valid)
  *   SS_TIMEOUT n           — set screensaver timeout at runtime (seconds; 0 = disable)
@@ -73,7 +77,7 @@
 #define KBD_EV_KEY  1
 
 /* ── Version ─────────────────────────────────────────────────── */
-#define SCREENREMOTE_VERSION "1.5.4"
+#define SCREENREMOTE_VERSION "1.6.0"
 #ifndef BUILD_ID
 #define BUILD_ID "dev"
 #endif
@@ -1218,22 +1222,25 @@ static void inject_key(int code, int val)
     (void)write(kbd_fd, &ev, sizeof(ev));
 }
 
+static void send_rtf5_event(uint32_t dev, uint32_t code, uint32_t value)
+{
+    if (touch_fd < 0)
+        touch_fd = open("/dev/rtf5", O_WRONLY);
+    if (touch_fd >= 0) {
+        uint32_t pkt[5] = { 0x00010014u, 0u, dev, code, value };
+        (void)write(touch_fd, pkt, 20);
+    }
+}
+
 static void inject_touch(int type, int x, int y)
 {
-    /* coord byte[0]=vertical ADC (Y), byte[1]=horizontal ADC (X) */
     if (x < 0) x = 0;
     if (x >= (int)fb_w) x = (int)fb_w - 1;
     if (y < 0) y = 0;
     if (y >= (int)fb_h) y = (int)fb_h - 1;
-    if (touch_fd < 0)
-        touch_fd = open("/dev/rtf5", O_WRONLY);
-    if (touch_fd >= 0) {
-        uint32_t h_adc = 10u + (uint32_t)(x * 236u) / 799u;
-        uint32_t v_adc = 8u  + (uint32_t)(y * 237u) / 599u;
-        uint32_t pkt[5] = { 0x00010014u, 0x00000000u, 0x00000011u,
-                             (uint32_t)type, v_adc | (h_adc << 8u) };
-        (void)write(touch_fd, pkt, 20);
-    }
+    uint32_t h_adc = 10u + (uint32_t)(x * 236u) / 799u;
+    uint32_t v_adc = 8u  + (uint32_t)(y * 237u) / 599u;
+    send_rtf5_event(0x11u, (uint32_t)type, v_adc | (h_adc << 8u));
 }
 
 /* ── Embedded .ko extraction ─────────────────────────────────── */
@@ -1529,27 +1536,15 @@ static void process_ctrl_cmd(const char *line, int fd)
             if (strcmp(bname, b->name) == 0) break;
         }
         if (b->name) {
-            if (touch_fd < 0)
-                touch_fd = open("/dev/rtf5", O_WRONLY);
-            if (touch_fd >= 0) {
-                uint32_t pkt[5];
-                pkt[0] = 0x00010014u;
-                pkt[1] = 0x00000000u;
-                pkt[2] = b->dev;
-                pkt[3] = b->code;
-                pkt[4] = 0x7fu;  /* press */
-                (void)write(touch_fd, pkt, 20);
-                pkt[4] = 0x00u;  /* release */
-                (void)write(touch_fd, pkt, 20);
-            }
-            mode_from_btn(b->dev, b->code);  /* keep g_mode in sync immediately */
+            send_rtf5_event(b->dev, b->code, 0x7fu);
+            send_rtf5_event(b->dev, b->code, 0x00u);
+            mode_from_btn(b->dev, b->code);
             REPLY("OK\n", 3);
         } else {
             REPLY("ERR\n", 4);
         }
 
     } else if (strncmp(line, "CHORD ", 6) == 0) {
-        /* CHORD name1 name2 — press name1, press name2, release name2, release name1 */
         char n1[16] = {0}, n2[16] = {0};
         if (sscanf(line + 6, "%15s %15s", n1, n2) == 2) {
             const struct btn_def *b1 = NULL, *b2 = NULL, *b;
@@ -1558,20 +1553,10 @@ static void process_ctrl_cmd(const char *line, int fd)
                 if (strcmp(n2, b->name) == 0) b2 = b;
             }
             if (b1 && b2) {
-                if (touch_fd < 0)
-                    touch_fd = open("/dev/rtf5", O_WRONLY);
-                if (touch_fd >= 0) {
-                    uint32_t pkt[5];
-                    pkt[0] = 0x00010014u; pkt[1] = 0x00000000u;
-                    pkt[2] = b1->dev; pkt[3] = b1->code; pkt[4] = 0x7fu;
-                    (void)write(touch_fd, pkt, 20);
-                    pkt[2] = b2->dev; pkt[3] = b2->code; pkt[4] = 0x7fu;
-                    (void)write(touch_fd, pkt, 20);
-                    pkt[2] = b2->dev; pkt[3] = b2->code; pkt[4] = 0x00u;
-                    (void)write(touch_fd, pkt, 20);
-                    pkt[2] = b1->dev; pkt[3] = b1->code; pkt[4] = 0x00u;
-                    (void)write(touch_fd, pkt, 20);
-                }
+                send_rtf5_event(b1->dev, b1->code, 0x7fu);
+                send_rtf5_event(b2->dev, b2->code, 0x7fu);
+                send_rtf5_event(b2->dev, b2->code, 0x00u);
+                send_rtf5_event(b1->dev, b1->code, 0x00u);
                 REPLY("OK\n", 3);
             } else {
                 REPLY("ERR\n", 4);
@@ -1597,6 +1582,25 @@ static void process_ctrl_cmd(const char *line, int fd)
             (void)write(touch_fd, pkt, 16);
         }
         REPLY("OK\n", 3);
+
+    } else if (strncmp(line, "SLIDER ", 7) == 0) {
+        int idx = 0, val = 0;
+        if (sscanf(line + 7, "%d %d", &idx, &val) == 2 &&
+                idx >= 1 && idx <= 8 && val >= 0 && val <= 127) {
+            send_rtf5_event(0x0eu, (uint32_t)(idx - 1), (uint32_t)val);
+            REPLY("OK\n", 3);
+        } else {
+            REPLY("ERR\n", 4);
+        }
+
+    } else if (strncmp(line, "VSLIDER ", 8) == 0) {
+        int val = 0;
+        if (sscanf(line + 8, "%d", &val) == 1 && val >= 0 && val <= 127) {
+            send_rtf5_event(0x0fu, 0x09u, (uint32_t)val);
+            REPLY("OK\n", 3);
+        } else {
+            REPLY("ERR\n", 4);
+        }
 
     } else if (strncmp(line, "KEY ", 4) == 0) {
         int code = 0, val = 0;
