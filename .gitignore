@@ -22,6 +22,7 @@ source/vkbd_ko.h
 tools/PackageMaker/dist/
 tools/PackageMaker/payload/mnt/
 tools/PackageMaker/payload/md5sum/
+tools/PackageManager/__pycache__/
 
 # OS metadata
 .DS_Store
