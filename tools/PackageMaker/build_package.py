@@ -35,12 +35,18 @@ Scenario 1 -- Factory (non-rooted) Kronos, standard grub.conf:
     NOTE: Korg OS updates reset grub.conf.  Re-run this USB package after
     any official firmware update to restore the grub hook.
 
-Scenario 2 -- Root-hacked Kronos (/bin/busybox + OA.clonos.rc + clontab):
+Scenario 2 -- Root-hacked Kronos (OA.clonos.rc present):
     posttar.sh injects a call to /korg/rw/kronosmods_init into OA.clonos.rc
-    after the STATUS=$? line (i.e. after loadoa returns).  Clontab parallel
-    entries can disrupt loadoa on the RTAI kernel; injection here is safe.
-    /bin/busybox is the definitive root-hack indicator -- OA.clonos.rc and
-    clontab can exist as ghost files on a non-rooted Kronos.
+    after the STATUS=$? line (i.e. after loadoa returns).  The injection is
+    attempted whenever OA.clonos.rc exists -- even if it is a ghost file on a
+    non-rooted Kronos, the injected line is harmless (never executed unless
+    the root-hack boot chain calls the script).
+
+    Additionally, posttar.sh patches any factory grub.conf kernel lines
+    that lack an init= parameter, adding  init=/korg/kronos_init  to them.
+    This provides a fallback boot path: if the user boots the factory GRUB
+    entry (instead of the root-hack entry), the screenremote still starts
+    via kronos_init.  The root-hack entry (init=/bin/init) is left unchanged.
 
 Scenario 3 -- Non-rooted Kronos with customised grub.conf:
     grub.conf exists but isn't factory-state (more than one entry, non-zero
@@ -162,12 +168,14 @@ def _make_kronos_init(debug_log: str = "") -> str:
     """
     Shell script installed at /korg/kronos_init (root filesystem, sda2).
 
-    Used as the GRUB init= target for scenarios 1 and 3 (non-rooted Kronos).
+    Used as the GRUB init= target for all scenarios (rooted and non-rooted).
     MUST live on sda2 (the root fs) -- /korg/rw (sda6) is not yet mounted when
     the kernel execs the init= target, so pointing init= at /korg/rw/... would
     produce ENOENT and silently fall back to /sbin/init with no error.
 
-    Mounts /korg/rw, delegates to kronosmods_init, then exec-chains to /sbin/init.
+    Mounts /korg/rw, delegates to kronosmods_init, then exec-chains to the
+    appropriate init: /bin/init (busybox) on a rooted Kronos to preserve the
+    root-hack boot chain, or /sbin/init on a factory system.
     Boot-diagnostic log (grub.conf snapshot) is written only when debug_log is set.
     """
     import posixpath
@@ -194,6 +202,10 @@ def _make_kronos_init(debug_log: str = "") -> str:
         "[ -x /korg/rw/kronosmods_init ] && /korg/rw/kronosmods_init",
         "",
         "# Hand off to the real init (this process becomes PID 1).",
+        "# On a rooted Kronos, /bin/init is the root-hack's busybox init.",
+        "if [ -x /bin/init ]; then",
+        "    exec /bin/init \"$@\"",
+        "fi",
         "exec /sbin/init \"$@\"",
         "",
     ]
@@ -266,16 +278,15 @@ def _make_posttar(pkg_name: str, install_cmds: list, boot_hook: bool,
         lines += [
             "chmod 755 /korg/rw/kronosmods_init /korg/kronos_init 2>/dev/null || true",
             "",
-            "# -- Scenario 2: inject into OA.clonos.rc if root-hack is actually active ------",
-            "# /bin/busybox is the definitive indicator: the root-hack replaces /bin/init with",
-            "# a busybox symlink.  OA.clonos.rc and clontab can exist as ghost files on a",
-            "# non-rooted Kronos after a Korg firmware reinstall -- checking them alone would",
-            "# inject into a dead script.  All three must be present.",
-            "# NOTE: even when Scenario 2 fires we still check grub.conf below, because a",
-            "# Korg firmware update resets grub.conf to factory state (no init=/bin/init),",
-            "# leaving the root-hack files present but inactive via GRUB.",
-            "if [ -x /bin/busybox ] && [ -f /etc/OA.clonos.rc ] && [ -f /etc/clontab ]; then",
-            *_diag("posttar: root-hack confirmed (busybox + OA.clonos.rc + clontab) - injecting"),
+            "# -- Scenario 2: inject into OA.clonos.rc if present --------------------------",
+            "# OA.clonos.rc may exist as a ghost file on a non-rooted Kronos after a firmware",
+            "# reinstall -- injecting into it is harmless (the line never runs unless the",
+            "# root-hack boot chain calls it).  We inject unconditionally so that all",
+            "# root-hack variants are covered regardless of /bin/busybox location.",
+            "# NOTE: we still check grub.conf below, because a Korg firmware update resets",
+            "# grub.conf to factory state, leaving root-hack files present but inactive.",
+            "if [ -f /etc/OA.clonos.rc ]; then",
+            *_diag("posttar: OA.clonos.rc found - injecting kronosmods_init"),
             "    if ! grep -q 'kronosmods' /etc/OA.clonos.rc; then",
             "        awk '/^STATUS=/{print; print \"/korg/rw/kronosmods_init\"; next}1' \\",
             "            /etc/OA.clonos.rc > /tmp/_rc_new \\",
@@ -285,12 +296,12 @@ def _make_posttar(pkg_name: str, install_cmds: list, boot_hook: bool,
             "    fi",
             "fi",
             "",
-            "# -- Scenarios 1, 2 (ghost-grub), 3: mount sda1 and check/patch grub.conf -----",
+            "# -- Scenarios 1, 2, 3: mount sda1 and check/patch grub.conf --------------------",
             "# /boot (sda1) is never mounted when UpdateOS runs -- always mount it.",
-            "# Skip patching only if the active default entry already uses the root-hack init",
-            "# (init=/bin/init), meaning the root-hack GRUB entry is live and OA.clonos.rc",
-            "# will be called at boot.  In all other cases (factory GRUB, ghost-rooted where",
-            "# a Korg update reset grub.conf) we add init=/korg/kronos_init.",
+            "# If the active default entry uses the root-hack init (init=/bin/init),",
+            "# patch only the factory kernel lines (those without init=) as a fallback.",
+            "# Otherwise (factory GRUB, ghost-rooted after Korg update) patch normally",
+            "# via scenario 1 or 3.",
             "_boot_mounted=0",
             "if mount -t vfat /dev/sda1 /boot 2>/dev/null; then",
             "    _boot_mounted=1",
@@ -309,8 +320,30 @@ def _make_posttar(pkg_name: str, install_cmds: list, boot_hook: bool,
             *_diag("posttar: grub default=$_DF kernel_line=$_KL"),
             "",
             "    if echo \"$_KL\" | grep -q 'init=/bin/init'; then",
-            "        # Root-hack GRUB entry is active -- OA.clonos.rc will be called at boot.",
-            *_diag("posttar: root-hack GRUB active (init=/bin/init) - no grub patch needed"),
+            "        # Root-hack GRUB entry is active -- OA.clonos.rc handles boot.",
+            "        # Patch only factory kernel lines (those without any init=) as fallback.",
+            *_diag("posttar: root-hack GRUB active (init=/bin/init) - patching factory entries only"),
+            *(
+                [
+                    f"        cp /boot/grub/grub.conf {diag_dir}/grub_preinstall.txt 2>/dev/null || true",
+                    "        sync 2>/dev/null",
+                ] if debug_log else []
+            ),
+            "        sed -i 's| init=/korg/rw/kronos_init||g' /boot/grub/grub.conf 2>/dev/null || true",
+            "        if ! grep -q 'init=/korg/kronos_init' /boot/grub/grub.conf; then",
+            "            awk '/^[[:space:]]*kernel /{if(!/init=/)print $0 \" init=/korg/kronos_init\"; else print; next}{print}' \\",
+            "                /boot/grub/grub.conf > /tmp/_grub_new \\",
+            "                && mv /tmp/_grub_new /boot/grub/grub.conf",
+            *_diag("posttar: factory entry patch exit=$?"),
+            "        else",
+            *_diag("posttar: init=/korg/kronos_init already present"),
+            "        fi",
+            *(
+                [
+                    f"        cp /boot/grub/grub.conf {diag_dir}/grub_postinstall.txt 2>/dev/null || true",
+                    "        sync 2>/dev/null",
+                ] if debug_log else []
+            ),
             "",
             "    else",
             "        # Factory GRUB (or ghost-rooted after Korg update) -- patch grub.conf.",
@@ -422,7 +455,7 @@ def _make_uninstall_posttar(pkg_name: str, installed_files: list,
         lines += [
             "# -- Remove boot hook (mirrors the three install scenarios) -------------------",
             "",
-            "if [ -x /bin/busybox ] && [ -f /etc/OA.clonos.rc ] && [ -f /etc/clontab ]; then",
+            "if [ -f /etc/OA.clonos.rc ]; then",
             "    # Scenario 2: remove injection from OA.clonos.rc",
             "    awk '!/kronosmods/' /etc/OA.clonos.rc > /tmp/_rc_new \\",
             "        && mv /tmp/_rc_new /etc/OA.clonos.rc",
@@ -647,7 +680,7 @@ def _auto_detect_commands(payload_dir: Path) -> tuple:
       *.ko anywhere              -> insmod at boot (modules first); rmmod at uninstall
       no extension, anywhere     -> ... & at boot; kill $(pidof ...) at uninstall
 
-    Returns (boot_cmds, uninstall_cmds).
+    Returns (boot_cmds, uninstall_cmds, daemon_paths).
     """
     mods: list    = []   # (kronos_path, module_name)
     daemons: list = []   # (kronos_path, binary_name)
@@ -664,21 +697,22 @@ def _auto_detect_commands(payload_dir: Path) -> tuple:
             if fname.endswith(".ko"):
                 mods.append((kpath, fname[:-3]))
             elif "." not in fname:
-                # No extension → executable binary (covers /bin/foo and /screenremote/foo alike)
                 daemons.append((kpath, fname))
 
     boot_cmds: list    = []
     uninstall_cmds: list = []
+    daemon_paths: list = []
 
     for kpath, modname in sorted(mods):
         boot_cmds.append(f"insmod {kpath} 2>/dev/null || true")
         uninstall_cmds.append(f"rmmod {modname} 2>/dev/null || true")
 
     for kpath, name in sorted(daemons):
-        boot_cmds.append(f"{kpath} &")
+        boot_cmds.append(f"pidof {name} > /dev/null 2>&1 || {kpath} &")
         uninstall_cmds.append(f"kill $(pidof {name}) 2>/dev/null || true")
+        daemon_paths.append(kpath)
 
-    return boot_cmds, uninstall_cmds
+    return boot_cmds, uninstall_cmds, daemon_paths
 
 
 # ---------------------------------------------------------------------------
@@ -711,7 +745,7 @@ def main() -> None:
     _check_payload_licensing(payload_dir)
 
     # Auto-detect boot and uninstall commands from the payload contents.
-    boot_cmds, uninstall_cmds = _auto_detect_commands(payload_dir)
+    boot_cmds, uninstall_cmds, daemon_paths = _auto_detect_commands(payload_dir)
 
     print()
     if boot_cmds:
@@ -737,9 +771,8 @@ def main() -> None:
     # Explicitly chmod executables in posttar.sh so they are runnable even if
     # UpdateOS doesn't preserve tarball mode bits on the target filesystem.
     install_cmds: list = [
-        f"chmod 755 {cmd.strip()[:-2]} 2>/dev/null || true"
-        for cmd in boot_cmds
-        if cmd.strip().endswith(" &")
+        f"chmod 755 {path} 2>/dev/null || true"
+        for path in daemon_paths
     ]
 
     pkg_id       = f"{pkg_name_id}_{version.replace('.', '_')}"

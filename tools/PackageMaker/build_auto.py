@@ -15,10 +15,10 @@ version     = sys.argv[1] if len(sys.argv) > 1 else "1.5.4"
 debug_log   = "/korg/rw/HD/ScreenRemote/kronosmods_boot.log"
 payload_dir = Path(__file__).parent / "payload"
 
-boot_cmds, uninstall_cmds = _auto_detect_commands(payload_dir)
+boot_cmds, uninstall_cmds, daemon_paths = _auto_detect_commands(payload_dir)
 install_cmds = [
-    "chmod 755 {} 2>/dev/null || true".format(cmd.strip()[:-2])
-    for cmd in boot_cmds if cmd.strip().endswith(" &")
+    "chmod 755 {} 2>/dev/null || true".format(path)
+    for path in daemon_paths
 ]
 
 pkg_id       = "{}_{}".format(pkg_name_id, version.replace(".", "_"))
