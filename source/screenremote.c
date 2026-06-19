@@ -77,7 +77,7 @@
 #define KBD_EV_KEY  1
 
 /* ── Version ─────────────────────────────────────────────────── */
-#define SCREENREMOTE_VERSION "1.6.1"
+#define SCREENREMOTE_VERSION "1.6.3"
 #ifndef BUILD_ID
 #define BUILD_ID "dev"
 #endif
@@ -134,6 +134,12 @@ static time_t   ss_last_chg   = 0;   /* last time fb1 pixels changed */
 static time_t   last_ss_chk   = 0;
 static uint8_t  ss_prev[SS_SAMPLE_N];
 static int      ss_prev_valid = 0;
+
+/* ── Touch calibration ──────────────────────────────────────── */
+static int g_touch_x_offset = 10;   /* pixels added to x before ADC scaling      */
+static int g_touch_x_range  = 813;  /* total pixel span → ADC 0-255              */
+static int g_touch_y_offset = 20;   /* pixels added to y before ADC scaling      */
+static int g_touch_y_range  = 638;  /* total pixel span → ADC 0-255              */
 
 /* ── Mode state ─────────────────────────────────────────────── */
 static uint32_t g_mode        = 0;   /* 0=init 1=Setlist 2=Combi 3=Program
@@ -529,6 +535,14 @@ static void read_config(void)
             g_ctrl_port = v;
         else if (sscanf(line, "screensaver_timeout=%d", &v) == 1 && v >= 0)
             g_ss_timeout = v;
+        else if (sscanf(line, "touch_x_offset=%d", &v) == 1)
+            g_touch_x_offset = v;
+        else if (sscanf(line, "touch_x_range=%d", &v) == 1 && v > 0)
+            g_touch_x_range = v;
+        else if (sscanf(line, "touch_y_offset=%d", &v) == 1)
+            g_touch_y_offset = v;
+        else if (sscanf(line, "touch_y_range=%d", &v) == 1 && v > 0)
+            g_touch_y_range = v;
     }
     fclose(f);
     fprintf(stderr, "screenremote: config loaded: stream=%d ctrl=%d\n",
@@ -771,8 +785,14 @@ static void inject_touch(int type, int x, int y)
     if (x >= (int)fb_w) x = (int)fb_w - 1;
     if (y < 0) y = 0;
     if (y >= (int)fb_h) y = (int)fb_h - 1;
-    uint32_t h_adc = 10u + (uint32_t)(x * 236u) / 799u;
-    uint32_t v_adc = 8u  + (uint32_t)(y * 237u) / 599u;
+    int x_range = g_touch_x_range;
+    int y_range = g_touch_y_range;
+    int cx = x + g_touch_x_offset;
+    int cy = y + g_touch_y_offset;
+    uint32_t h_adc = cx <= 0 ? 0u : (cx >= x_range ? 255u
+                   : (uint32_t)(cx * 255 + x_range / 2) / (uint32_t)x_range);
+    uint32_t v_adc = cy <= 0 ? 0u : (cy >= y_range ? 255u
+                   : (uint32_t)(cy * 255 + y_range / 2) / (uint32_t)y_range);
     send_rtf5_event(0x11u, (uint32_t)type, v_adc | (h_adc << 8u));
 }
 

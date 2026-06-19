@@ -27,3 +27,6 @@ tools/PackageMaker/payload/mnt/korg/rw/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Troubleshooting Files
+.rawGrab/
