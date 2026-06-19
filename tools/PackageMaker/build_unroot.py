@@ -172,9 +172,7 @@ def _make_unroot_posttar() -> str:
     return "\n".join(lines)
 
 
-def main() -> None:
-    version = sys.argv[1] if len(sys.argv) > 1 else "1.0.0"
-
+def build(version: str = "1.0.0") -> None:
     print("=" * 52)
     print(f"  {PKG_NAME} Package Builder")
     print("=" * 52)
@@ -251,6 +249,11 @@ def main() -> None:
     print("Diagnostics: /korg/rw/HD/Unroot/unroot_diag.txt (FTP-accessible)")
     print()
     print("After install, reboot the Kronos to restore factory boot.")
+
+
+def main() -> None:
+    version = sys.argv[1] if len(sys.argv) > 1 else "1.0.0"
+    build(version)
 
 
 if __name__ == "__main__":

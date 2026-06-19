@@ -719,12 +719,8 @@ def _auto_detect_commands(payload_dir: Path) -> tuple:
 # Main
 # ---------------------------------------------------------------------------
 
-def main() -> None:
-    print("=" * 52)
-    print("  Kronos Package Builder")
-    print("=" * 52)
-    print()
-
+def _build_deployment() -> None:
+    """Interactive flow for building a payload deployment package."""
     pkg_name = _prompt("Package name (e.g. ScreenRemote, VKeyboard)")
     if not pkg_name:
         sys.exit("Package name is required.")
@@ -879,6 +875,109 @@ def main() -> None:
         print("    kronos_boot.log     -- appended on every boot if GRUB hook ran")
         if debug_log:
             print(f"    kronosmods_boot.log -- daemon stdout/stderr, appended on every boot")
+
+
+def _build_uninstaller_only() -> None:
+    """Interactive flow for building a standalone uninstaller package."""
+    pkg_name = _prompt("Package name to uninstall (e.g. ScreenRemote)")
+    if not pkg_name:
+        sys.exit("Package name is required.")
+    pkg_name_id = pkg_name.replace(" ", "_").replace("/", "_")
+    if pkg_name_id != pkg_name:
+        print(f"  (filename ID: {pkg_name_id})")
+
+    version = _prompt("Version", "1.0.0")
+
+    default_payload = str(Path(__file__).parent / "payload")
+    payload_str = _prompt("Payload directory (matching the installed package)", default_payload)
+    payload_dir = Path(payload_str)
+    if not payload_dir.is_dir():
+        sys.exit(f"Error: '{payload_dir}' is not a directory.")
+
+    boot_cmds, uninstall_cmds, daemon_paths = _auto_detect_commands(payload_dir)
+
+    print()
+    if uninstall_cmds:
+        print("Auto-detected uninstall commands:")
+        for cmd in uninstall_cmds:
+            print(f"  {cmd}")
+    else:
+        print("(No .ko modules or executables found in payload.)")
+
+    print()
+    boot_hook = _prompt_yn(
+        "Remove boot hook?  (Y = uninstall will undo grub/OA.clonos.rc changes)",
+        default=bool(boot_cmds),
+    )
+
+    if not boot_hook:
+        uninstall_cmds = []
+
+    installed_files: list = []
+    for root, _, files in os.walk(payload_dir):
+        for fname in files:
+            fpath = Path(root) / fname
+            arcname = fpath.relative_to(payload_dir).as_posix()
+            if arcname.startswith("mnt/korg/rw/"):
+                installed_files.append("/" + arcname[4:])
+    if boot_hook:
+        installed_files.append("/korg/rw/kronosmods_init")
+        installed_files.append("/korg/kronos_init")
+
+    md5sum_src = payload_dir.joinpath(*_MD5SUM_PAYLOAD_REL)
+    display_msg_src = payload_dir.joinpath(*_DISPLAY_MSG_PAYLOAD_REL)
+
+    print("\nBuilding uninstaller ...")
+    uout_dir = _build_uninstaller(pkg_name, version, installed_files, boot_hook,
+                                  uninstall_cmds, md5sum_src, display_msg_src)
+
+    print()
+    print("=" * 52)
+    print(f"  Ready: {uout_dir}/")
+    print("=" * 52)
+    print()
+    print("Copy to FAT32 USB root:")
+    for p in sorted(uout_dir.iterdir()):
+        note = "  (empty -- required)" if (p.name == "mnt" and p.is_dir()) else ""
+        print(f"  {p.name}{note}")
+
+
+def main() -> None:
+    print("=" * 52)
+    print("  Kronos Package Builder")
+    print("=" * 52)
+    print()
+    print("Select package type:")
+    print("  1. Factory State Restore  (remove ALL non-Korg artifacts)")
+    print("  2. Package Deployment     (install payload with optional boot hook)")
+    print("  3. Root Cleaner           (remove root hack, keep ScreenRemote)")
+    print("  4. Uninstaller            (build standalone uninstaller for a package)")
+    print()
+
+    choice = _prompt("Package type", "1")
+
+    if choice == "1":
+        version = _prompt("Version", "1.0.0")
+        print()
+        from build_cleaner import build as build_cleaner
+        build_cleaner(version)
+
+    elif choice == "2":
+        print()
+        _build_deployment()
+
+    elif choice == "3":
+        version = _prompt("Version", "1.0.0")
+        print()
+        from build_unroot import build as build_unroot
+        build_unroot(version)
+
+    elif choice == "4":
+        print()
+        _build_uninstaller_only()
+
+    else:
+        sys.exit(f"Invalid choice: {choice}")
 
 
 if __name__ == "__main__":
