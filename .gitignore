@@ -20,9 +20,8 @@ source/vkbd_ko.h
 
 # PackageMaker generated packages and payload binaries
 tools/PackageMaker/dist/
-tools/PackageMaker/payload/mnt/
-tools/PackageMaker/payload/md5sum/
 tools/PackageMaker/__pycache__/
+tools/PackageMaker/payload/mnt/korg/rw/
 
 # OS metadata
 .DS_Store

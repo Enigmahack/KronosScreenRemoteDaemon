@@ -14,10 +14,14 @@ Python 3.6 or later. No third-party packages — standard library only.
 
 | File | Purpose |
 |---|---|
-| `build_package.py` | Interactive package builder. Run this to produce a USB package. |
+| `build_package.py` | Main entry point. Presents a package type menu, then runs the appropriate builder. |
+| `build_cleaner.py` | Factory State Restore builder. Also usable standalone: `python build_cleaner.py [version]` |
+| `build_unroot.py` | Root Cleaner (unroot) builder. Also usable standalone: `python build_unroot.py [version]` |
+| `build_auto.py` | Non-interactive one-shot builder for ScreenRemote. |
 | `sign_package.py` | Standalone signature generator. Re-sign or verify any package's scripts. |
+| `runPackageBuilder.bat` | Windows launcher — runs `build_package.py`. |
 | `payload/` | Your files, organised under the `mnt/` prefix (see below). Not committed — project-specific. |
-| `dist/` | Output packages. Each build produces an installer + auto-generated uninstaller here. Not committed. |
+| `dist/` | Output packages. Each build produces output here. Not committed. |
 
 ---
 
@@ -61,7 +65,29 @@ anywhere else — those paths are wiped on every official Korg firmware update.
 python build_package.py
 ```
 
-Answer the prompts:
+The first prompt asks which type of package to build:
+
+```
+Select package type:
+  1. Factory State Restore  (remove ALL non-Korg artifacts)
+  2. Package Deployment     (install payload with optional boot hook)
+  3. Root Cleaner           (remove root hack, keep ScreenRemote)
+  4. Uninstaller            (build standalone uninstaller for a package)
+```
+
+#### Option 1 — Factory State Restore
+
+Produces a package that removes **all** non-Korg modifications: root hack (grub,
+dropbear, SSH tools, OA.clonos.\*, clontab), ScreenRemote (daemon, logs, boot
+hooks), and extraction tool outputs. Restores grub.conf to the verified factory
+image. Boot-critical files are only removed after GRUB is confirmed safe.
+
+Prompts: **Version** only.
+
+#### Option 2 — Package Deployment
+
+The full interactive builder for installing a payload onto the Kronos. Produces
+both an installer and a matching uninstaller.
 
 | Prompt | Notes |
 |---|---|
@@ -78,10 +104,32 @@ The `md5sum` binary is read from `<payload_dir>/md5sum/md5sum` — place an i386
 `md5sum` ELF there before building. If absent, the builder warns and `pretar.sh`
 will abort the install.
 
+#### Option 3 — Root Cleaner
+
+Produces a package that reverses the KronosRootHack only — strips `init=/bin/init`
+from grub.conf, removes dropbear SSH and root-hack boot chain files. **Preserves**
+ScreenRemote / PackageMaker hooks (`kronos_init`, `kronosmods_init`, grub
+`init=/korg/kronos_init`). Boot-critical files are only removed after GRUB is
+verified safe.
+
+Prompts: **Version** only.
+
+#### Option 4 — Uninstaller
+
+Builds a standalone uninstaller package for a previously deployed payload. Uses the
+same payload directory to determine which files and boot hooks to remove.
+
+| Prompt | Notes |
+|---|---|
+| Package name | Must match the installed package name |
+| Version | Must match the installed package version |
+| Payload directory | Same payload used for the original deployment |
+| Remove boot hook? | `Y` to undo grub/OA.clonos.rc changes |
+
 ### 3. Copy the output to USB
 
-Format a USB drive as **FAT32**. Copy the entire contents of
-`dist/<Name>_<Version>/` to the **root** of the drive:
+Format a USB drive as **FAT32**. Copy the entire contents of the output directory
+(`dist/<Name>_<Version>/`) to the **root** of the drive. A typical package contains:
 
 ```
 install.info
@@ -89,11 +137,15 @@ pretar.sh
 posttar.sh
 <Name>_<Version>.tar.gz
 md5sum
+DisplayUpdaterMessage
 mnt/            ← empty directory, must exist
 ```
 
-A matching uninstaller is also generated at `dist/<Name>_<Version>_Uninstall/`
-and is a separate USB package.
+For **Package Deployment** (option 2), a matching uninstaller is also generated at
+`dist/<Name>_<Version>_Uninstall/` — this is a separate USB package.
+
+**Factory State Restore** and **Root Cleaner** packages contain an empty tarball
+(all work is done in `posttar.sh`), but the same USB layout applies.
 
 ### 4. Apply on the Kronos
 
@@ -109,7 +161,8 @@ and is a separate USB package.
 
 ## How Auto-Detection Works
 
-`build_package.py` scans files under `mnt/korg/rw/` and derives commands automatically:
+For **Package Deployment** and **Uninstaller** builds, `build_package.py` scans
+files under `mnt/korg/rw/` and derives commands automatically:
 
 | File pattern | Generated boot command | Generated uninstall command |
 |---|---|---|
