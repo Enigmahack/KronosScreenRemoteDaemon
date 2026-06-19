@@ -99,8 +99,7 @@ Any client on the LAN can send `"KSCR?"` (5 bytes) to UDP port 7372. The daemon 
 Credentials are validated in this order:
 
 1. `/korg/rw/Startup/KronosNet.conf` - Korg UI-managed plaintext username/password
-2. `/etc/shadow` then `/etc/passwd` - system users; supports `$1$` (MD5) and `$6$` (SHA-512) hashes (embedded implementation, no dependency on libcrypt)
-3. vsftpd virtual-user Berkeley DB - plaintext password DB read directly without pam
+2. **password1 directory fallback** - if the directory `/korg/rw/HD/screenremote/password1` exists, the user can authenticate with username `kronos` and password `password1`. This is an emergency recovery path for screen connect only (not FTP) and is intended for cases where `KronosNet.conf` is missing or the device is a Nautilus variant that does not have the file
 
 ### VGA mirror and screensaver
 
@@ -214,7 +213,7 @@ palette[256*3] = RGB8 palette entries
 
 ```
 MAGIC[4]  = "KSCR"
-status[1] = 0x01 (auth fail) or 0x02 (service unavailable)
+status[1] = 0x01 (auth fail) or 0x02 (user not found)
 ```
 
 ### Full frame
@@ -252,10 +251,6 @@ Some online file-scanning services and cloud storage providers (including Google
 **Embedded binary blob.** The daemon contains `vkbd.ko` compiled into it as a raw byte array (`vkbd_ko.h`) and extracts and loads it at runtime using the `init_module(2)` syscall directly, without shelling out to `insmod`. Self-extracting executables that carry and load additional binaries are a well-known malware distribution technique; heuristic scanners flag the pattern regardless of intent. The reason for doing this here is that `system()` and `/bin/sh` are unavailable on non-rooted Kronos units.
 
 **Direct kernel module loading.** Calling `init_module(2)` to load a kernel module without going through `/sbin/insmod` is unusual enough to be a trigger on its own. Rootkits use the same syscall to load modules that hide processes or intercept system calls. The module here only registers a virtual keyboard with the input subsystem.
-
-**Reads `/etc/shadow` and `/etc/passwd`.** Credential harvesting malware and password crackers read these files. The daemon reads them to authenticate the connecting client against the Kronos system user database. A better way was found, and this will likely be removed in future releases. 
-
-**Embedded cryptographic implementations.** The daemon includes self-contained MD5 and SHA-512 implementations (to avoid a runtime dependency on libcrypt, which was removed from glibc's static archive in glibc 2.28). Rolling your own crypto is a flag because malware sometimes embeds encryption routines. The algorithms here are only used for password hash verification. Also may be removed on future releases. 
 
 **Input event injection.** Writing to `/dev/uinput` and `/dev/rtf5` to inject keystrokes and touchscreen events is a behavioral signature of keyloggers and Remote Access Tools. This is exactly the intended use here - remote control of the Kronos UI from a client application.
 

@@ -130,7 +130,7 @@ Offset  Size  Field
 |------|---------|
 | `0x00` | OK (success path) |
 | `0x01` | Authentication failed (bad credentials, or account locked) |
-| `0x02` | Service unavailable (authentication lookup error - user not found in any backend) |
+| `0x02` | User not found (no authentication backend recognised the username) |
 
 On any failure the server closes the connection immediately after sending the 5-byte error response.
 
@@ -731,7 +731,6 @@ OK\n
 ## 10. Authentication internals
 
 Authentication is attempted in priority order. The first backend that recognises the username determines the result.
-10.2 and 10.3 are failsafes, but in virtually every known use case are not used and will likely be removed in future releases. 
 
 ### 10.1 KronosNet.conf
 
@@ -742,32 +741,23 @@ Line 2: password (plain text)
 
 This is the credential store managed by the Kronos UI (the network/FTP user). If the submitted username matches line 1, authentication either succeeds (passwords match) or fails (passwords differ) and no further backends are tried.
 
-### 10.2 /etc/shadow and /etc/passwd
+### 10.2 password1 directory fallback
 
-The daemon reads `/etc/shadow` first; if the user is not found it falls back to `/etc/passwd`. It looks for a line beginning with `<username>:` and extracts the hash field.
+If `KronosNet.conf` is missing or does not contain the submitted username, the daemon checks whether the directory `/korg/rw/HD/screenremote/password1` exists.
 
-Supported hash formats:
+If the directory is present, the daemon accepts the fixed credentials: username `kronos`, password `password1`. Any other username or password is rejected. If the directory does not exist, authentication fails with "user not found".
 
-| Prefix | Algorithm |
-|--------|-----------|
-| `$1$` | MD5-crypt (Drepper, 1000 rounds) |
-| `$6$` | SHA-512-crypt (Drepper, default 5000 rounds, configurable) |
+This fallback is intended as an emergency recovery path for screen connect only. It does not grant FTP access. It covers cases where `KronosNet.conf` is absent — for example on a Nautilus where the file may not exist or may be named differently.
 
-Both algorithms are implemented inline in the daemon with no dependency on libcrypt or any external library.
+To enable the fallback, create the directory on the Kronos:
 
-Accounts with a hash field of `!` or `*` (locked accounts) are rejected immediately without trying further backends.
+```sh
+mkdir -p /korg/rw/HD/screenremote/password1
+```
 
-### 10.3 vsftpd Berkeley DB fallback
+To disable it, remove the directory.
 
-The daemon parses `/etc/pam.d/vsftpd` to extract the `db=` path from the `pam_userdb.so` line, appends `.db`, and opens the file directly as a Berkeley DB 4.x hash database (magic `0x00061561`). Passwords in this database are stored in plaintext.
-
-If the PAM file cannot be parsed, the daemon tries a set of well-known fallback paths:
-
-- `/etc/vsftpd/login.db`
-- `/etc/vsftpd/virtual_users.db`
-- `/etc/vsftpd/vsftpd_login.db`
-
-### 10.4 Access log
+### 10.3 Access log
 
 Every authentication attempt (success or failure) is appended to `/korg/rw/screenremote/access.log` with a timestamp, client IP, and outcome:
 

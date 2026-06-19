@@ -7,10 +7,10 @@
  *
  * Stream handshake (TCP port 7373):
  *   Client → Server: MAGIC[4]="KSCR" + 0x02(ver) + mode(1) + fps(1) + ulen(1) + plen(1)
- *                    + username[ulen] + password[plen]  (password validated against screenremote.cfg)
+ *                    + username[ulen] + password[plen]
  *     mode: 0x01=Pull (server sends at fps), 0x02=Change (server sends on fb change)
  *   Server → Client: MAGIC[4] + status(1)  [+ width_LE16 + height_LE16 + 256×RGB8 if status=0x00]
- *     status: 0x00=ok  0x01=auth_fail  0x02=ftp_service_unavailable
+ *     status: 0x00=ok  0x01=auth_fail  0x02=user_not_found
  *   Frames: [len_LE32][pixel_data]  (full) or dirty-rect PackBits RLE
  *
  * Control port 7374 (text line commands, newline-terminated):
@@ -269,436 +269,12 @@ static int write_all(int fd, const void *buf, size_t n)
     return 0;
 }
 
-/* ── Embedded SHA-512 + SHA-512 crypt ($6$) ─────────────────────────────────
- * crypt() was removed from glibc libc.a in 2.28; embed it to avoid -lcrypt. */
-
-#define SR_R64(x,n)     (((x)>>(n))|((x)<<(64-(n))))
-#define SR_CH(e,f,g)    (((e)&(f))^((~(e))&(g)))
-#define SR_MAJ(a,b,c)   (((a)&(b))^((a)&(c))^((b)&(c)))
-#define SR_BSIG0(x)     (SR_R64(x,28)^SR_R64(x,34)^SR_R64(x,39))
-#define SR_BSIG1(x)     (SR_R64(x,14)^SR_R64(x,18)^SR_R64(x,41))
-#define SR_SSIG0(x)     (SR_R64(x, 1)^SR_R64(x, 8)^((x)>>7))
-#define SR_SSIG1(x)     (SR_R64(x,19)^SR_R64(x,61)^((x)>>6))
-
-static const uint64_t S512K[80] = {
-    UINT64_C(0x428a2f98d728ae22),UINT64_C(0x7137449123ef65cd),
-    UINT64_C(0xb5c0fbcfec4d3b2f),UINT64_C(0xe9b5dba58189dbbc),
-    UINT64_C(0x3956c25bf348b538),UINT64_C(0x59f111f1b605d019),
-    UINT64_C(0x923f82a4af194f9b),UINT64_C(0xab1c5ed5da6d8118),
-    UINT64_C(0xd807aa98a3030242),UINT64_C(0x12835b0145706fbe),
-    UINT64_C(0x243185be4ee4b28c),UINT64_C(0x550c7dc3d5ffb4e2),
-    UINT64_C(0x72be5d74f27b896f),UINT64_C(0x80deb1fe3b1696b1),
-    UINT64_C(0x9bdc06a725c71235),UINT64_C(0xc19bf174cf692694),
-    UINT64_C(0xe49b69c19ef14ad2),UINT64_C(0xefbe4786384f25e3),
-    UINT64_C(0x0fc19dc68b8cd5b5),UINT64_C(0x240ca1cc77ac9c65),
-    UINT64_C(0x2de92c6f592b0275),UINT64_C(0x4a7484aa6ea6e483),
-    UINT64_C(0x5cb0a9dcbd41fbd4),UINT64_C(0x76f988da831153b5),
-    UINT64_C(0x983e5152ee66dfab),UINT64_C(0xa831c66d2db43210),
-    UINT64_C(0xb00327c898fb213f),UINT64_C(0xbf597fc7beef0ee4),
-    UINT64_C(0xc6e00bf33da88fc2),UINT64_C(0xd5a79147930aa725),
-    UINT64_C(0x06ca6351e003826f),UINT64_C(0x142929670a0e6e70),
-    UINT64_C(0x27b70a8546d22ffc),UINT64_C(0x2e1b21385c26c926),
-    UINT64_C(0x4d2c6dfc5ac42aed),UINT64_C(0x53380d139d95b3df),
-    UINT64_C(0x650a73548baf63de),UINT64_C(0x766a0abb3c77b2a8),
-    UINT64_C(0x81c2c92e47edaee6),UINT64_C(0x92722c851482353b),
-    UINT64_C(0xa2bfe8a14cf10364),UINT64_C(0xa81a664bbc423001),
-    UINT64_C(0xc24b8b70d0f89791),UINT64_C(0xc76c51a30654be30),
-    UINT64_C(0xd192e819d6ef5218),UINT64_C(0xd69906245565a910),
-    UINT64_C(0xf40e35855771202a),UINT64_C(0x106aa07032bbd1b8),
-    UINT64_C(0x19a4c116b8d2d0c8),UINT64_C(0x1e376c085141ab53),
-    UINT64_C(0x2748774cdf8eeb99),UINT64_C(0x34b0bcb5e19b48a8),
-    UINT64_C(0x391c0cb3c5c95a63),UINT64_C(0x4ed8aa4ae3418acb),
-    UINT64_C(0x5b9cca4f7763e373),UINT64_C(0x682e6ff3d6b2b8a3),
-    UINT64_C(0x748f82ee5defb2fc),UINT64_C(0x78a5636f43172f60),
-    UINT64_C(0x84c87814a1f0ab72),UINT64_C(0x8cc702081a6439ec),
-    UINT64_C(0x90befffa23631e28),UINT64_C(0xa4506cebde82bde9),
-    UINT64_C(0xbef9a3f7b2c67915),UINT64_C(0xc67178f2e372532b),
-    UINT64_C(0xca273eceea26619c),UINT64_C(0xd186b8c721c0c207),
-    UINT64_C(0xeada7dd6cde0eb1e),UINT64_C(0xf57d4f7fee6ed178),
-    UINT64_C(0x06f067aa72176fba),UINT64_C(0x0a637dc5a2c898a6),
-    UINT64_C(0x113f9804bef90dae),UINT64_C(0x1b710b35131c471b),
-    UINT64_C(0x28db77f523047d84),UINT64_C(0x32caab7b40c72493),
-    UINT64_C(0x3c9ebe0a15c9bebc),UINT64_C(0x431d67c49c100d4c),
-    UINT64_C(0x4cc5d4becb3e42b6),UINT64_C(0x597f299cfc657e2a),
-    UINT64_C(0x5fcb6fab3ad6faec),UINT64_C(0x6c44198c4a475817)
-};
-
-typedef struct { uint64_t h[8]; uint64_t total; unsigned blen; uint8_t buf[128]; } s512_ctx;
-
-static void s512_compress(s512_ctx *c, const uint8_t *blk)
-{
-    uint64_t w[80], a,b,cc,d,e,f,g,h,t1,t2; int i;
-    for (i=0;i<16;i++)
-        w[i]=((uint64_t)blk[i*8]<<56)|((uint64_t)blk[i*8+1]<<48)
-            |((uint64_t)blk[i*8+2]<<40)|((uint64_t)blk[i*8+3]<<32)
-            |((uint64_t)blk[i*8+4]<<24)|((uint64_t)blk[i*8+5]<<16)
-            |((uint64_t)blk[i*8+6]<<8)|blk[i*8+7];
-    for (i=16;i<80;i++) w[i]=SR_SSIG1(w[i-2])+w[i-7]+SR_SSIG0(w[i-15])+w[i-16];
-    a=c->h[0];b=c->h[1];cc=c->h[2];d=c->h[3];
-    e=c->h[4];f=c->h[5];g=c->h[6];h=c->h[7];
-    for (i=0;i<80;i++){
-        t1=h+SR_BSIG1(e)+SR_CH(e,f,g)+S512K[i]+w[i];
-        t2=SR_BSIG0(a)+SR_MAJ(a,b,cc);
-        h=g;g=f;f=e;e=d+t1;d=cc;cc=b;b=a;a=t1+t2;
-    }
-    c->h[0]+=a;c->h[1]+=b;c->h[2]+=cc;c->h[3]+=d;
-    c->h[4]+=e;c->h[5]+=f;c->h[6]+=g;c->h[7]+=h;
-}
-
-static void s512_init(s512_ctx *c)
-{
-    c->h[0]=UINT64_C(0x6a09e667f3bcc908);c->h[1]=UINT64_C(0xbb67ae8584caa73b);
-    c->h[2]=UINT64_C(0x3c6ef372fe94f82b);c->h[3]=UINT64_C(0xa54ff53a5f1d36f1);
-    c->h[4]=UINT64_C(0x510e527fade682d1);c->h[5]=UINT64_C(0x9b05688c2b3e6c1f);
-    c->h[6]=UINT64_C(0x1f83d9abfb41bd6b);c->h[7]=UINT64_C(0x5be0cd19137e2179);
-    c->total=0;c->blen=0;
-}
-
-static void s512_feed(s512_ctx *c, const void *data, size_t len)
-{
-    const uint8_t *p=(const uint8_t*)data;
-    while(len){ size_t sp=128-c->blen,tk=len<sp?len:sp;
-        memcpy(c->buf+c->blen,p,tk);
-        c->blen+=(unsigned)tk;c->total+=tk;p+=tk;len-=tk;
-        if(c->blen==128){s512_compress(c,c->buf);c->blen=0;}
-    }
-}
-
-static void s512_done(s512_ctx *c, uint8_t out[64])
-{
-    uint64_t bits=c->total*8; uint8_t pad=0x80; int i;
-    uint8_t lb[16]={0,0,0,0,0,0,0,0,
-        (uint8_t)(bits>>56),(uint8_t)(bits>>48),(uint8_t)(bits>>40),(uint8_t)(bits>>32),
-        (uint8_t)(bits>>24),(uint8_t)(bits>>16),(uint8_t)(bits>>8),(uint8_t)bits};
-    s512_feed(c,&pad,1); pad=0;
-    while(c->blen!=112) s512_feed(c,&pad,1);
-    s512_feed(c,lb,16);
-    for(i=0;i<8;i++){
-        out[i*8+0]=(uint8_t)(c->h[i]>>56);out[i*8+1]=(uint8_t)(c->h[i]>>48);
-        out[i*8+2]=(uint8_t)(c->h[i]>>40);out[i*8+3]=(uint8_t)(c->h[i]>>32);
-        out[i*8+4]=(uint8_t)(c->h[i]>>24);out[i*8+5]=(uint8_t)(c->h[i]>>16);
-        out[i*8+6]=(uint8_t)(c->h[i]>>8); out[i*8+7]=(uint8_t)c->h[i];
-    }
-}
-
-/* SHA-512 crypt — Drepper algorithm, $6$ hashes only */
-static const char S6B64[] =
-    "./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-
-static void s6b64(char **p, unsigned b2, unsigned b1, unsigned b0, int n)
-{
-    unsigned v=(b2<<16)|(b1<<8)|b0;
-    while(n--){*(*p)++=S6B64[v&0x3f];v>>=6;}
-}
-
-static char s6_out[128];
-
-static char *local_crypt_sha512(const char *key, const char *setting)
-{
-    s512_ctx ctx;
-    uint8_t dA[64],dB[64],dP[64],dS[64],C[64];
-    uint8_t pstr[128],sstr[64];
-    const char *sp,*ep; size_t klen,slen;
-    unsigned rounds=5000,i,n; int cust=0; char *op;
-
-    if(strncmp(setting,"$6$",3)!=0) return NULL;
-    sp=setting+3;
-    if(strncmp(sp,"rounds=",7)==0){
-        sp+=7; rounds=(unsigned)strtoul(sp,(char**)&ep,10);
-        if(rounds<1000) rounds=1000;
-        if(rounds>999999999u) rounds=999999999u;
-        cust=1; sp=ep; if(*sp=='$') sp++;
-    }
-    ep=sp; while(*ep&&*ep!='$'&&(ep-sp)<16) ep++;
-    slen=(size_t)(ep-sp); klen=strlen(key);
-    if(klen>128) klen=128;
-
-    /* Digest B = SHA512(P + P) */
-    s512_init(&ctx); s512_feed(&ctx,key,klen); s512_feed(&ctx,key,klen);
-    s512_done(&ctx,dB);
-
-    /* Digest A = SHA512(P + S + dB[0..klen-1] + bit-alt(P,dB)) */
-    s512_init(&ctx);
-    s512_feed(&ctx,key,klen); s512_feed(&ctx,sp,slen);
-    for(n=(unsigned)klen;n>64;n-=64) s512_feed(&ctx,dB,64);
-    s512_feed(&ctx,dB,n);
-    for(n=(unsigned)klen;n;n>>=1)
-        s512_feed(&ctx,(n&1)?(const void*)dB:(const void*)key,
-                  (n&1)?64:klen);
-    s512_done(&ctx,dA);
-
-    /* P-string: SHA512(P repeated klen times), tiled to klen bytes */
-    s512_init(&ctx);
-    for(i=0;i<(unsigned)klen;i++) s512_feed(&ctx,key,klen);
-    s512_done(&ctx,dP);
-    for(i=0;i<(unsigned)klen;i++) pstr[i]=dP[i%64];
-
-    /* S-string: SHA512(S repeated 16+dA[0] times), tiled to slen bytes */
-    s512_init(&ctx);
-    for(i=0;i<16+(unsigned)dA[0];i++) s512_feed(&ctx,sp,slen);
-    s512_done(&ctx,dS);
-    for(i=0;i<(unsigned)slen;i++) sstr[i]=dS[i%64];
-
-    /* Rounds */
-    memcpy(C,dA,64);
-    for(i=0;i<rounds;i++){
-        s512_init(&ctx);
-        if(i&1) s512_feed(&ctx,pstr,klen); else s512_feed(&ctx,C,64);
-        if(i%3) s512_feed(&ctx,sstr,slen);
-        if(i%7) s512_feed(&ctx,pstr,klen);
-        if(i&1) s512_feed(&ctx,C,64); else s512_feed(&ctx,pstr,klen);
-        s512_done(&ctx,C);
-    }
-
-    /* Encode output */
-    op=s6_out;
-    *op++='$';*op++='6';*op++='$';
-    if(cust) op+=sprintf(op,"rounds=%u$",rounds);
-    memcpy(op,sp,slen); op+=slen; *op++='$';
-    s6b64(&op,C[ 0],C[21],C[42],4); s6b64(&op,C[22],C[43],C[ 1],4);
-    s6b64(&op,C[44],C[ 2],C[23],4); s6b64(&op,C[ 3],C[24],C[45],4);
-    s6b64(&op,C[25],C[46],C[ 4],4); s6b64(&op,C[47],C[ 5],C[26],4);
-    s6b64(&op,C[ 6],C[27],C[48],4); s6b64(&op,C[28],C[49],C[ 7],4);
-    s6b64(&op,C[50],C[ 8],C[29],4); s6b64(&op,C[ 9],C[30],C[51],4);
-    s6b64(&op,C[31],C[52],C[10],4); s6b64(&op,C[53],C[11],C[32],4);
-    s6b64(&op,C[12],C[33],C[54],4); s6b64(&op,C[34],C[55],C[13],4);
-    s6b64(&op,C[56],C[14],C[35],4); s6b64(&op,C[15],C[36],C[57],4);
-    s6b64(&op,C[37],C[58],C[16],4); s6b64(&op,C[59],C[17],C[38],4);
-    s6b64(&op,C[18],C[39],C[60],4); s6b64(&op,C[40],C[61],C[19],4);
-    s6b64(&op,C[62],C[20],C[41],4); s6b64(&op,0,C[63],0,2);
-    *op='\0';
-    return s6_out;
-}
-
-/* ── Embedded MD5 for $1$ hashes ─────────────────────────────────────────── */
-typedef struct { uint32_t s[4]; uint64_t total; unsigned blen; uint8_t buf[64]; } md5_ctx;
-
-static const uint8_t MD5SH[64]={
-    7,12,17,22,7,12,17,22,7,12,17,22,7,12,17,22,
-    5,9,14,20,5,9,14,20,5,9,14,20,5,9,14,20,
-    4,11,16,23,4,11,16,23,4,11,16,23,4,11,16,23,
-    6,10,15,21,6,10,15,21,6,10,15,21,6,10,15,21
-};
-static const uint32_t MD5K[64]={
-    0xd76aa478u,0xe8c7b756u,0x242070dbu,0xc1bdceeeu,
-    0xf57c0fafu,0x4787c62au,0xa8304613u,0xfd469501u,
-    0x698098d8u,0x8b44f7afu,0xffff5bb1u,0x895cd7beu,
-    0x6b901122u,0xfd987193u,0xa679438eu,0x49b40821u,
-    0xf61e2562u,0xc040b340u,0x265e5a51u,0xe9b6c7aau,
-    0xd62f105du,0x02441453u,0xd8a1e681u,0xe7d3fbc8u,
-    0x21e1cde6u,0xc33707d6u,0xf4d50d87u,0x455a14edu,
-    0xa9e3e905u,0xfcefa3f8u,0x676f02d9u,0x8d2a4c8au,
-    0xfffa3942u,0x8771f681u,0x6d9d6122u,0xfde5380cu,
-    0xa4beea44u,0x4bdecfa9u,0xf6bb4b60u,0xbebfbc70u,
-    0x289b7ec6u,0xeaa127fau,0xd4ef3085u,0x04881d05u,
-    0xd9d4d039u,0xe6db99e5u,0x1fa27cf8u,0xc4ac5665u,
-    0xf4292244u,0x432aff97u,0xab9423a7u,0xfc93a039u,
-    0x655b59c3u,0x8f0ccc92u,0xffeff47du,0x85845dd1u,
-    0x6fa87e4fu,0xfe2ce6e0u,0xa3014314u,0x4e0811a1u,
-    0xf7537e82u,0xbd3af235u,0x2ad7d2bbu,0xeb86d391u
-};
-#define MD5ROL(x,n) (((x)<<(n))|((x)>>(32-(n))))
-
-static void md5_compress(md5_ctx *c, const uint8_t *blk)
-{
-    uint32_t W[16],A,B,C,D,f,tmp; unsigned i,g;
-    for(i=0;i<16;i++)
-        W[i]=((uint32_t)blk[i*4+3]<<24)|((uint32_t)blk[i*4+2]<<16)
-            |((uint32_t)blk[i*4+1]<<8)|blk[i*4];
-    A=c->s[0]; B=c->s[1]; C=c->s[2]; D=c->s[3];
-    for(i=0;i<64;i++){
-        if(i<16){      f=(B&C)|(~B&D);  g=i; }
-        else if(i<32){ f=(B&D)|(C&~D);  g=(5*i+1)%16; }
-        else if(i<48){ f=B^C^D;         g=(3*i+5)%16; }
-        else{          f=C^(B|~D);      g=(7*i)%16; }
-        tmp=D; D=C; C=B; B+=MD5ROL(A+f+MD5K[i]+W[g],MD5SH[i]); A=tmp;
-    }
-    c->s[0]+=A; c->s[1]+=B; c->s[2]+=C; c->s[3]+=D;
-}
-static void md5_init(md5_ctx *c)
-{
-    c->s[0]=0x67452301u; c->s[1]=0xEFCDAB89u;
-    c->s[2]=0x98BADCFEu; c->s[3]=0x10325476u;
-    c->total=0; c->blen=0;
-}
-static void md5_feed(md5_ctx *c, const void *data, size_t len)
-{
-    const uint8_t *p=(const uint8_t*)data;
-    while(len){ size_t sp=64-c->blen,tk=len<sp?len:sp;
-        memcpy(c->buf+c->blen,p,tk);
-        c->blen+=(unsigned)tk; c->total+=tk; p+=tk; len-=tk;
-        if(c->blen==64){md5_compress(c,c->buf); c->blen=0;}
-    }
-}
-static void md5_done(md5_ctx *c, uint8_t out[16])
-{
-    uint64_t bits=c->total*8; uint8_t pad=0x80; int i;
-    uint8_t lb[8]={(uint8_t)bits,(uint8_t)(bits>>8),(uint8_t)(bits>>16),(uint8_t)(bits>>24),
-                   (uint8_t)(bits>>32),(uint8_t)(bits>>40),(uint8_t)(bits>>48),(uint8_t)(bits>>56)};
-    md5_feed(c,&pad,1); pad=0;
-    while(c->blen!=56) md5_feed(c,&pad,1);
-    md5_feed(c,lb,8);
-    for(i=0;i<4;i++){
-        out[i*4]=(uint8_t)c->s[i];   out[i*4+1]=(uint8_t)(c->s[i]>>8);
-        out[i*4+2]=(uint8_t)(c->s[i]>>16); out[i*4+3]=(uint8_t)(c->s[i]>>24);
-    }
-}
-
-static char m1_out[64];
-
-static char *local_crypt_md5(const char *key, const char *setting)
-{
-    md5_ctx ctx,ctx1;
-    uint8_t dA[16],dB[16]; uint8_t zero=0;
-    const char *sp,*ep; size_t klen,slen;
-    unsigned i,n; char *op;
-
-    if(strncmp(setting,"$1$",3)!=0) return NULL;
-    sp=setting+3;
-    ep=sp; while(*ep&&*ep!='$'&&(ep-sp)<8) ep++;
-    slen=(size_t)(ep-sp); klen=strlen(key);
-    if(klen>128) klen=128;
-
-    /* Digest B = MD5(P + S + P) */
-    md5_init(&ctx1);
-    md5_feed(&ctx1,key,klen); md5_feed(&ctx1,sp,slen); md5_feed(&ctx1,key,klen);
-    md5_done(&ctx1,dB);
-
-    /* Digest A = MD5(P + "$1$" + S + dB[0..klen-1] + bit-alt('\0', P[0])) */
-    md5_init(&ctx);
-    md5_feed(&ctx,key,klen); md5_feed(&ctx,"$1$",3); md5_feed(&ctx,sp,slen);
-    for(n=(unsigned)klen;n>16;n-=16) md5_feed(&ctx,dB,16);
-    md5_feed(&ctx,dB,n);
-    for(n=(unsigned)klen;n;n>>=1)
-        if(n&1) md5_feed(&ctx,&zero,1);
-        else    md5_feed(&ctx,key,1);
-    md5_done(&ctx,dA);
-
-    /* 1000 rounds */
-    for(i=0;i<1000;i++){
-        md5_init(&ctx1);
-        if(i&1) md5_feed(&ctx1,key,klen); else md5_feed(&ctx1,dA,16);
-        if(i%3) md5_feed(&ctx1,sp,slen);
-        if(i%7) md5_feed(&ctx1,key,klen);
-        if(i&1) md5_feed(&ctx1,dA,16); else md5_feed(&ctx1,key,klen);
-        md5_done(&ctx1,dA);
-    }
-
-    op=m1_out;
-    *op++='$'; *op++='1'; *op++='$';
-    memcpy(op,sp,slen); op+=slen; *op++='$';
-    s6b64(&op,dA[ 0],dA[ 6],dA[12],4);
-    s6b64(&op,dA[ 1],dA[ 7],dA[13],4);
-    s6b64(&op,dA[ 2],dA[ 8],dA[14],4);
-    s6b64(&op,dA[ 3],dA[ 9],dA[15],4);
-    s6b64(&op,dA[ 4],dA[10],dA[ 5],4);
-    s6b64(&op,0,0,dA[11],2);
-    *op='\0';
-    return m1_out;
-}
-
-static char *local_crypt(const char *key, const char *setting)
-{
-    if(strncmp(setting,"$1$",3)==0) return local_crypt_md5(key,setting);
-    if(strncmp(setting,"$6$",3)==0) return local_crypt_sha512(key,setting);
-    return NULL;
-}
-
-/* ── Berkeley DB 4.x hash reader for vsftpd virtual users ─────────────────
- * pam_userdb stores plaintext passwords: key=username, value=password.
- * Magic 0x00061561; metadata at fixed offsets (same for DB 2–6).          */
-
-/* Parse /etc/pam.d/vsftpd for the db= path used by pam_userdb.so.
- * Appends ".db" suffix. Falls back to common on-disk paths. Returns 1 on success. */
-static int find_vsftpd_db(char *out, size_t outsz)
-{
-    static const char *const fallbacks[] = {
-        "/etc/vsftpd/login.db", "/etc/vsftpd/virtual_users.db",
-        "/etc/vsftpd/vsftpd_login.db", NULL
-    };
-    FILE *f = fopen("/etc/pam.d/vsftpd", "r");
-    if (f) {
-        char line[256];
-        while (fgets(line, sizeof(line), f)) {
-            char *p = strstr(line, "pam_userdb");
-            if (!p) continue;
-            p = strstr(p, "db=");
-            if (!p) continue;
-            p += 3;
-            char *end = p;
-            while (*end && *end != ' ' && *end != '\t' && *end != '\n' && *end != '\r') end++;
-            size_t len = (size_t)(end - p);
-            if (len > 0 && len + 4 < outsz) {
-                memcpy(out, p, len);
-                memcpy(out + len, ".db", 4);
-                fclose(f);
-                return 1;
-            }
-        }
-        fclose(f);
-    }
-    /* Try well-known fallback paths */
-    int i; for (i = 0; fallbacks[i]; i++) {
-        FILE *tf = fopen(fallbacks[i], "rb");
-        if (tf) { fclose(tf); strncpy(out, fallbacks[i], outsz - 1); out[outsz-1] = '\0'; return 1; }
-    }
-    return 0;
-}
-
-/* Validate user:pass against a Berkeley DB hash file (pam_userdb plaintext).
- * Returns 0=match, 1=wrong password, -1=not found or parse error. */
-static int bdb_check_pass(const char *db_path, const char *user, const char *pass)
-{
-    uint8_t meta[512], page[4096];
-    uint32_t pagesize, lastpgno, magic, pgno;
-    size_t ulen = strlen(user), plen = strlen(pass);
-    int result = -1;
-    FILE *f = fopen(db_path, "rb");
-    if (!f) return -1;
-
-    if (fread(meta, 1, sizeof(meta), f) < sizeof(meta)) { fclose(f); return -1; }
-    magic = (uint32_t)meta[12] | ((uint32_t)meta[13]<<8)
-          | ((uint32_t)meta[14]<<16) | ((uint32_t)meta[15]<<24);
-    if (magic != 0x00061561u) { fclose(f); return -1; }
-
-    pagesize = (uint32_t)meta[20] | ((uint32_t)meta[21]<<8)
-             | ((uint32_t)meta[22]<<16) | ((uint32_t)meta[23]<<24);
-    lastpgno = (uint32_t)meta[32] | ((uint32_t)meta[33]<<8)
-             | ((uint32_t)meta[34]<<16) | ((uint32_t)meta[35]<<24);
-    if (pagesize < 512 || pagesize > sizeof(page)) { fclose(f); return -1; }
-
-    for (pgno = 1; pgno <= lastpgno && result < 0; pgno++) {
-        if (fseek(f, (long)pgno * (long)pagesize, SEEK_SET) != 0) continue;
-        if (fread(page, 1, pagesize, f) < pagesize) continue;
-        if (page[25] != 13) continue;  /* P_HASH = 13 */
-
-        unsigned n = (unsigned)((uint16_t)page[20] | ((uint16_t)page[21]<<8));
-        if (n < 2 || (n & 1)) continue;  /* must have even item count (key+value pairs) */
-
-        /* inp[i] at page[26 + i*2].  Offsets descend: inp[0] > inp[1] > ...
-         * LEN_HITEM: len[0] = pagesize - inp[0]; len[i] = inp[i-1] - inp[i]. */
-        unsigned j; for (j = 0; j + 1 < n && result < 0; j += 2) {
-            uint16_t koff = (uint16_t)page[26+j*2]   | ((uint16_t)page[26+j*2+1]<<8);
-            uint16_t doff = (uint16_t)page[26+j*2+2] | ((uint16_t)page[26+j*2+3]<<8);
-            uint16_t klen = (j == 0) ? (uint16_t)(pagesize - koff)
-                          : ((uint16_t)page[26+j*2-2] | ((uint16_t)page[26+j*2-1]<<8)) - koff;
-            uint16_t dlen = koff - doff;  /* = inp[j] - inp[j+1] */
-
-            if (koff < 26 || doff < 26 || koff >= pagesize || doff >= pagesize) continue;
-            if (klen < 2 || dlen < 2) continue;
-            if (page[koff] != 1 || page[doff] != 1) continue;  /* H_KEYDATA = 1 */
-
-            /* key bytes: page[koff+1 .. koff+klen-1], length = klen-1 */
-            if ((uint16_t)(klen - 1) == (uint16_t)ulen &&
-                memcmp(page + koff + 1, user, ulen) == 0) {
-                result = ((uint16_t)(dlen - 1) == (uint16_t)plen &&
-                          memcmp(page + doff + 1, pass, plen) == 0) ? 0 : 1;
-            }
-        }
-    }
-    fclose(f);
-    return result;
-}
+/* ── Emergency fallback password directory ──────────────────────────────────
+ * If /korg/rw/HD/screenremote/password1/ exists as a directory, the user can
+ * authenticate to screen connect (not FTP) with username "kronos" and
+ * password "password1".  This provides a recovery path when KronosNet.conf
+ * is missing or the device is a Nautilus variant without that file. */
+#define PASSWORD1_DIR "/korg/rw/HD/screenremote/password1"
 
 /* Check /korg/rw/Startup/KronosNet.conf — Korg's UI-managed credential store.
  * Format: line 1 = username, line 2 = password (plain text, updated by the UI).
@@ -720,68 +296,25 @@ static int kronosnet_auth(const char *user, const char *pass)
 
 /* Validate credentials.  Priority:
  *   1. KronosNet.conf  (Korg UI-managed, covers the 'kronos' / network user)
- *   2. /etc/shadow + /etc/passwd  (system users: root, stg, pocky, …)
- *   3. vsftpd virtual-user Berkeley DB  (legacy fallback)
+ *   2. password1 directory fallback  (emergency recovery for screenconnect)
  * Returns 0=ok, -1=wrong password, -2=lookup error.
  * *out_reason describes the failure (never NULL on error). */
-static int shadow_auth(const char *user, const char *pass, const char **out_reason)
+static int check_auth(const char *user, const char *pass, const char **out_reason)
 {
     /* ── KronosNet.conf ── */
     int kr = kronosnet_auth(user, pass);
     if (kr == 0) { *out_reason = NULL; return 0; }
     if (kr == 1) { *out_reason = "wrong password"; return -1; }
 
-    /* ── /etc/shadow then /etc/passwd ── */
-    FILE *f;
-    char line[512], hash[256] = "";
-    size_t ulen = strlen(user);
-    char *result;
-
-    f = fopen("/etc/shadow", "r");
-    if (f) {
-        while (fgets(line, sizeof(line), f)) {
-            if (strncmp(line, user, ulen) == 0 && line[ulen] == ':') {
-                char *h = line + ulen + 1, *end = strchr(h, ':');
-                if (end) *end = '\0';
-                h[strcspn(h, "\r\n")] = '\0';
-                strncpy(hash, h, sizeof(hash) - 1);
-                break;
-            }
+    /* ── password1 directory fallback ── */
+    struct stat st;
+    if (stat(PASSWORD1_DIR, &st) == 0 && S_ISDIR(st.st_mode)) {
+        if (strcmp(user, "kronos") == 0 && strcmp(pass, "password1") == 0) {
+            *out_reason = NULL;
+            return 0;
         }
-        fclose(f);
-    }
-    if (hash[0] == '\0') {
-        f = fopen("/etc/passwd", "r");
-        if (f) {
-            while (fgets(line, sizeof(line), f)) {
-                if (strncmp(line, user, ulen) == 0 && line[ulen] == ':') {
-                    char *h = line + ulen + 1, *end = strchr(h, ':');
-                    if (end) *end = '\0';
-                    h[strcspn(h, "\r\n")] = '\0';
-                    strncpy(hash, h, sizeof(hash) - 1);
-                    break;
-                }
-            }
-            fclose(f);
-        }
-    }
-
-    if (hash[0] != '\0' && hash[0] != 'x' && hash[0] != '!' && hash[0] != '*') {
-        if (hash[0] != '$') { *out_reason = "unrecognised hash format"; return -2; }
-        result = local_crypt(pass, hash);
-        if (!result) { *out_reason = "unsupported hash algorithm"; return -2; }
-        if (strcmp(result, hash) != 0) { *out_reason = "wrong password"; return -1; }
-        *out_reason = NULL;
-        return 0;
-    }
-    if (hash[0] == '!' || hash[0] == '*') { *out_reason = "account locked"; return -1; }
-
-    /* ── vsftpd Berkeley DB fallback ── */
-    char db_path[256];
-    if (find_vsftpd_db(db_path, sizeof(db_path))) {
-        int r = bdb_check_pass(db_path, user, pass);
-        if (r == 0) { *out_reason = NULL; return 0; }
-        if (r == 1) { *out_reason = "wrong password"; return -1; }
+        *out_reason = "wrong password";
+        return -1;
     }
 
     *out_reason = "user not found";
@@ -1132,7 +665,7 @@ static int do_handshake(int fd, uint8_t *mode_out, uint8_t *fps_out,
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tvz, sizeof(tvz));
 
     const char *auth_reason = NULL;
-    auth = shadow_auth(user, pass, &auth_reason);
+    auth = check_auth(user, pass, &auth_reason);
     memset(pass, 0, sizeof(pass));
 
     if (auth != 0) {
