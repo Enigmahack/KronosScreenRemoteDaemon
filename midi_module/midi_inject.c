@@ -15,11 +15,9 @@
 #include <linux/uaccess.h>
 #include <linux/vmalloc.h>
 #include <linux/spinlock.h>
+#include <linux/notifier.h>
 
 MODULE_LICENSE("GPL");
-
-static DEFINE_SPINLOCK(ring_lock);
-static int ring_dead;
 
 static unsigned long receive_fn = 0;
 module_param(receive_fn, ulong, 0444);
@@ -37,10 +35,40 @@ static struct proc_dir_entry *proc_midi_ring;
 static uint8_t midi_buf[4096];
 
 /* Block 5 ring state */
-static uint32_t *hw_queue;     /* CSTGMidiQueue* in container */
-static uint8_t  *hw_data;      /* Block 5 data KVA */
-static uint32_t  hw_mask;      /* 0x7F */
+static uint32_t *hw_queue;
+static uint8_t  *hw_data;
+static uint32_t  hw_mask;
 static uint32_t  ring_cursor;
+
+static DEFINE_SPINLOCK(ring_lock);
+static int ring_dead;
+
+static void ring_disable(void)
+{
+    spin_lock(&ring_lock);
+    ring_dead = 1;
+    hw_data   = NULL;
+    hw_queue  = NULL;
+    port_obj  = NULL;
+    spin_unlock(&ring_lock);
+}
+
+static int midi_module_notify(struct notifier_block *nb,
+                              unsigned long action, void *data)
+{
+    struct module *mod = data;
+    if (action == MODULE_STATE_GOING &&
+        (strcmp(mod->name, "OA") == 0 ||
+         strcmp(mod->name, "loadmod") == 0)) {
+        ring_disable();
+        printk(KERN_INFO "midi_inject: %s unloading, disabled\n", mod->name);
+    }
+    return NOTIFY_OK;
+}
+
+static struct notifier_block midi_nb = {
+    .notifier_call = midi_module_notify,
+};
 
 /* ------------------------------------------------------------------ */
 /*  Port discovery                                                     */
@@ -129,11 +157,13 @@ static int setup_ring(void)
 static ssize_t ring_fops_read(struct file *file, char __user *buf,
                               size_t count, loff_t *ppos)
 {
-    uint32_t wpos, avail, i;
+    uint32_t wpos, avail;
+    uint32_t start, first;
     size_t len;
     uint8_t tmp[512];
     uint8_t  *data;
     uint32_t *queue;
+    uint32_t mask;
 
     spin_lock(&ring_lock);
     if (ring_dead || !hw_data || !hw_queue) {
@@ -142,23 +172,41 @@ static ssize_t ring_fops_read(struct file *file, char __user *buf,
     }
     data  = hw_data;
     queue = hw_queue;
+    mask  = hw_mask;
     spin_unlock(&ring_lock);
 
-    wpos = queue[3];
-    avail = wpos - ring_cursor;
+    if (probe_kernel_read(&wpos, &queue[3], sizeof(wpos))) {
+        ring_disable();
+        printk(KERN_WARNING "midi_inject: ring memory gone (queue read)\n");
+        return -ENODEV;
+    }
 
+    avail = wpos - ring_cursor;
     if (avail == 0)
         return 0;
 
-    if (avail > (hw_mask + 1))
-        avail = hw_mask + 1;
+    if (avail > (mask + 1))
+        avail = mask + 1;
 
     len = avail;
     if (len > count) len = count;
     if (len > sizeof(tmp)) len = sizeof(tmp);
 
-    for (i = 0; i < (uint32_t)len; i++)
-        tmp[i] = data[(ring_cursor + i) & hw_mask];
+    start = ring_cursor & mask;
+    first = (mask + 1) - start;
+    if (first > (uint32_t)len) first = (uint32_t)len;
+
+    if (probe_kernel_read(tmp, &data[start], first)) {
+        ring_disable();
+        printk(KERN_WARNING "midi_inject: ring memory gone (data read)\n");
+        return -ENODEV;
+    }
+    if (first < (uint32_t)len) {
+        if (probe_kernel_read(tmp + first, &data[0], len - first)) {
+            ring_disable();
+            return -ENODEV;
+        }
+    }
 
     if (copy_to_user(buf, tmp, len))
         return -EFAULT;
@@ -170,10 +218,20 @@ static ssize_t ring_fops_read(struct file *file, char __user *buf,
 static ssize_t ring_fops_write(struct file *file, const char __user *buf,
                                size_t count, loff_t *ppos)
 {
+    uint32_t *queue;
+    uint32_t wpos;
+
     spin_lock(&ring_lock);
-    if (!ring_dead && hw_queue)
-        ring_cursor = hw_queue[3];
+    if (ring_dead || !hw_queue) {
+        spin_unlock(&ring_lock);
+        return count;
+    }
+    queue = hw_queue;
     spin_unlock(&ring_lock);
+
+    if (!probe_kernel_read(&wpos, &queue[3], sizeof(wpos)))
+        ring_cursor = wpos;
+
     return count;
 }
 
@@ -242,6 +300,8 @@ static int __init midi_inject_init(void)
             proc_midi_ring->proc_fops = &ring_fops;
     }
 
+    register_module_notifier(&midi_nb);
+
     printk(KERN_INFO "midi_inject: ready — port=%p ring=%s\n",
            port_obj, hw_data ? "KVA" : "none");
     return 0;
@@ -249,12 +309,8 @@ static int __init midi_inject_init(void)
 
 static void __exit midi_inject_exit(void)
 {
-    spin_lock(&ring_lock);
-    ring_dead = 1;
-    hw_data   = NULL;
-    hw_queue  = NULL;
-    port_obj  = NULL;
-    spin_unlock(&ring_lock);
+    unregister_module_notifier(&midi_nb);
+    ring_disable();
 
     if (proc_midi_ring)
         remove_proc_entry(".midi_ring", NULL);
