@@ -1,1 +1,0 @@
-cmd_/home/KronosScreenRemoteDaemon/vusb_midi/test_exit.ko := ld -r -m elf_i386 -T /home/share/linux-2.6.32.11/scripts/module-common.lds --build-id -o /home/KronosScreenRemoteDaemon/vusb_midi/test_exit.ko /home/KronosScreenRemoteDaemon/vusb_midi/test_exit.o /home/KronosScreenRemoteDaemon/vusb_midi/test_exit.mod.o

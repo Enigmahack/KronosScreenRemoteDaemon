@@ -28,6 +28,7 @@ This document describes every network interface exposed by the `screenremote` da
 | TCP | 7373 | Yes (`stream_port` in config) | Framebuffer stream |
 | TCP | 7374 | Yes (`ctrl_port` in config) | Remote control |
 | UDP | 7372 | No | LAN discovery |
+| TCP | 9875 | No | MIDI bridge (localhost only; internal daemon↔midi_tcp) |
 
 The daemon binds the stream and control ports to the first usable LAN IPv4 address it finds (skipping loopback and link-local). If no LAN interface is up, it waits and retries every 5 seconds. The UDP discovery socket always binds to `INADDR_ANY`.
 
@@ -55,16 +56,16 @@ Any payload longer than 5 bytes is accepted as long as the first 5 bytes match.
 The daemon replies to the sender's address and port with a newline-terminated ASCII string.
 
 ```
-KSCR SP=<stream_port> CP=<ctrl_port>\n
+KSCR SP=<stream_port> CP=<ctrl_port> MIDI=<0|1>\n
 ```
 
 Example:
 
 ```
-KSCR SP=7373 CP=7374\n
+KSCR SP=7373 CP=7374 MIDI=1\n
 ```
 
-Both port numbers are decimal ASCII. There is no authentication on discovery; the daemon always responds.
+Port numbers are decimal ASCII. `MIDI=1` indicates the MIDI injection module loaded successfully; `MIDI=0` means MIDI functionality is unavailable. There is no authentication on discovery; the daemon always responds.
 
 ---
 
@@ -599,6 +600,65 @@ Note: CPU percentage fields require two successive `SYSINFO` calls to be meaning
 
 ---
 
+### MIDI_SEND
+
+Inject raw MIDI bytes into the Kronos MIDI engine. Requires the MIDI injection module to be loaded.
+
+```
+Request:  MIDI_SEND <hex>\n
+Response: OK\n                    (bytes injected)
+          ERR MIDI_NOT_LOADED\n   (midi_inject.ko not loaded)
+          ERR BAD_HEX\n           (hex decode failed)
+```
+
+| Argument | Type | Description |
+|----------|------|-------------|
+| hex | string | Hex-encoded MIDI bytes (pairs, spaces allowed). Example: `90 3C 7F` (Note On, middle C, velocity 127) |
+
+The hex string is decoded and written to `/proc/.midi_in` which passes the bytes directly to the Kronos MIDI receive function. Any valid MIDI message can be sent: note on/off, CC, program change, SysEx, etc. Maximum message size is 4096 bytes.
+
+---
+
+### SYSEX
+
+Send a SysEx message and capture the response. The daemon injects the SysEx via the `midi_tcp` subprocess which handles both injection and response capture from the hardware ring buffer.
+
+```
+Request:  SYSEX <hex>\n
+Response: SYSEX_RESP <hex>\n      (captured response as hex)
+          ERR MIDI_NOT_LOADED\n   (midi_inject.ko not loaded or capture unavailable)
+          ERR BAD_SYSEX\n         (hex decode failed or first byte is not F0)
+          ERR TIMEOUT\n           (no response received within timeout)
+```
+
+| Argument | Type | Description |
+|----------|------|-------------|
+| hex | string | Hex-encoded SysEx message (must start with `F0`, should end with `F7`). Spaces allowed between hex pairs. |
+
+The capture timeout is approximately 5 seconds. The response includes all bytes received from the Kronos during the capture window, up to 65536 bytes. For SysEx request/response to work, **Global > MIDI > "Enable Exclusive" must be ON** on the Kronos, or SysEx messages are silently ignored.
+
+---
+
+### MIDI_STATUS
+
+Query the state of the MIDI injection subsystem.
+
+```
+Request:  MIDI_STATUS\n
+Response: MIDI_LOADED=<0|1>\n
+          MIDI_IN=<0|1>\n
+          MIDI_CAPTURE=<0|1>\n
+          OK\n
+```
+
+| Field | Description |
+|-------|-------------|
+| `MIDI_LOADED` | 1 if `midi_inject.ko` was loaded successfully |
+| `MIDI_IN` | 1 if `/proc/.midi_in` is open and writable |
+| `MIDI_CAPTURE` | 1 if the `midi_tcp` subprocess is connected and SysEx capture is available |
+
+---
+
 ## 8. Button name reference
 
 Button names are case-sensitive and must be uppercase.
@@ -808,3 +868,8 @@ Every authentication attempt (success or failure) is appended to `/korg/rw/scree
 | PackBits RLE repeat run max | 128 repetitions | Standard PackBits limit |
 | fb0 poll for `/dev/fb1` at startup | 30 seconds | 300 x 100 ms; daemon exits if fb1 never appears |
 | vkbd.ko open poll at startup | 2 seconds | 20 x 100 ms; falls back to uinput if /proc/.vkbd never appears |
+| midi_inject.ko open poll at startup | 2 seconds | 20 x 100 ms; MIDI disabled if /proc/.midi_in never appears |
+| midi_tcp connect poll at startup | 6 seconds | 30 x 200 ms; SysEx capture unavailable if connection fails |
+| MIDI_SEND max message size | 4096 bytes | Limited by the kernel module's static buffer |
+| SysEx capture buffer | 65536 bytes | Maximum response size from a single SYSEX command |
+| SysEx capture timeout | ~5 seconds | Initial 5 s recv timeout, then 1 s for trailing data |

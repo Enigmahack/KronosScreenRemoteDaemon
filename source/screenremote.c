@@ -29,6 +29,10 @@
  *   VSLIDER value          — set value slider position (0–127)
  *   KEY code val           — raw key inject: code 1–511, val 0=release 1=press
  *   REFRESH                — force full-frame resend (clears shadow_valid)
+ *   MIDI_SEND hex          — inject raw MIDI bytes (hex pairs, spaces allowed)
+ *   SYSEX hex              — send SysEx (must start F0), capture response (up to 5 s)
+ *                            → SYSEX_RESP hex\n  or  ERR TIMEOUT\n
+ *   MIDI_STATUS            → MIDI_LOADED=n\nMIDI_IN=n\nMIDI_CAPTURE=n\nOK\n
  *   SS_TIMEOUT n           — set screensaver timeout at runtime (seconds; 0 = disable)
  *   STATE                  → MODE=N\n  (0=init 1=Setlist 2=Combi 3=Program 4=Sequence 5=Sampling 6=Global 7=Disk)
  *   VERSION                → VER=x.x.x BUILD=xxx\n
@@ -66,18 +70,21 @@
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <ifaddrs.h>
+#include <sys/wait.h>
 #include <linux/fb.h>
 #include <linux/uinput.h>
 #include <sys/syscall.h>
 #include "palette_data.h"
 #include "vkbd_ko.h"
+#include "midi_inject_ko.h"
+#include "midi_tcp_bin.h"
 
 /* ── keyboard injection (uinput fallback) ───────────────────── */
 #define KBD_EV_SYN  0
 #define KBD_EV_KEY  1
 
 /* ── Version ─────────────────────────────────────────────────── */
-#define SCREENREMOTE_VERSION "1.6.3"
+#define SCREENREMOTE_VERSION "1.7.0"
 #ifndef BUILD_ID
 #define BUILD_ID "dev"
 #endif
@@ -85,6 +92,8 @@
 /* ── Config ─────────────────────────────────────────────────── */
 #define SCREENREMOTE_DIR  "/korg/rw/screenremote"
 #define VKBD_KO           SCREENREMOTE_DIR "/vkbd.ko"
+#define MIDI_INJECT_KO    SCREENREMOTE_DIR "/midi_inject.ko"
+#define MIDI_TCP_BIN      SCREENREMOTE_DIR "/midi_tcp"
 
 #define FB_SRC       "/dev/fb1"
 #define FB_DST       "/dev/fb0"
@@ -157,6 +166,11 @@ static int        g_si_prev_valid = 0;
 static int touch_fd = -1;  /* fd to /dev/rtf5 O_WRONLY — injects into Eva's FIFO */
 static int vkbd_fd  = -1;  /* fd to /proc/.vkbd (vkbd.ko virtual keyboard) */
 static int kbd_fd   = -1;  /* fd to physical USB keyboard evdev node (fallback) */
+static int midi_in_fd    = -1;  /* fd to /proc/.midi_in (MIDI injection) */
+static int midi_cap_fd   = -1;  /* TCP socket to midi_tcp child on localhost */
+static pid_t midi_cap_pid = -1;
+static int g_midi_loaded = 0;
+#define MIDI_TCP_PORT 9875
 
 /* Button table — pkt[2]=dev, pkt[3]=code, pkt[4]=0x7f/0x00 for press/release */
 struct btn_def { const char *name; uint32_t dev; uint32_t code; };
@@ -1082,6 +1096,117 @@ static int sysinfo_collect(char *out, int outsz)
     return n;
 }
 
+/* ── MIDI helpers ───────────────────────────────────────────── */
+
+static void resolve_kallsyms(unsigned long *recv_fn, unsigned long *reg_fn)
+{
+    FILE *f = fopen("/proc/kallsyms", "r");
+    char line[256];
+    *recv_fn = 0; *reg_fn = 0;
+    if (!f) return;
+    while (fgets(line, sizeof(line), f)) {
+        unsigned long addr; char type, name[128];
+        if (sscanf(line, "%lx %c %127s", &addr, &type, name) != 3) continue;
+        if (!*recv_fn && strstr(name, "MidiInPortGeneric7Receive"))
+            *recv_fn = addr;
+        else if (!*reg_fn && strstr(name, "RegisterMidiInPort"))
+            *reg_fn = addr;
+        if (*recv_fn && *reg_fn) break;
+    }
+    fclose(f);
+}
+
+
+static int hex_decode(const char *hex, uint8_t *out, int maxlen)
+{
+    int len = 0;
+    while (*hex && len < maxlen) {
+        while (*hex == ' ') hex++;
+        if (!*hex) break;
+        unsigned int b;
+        if (sscanf(hex, "%2x", &b) != 1) return -1;
+        out[len++] = (uint8_t)b;
+        hex += 2;
+    }
+    return len;
+}
+
+#define SYSEX_CAP_SIZE 65536
+static uint8_t sysex_capbuf[SYSEX_CAP_SIZE];
+static char    sysex_hexbuf[SYSEX_CAP_SIZE * 2 + 32];
+
+static void start_midi_capture(void)
+{
+    pid_t pid;
+    int i;
+
+    extract_ko(MIDI_TCP_BIN, midi_tcp_bin, midi_tcp_bin_len);
+    chmod(MIDI_TCP_BIN, 0755);
+
+    /* Ensure loopback is up — Kronos doesn't configure it by default */
+    system("ifconfig lo 127.0.0.1 up 2>/dev/null");
+
+    pid = fork();
+    if (pid < 0) return;
+
+    if (pid == 0) {
+        execl(MIDI_TCP_BIN, "midi_tcp", "-s", NULL);
+        _exit(127);
+    }
+
+    midi_cap_pid = pid;
+    fprintf(stderr, "screenremote: midi_tcp pid=%d port=%d\n",
+            (int)pid, MIDI_TCP_PORT);
+
+    for (i = 0; i < 30 && midi_cap_fd < 0; i++) {
+        struct sockaddr_in sa;
+        int fd;
+        usleep(200000);
+        fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) continue;
+        memset(&sa, 0, sizeof(sa));
+        sa.sin_family = AF_INET;
+        sa.sin_port = htons(MIDI_TCP_PORT);
+        sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) == 0) {
+            int nd = 1;
+            setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nd, sizeof(nd));
+            midi_cap_fd = fd;
+        } else {
+            close(fd);
+        }
+    }
+}
+
+
+static int sysex_send_and_capture(const uint8_t *sysex, int sysex_len)
+{
+    int caplen = 0;
+    struct timeval tv;
+
+    if (midi_cap_fd < 0)
+        return 0;
+
+    send(midi_cap_fd, sysex, sysex_len, 0);
+
+    tv.tv_sec = 5; tv.tv_usec = 0;
+    setsockopt(midi_cap_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    while (caplen < SYSEX_CAP_SIZE) {
+        int n = recv(midi_cap_fd, sysex_capbuf + caplen,
+                     SYSEX_CAP_SIZE - caplen, 0);
+        if (n <= 0) break;
+        caplen += n;
+
+        if (caplen == n) {
+            tv.tv_sec = 1; tv.tv_usec = 0;
+            setsockopt(midi_cap_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        }
+    }
+
+    return caplen;
+}
+
 /* Process one already-parsed command line.
  * fd >= 0: write response to fd.  fd == -1: fire-and-forget, no response. */
 static void process_ctrl_cmd(const char *line, int fd)
@@ -1262,6 +1387,49 @@ static void process_ctrl_cmd(const char *line, int fd)
         } else {
             REPLY("ERR\n", 4);
         }
+
+    } else if (strncmp(line, "MIDI_SEND ", 10) == 0) {
+        if (midi_in_fd < 0) { REPLY("ERR MIDI_NOT_LOADED\n", 20); }
+        else {
+            uint8_t mb[4096];
+            int mlen = hex_decode(line + 10, mb, sizeof(mb));
+            if (mlen > 0) {
+                write(midi_in_fd, mb, mlen);
+                REPLY("OK\n", 3);
+            } else {
+                REPLY("ERR BAD_HEX\n", 12);
+            }
+        }
+
+    } else if (strncmp(line, "SYSEX ", 6) == 0) {
+        if (midi_in_fd < 0 || midi_cap_fd < 0) {
+            REPLY("ERR MIDI_NOT_LOADED\n", 20);
+        } else {
+            uint8_t sb[4096];
+            int slen = hex_decode(line + 6, sb, sizeof(sb));
+            if (slen <= 0 || sb[0] != 0xF0) {
+                REPLY("ERR BAD_SYSEX\n", 14);
+            } else {
+                int caplen, i, rlen;
+                caplen = sysex_send_and_capture(sb, slen);
+                if (caplen > 0) {
+                    rlen = sprintf(sysex_hexbuf, "SYSEX_RESP ");
+                    for (i = 0; i < caplen; i++)
+                        rlen += sprintf(sysex_hexbuf + rlen, "%02X", sysex_capbuf[i]);
+                    sysex_hexbuf[rlen++] = '\n';
+                    REPLY(sysex_hexbuf, rlen);
+                } else {
+                    REPLY("ERR TIMEOUT\n", 12);
+                }
+            }
+        }
+
+    } else if (strcmp(line, "MIDI_STATUS") == 0) {
+        char resp[256];
+        int rlen = snprintf(resp, sizeof(resp),
+            "MIDI_LOADED=%d\nMIDI_IN=%d\nMIDI_CAPTURE=%d\nOK\n",
+            g_midi_loaded, midi_in_fd >= 0 ? 1 : 0, midi_cap_fd >= 0 ? 1 : 0);
+        REPLY(resp, rlen);
     }
 
 #undef REPLY
@@ -1433,6 +1601,42 @@ int main(void)
     for (int _vi = 0; _vi < 20 && vkbd_fd < 0; _vi++) {
         usleep(100000);
         vkbd_fd = open("/proc/.vkbd", O_WRONLY);
+    }
+
+    /* Load MIDI injection module */
+    {
+        unsigned long recv_fn = 0, reg_fn = 0;
+        resolve_kallsyms(&recv_fn, &reg_fn);
+        if (recv_fn && reg_fn) {
+            char params[256];
+            snprintf(params, sizeof(params),
+                     "receive_fn=0x%lx register_fn=0x%lx",
+                     recv_fn, reg_fn);
+            extract_ko(MIDI_INJECT_KO, midi_inject_ko, midi_inject_ko_len);
+            long ret = syscall(SYS_init_module,
+                               (void *)midi_inject_ko,
+                               (unsigned long)midi_inject_ko_len,
+                               params);
+            if (ret == 0 || errno == EEXIST) {
+                g_midi_loaded = 1;
+                fprintf(stderr, "screenremote: midi_inject %s\n",
+                        ret == 0 ? "loaded" : "already loaded");
+            } else {
+                fprintf(stderr, "screenremote: midi_inject failed (%ld)\n", ret);
+            }
+        } else {
+            fprintf(stderr, "screenremote: kallsyms resolve failed, MIDI disabled\n");
+        }
+
+        if (g_midi_loaded) {
+            for (int _mi = 0; _mi < 20 && midi_in_fd < 0; _mi++) {
+                usleep(100000);
+                midi_in_fd = open("/proc/.midi_in", O_WRONLY);
+            }
+            start_midi_capture();
+            fprintf(stderr, "screenremote: midi_in=%d capture=%d\n",
+                    midi_in_fd >= 0 ? 1 : 0, midi_cap_fd >= 0 ? 1 : 0);
+        }
     }
 
     /* On the non-rooted boot path, screenremote starts before /sbin/init via the
@@ -1758,9 +1962,9 @@ int main(void)
             ssize_t n = recvfrom(disc_fd, buf, sizeof(buf) - 1, 0,
                                  (struct sockaddr *)&from, &fromlen);
             if (n >= 5 && memcmp(buf, "KSCR?", 5) == 0) {
-                char resp[48];
-                int rlen = snprintf(resp, sizeof(resp), "KSCR SP=%d CP=%d\n",
-                                    g_stream_port, g_ctrl_port);
+                char resp[64];
+                int rlen = snprintf(resp, sizeof(resp), "KSCR SP=%d CP=%d MIDI=%d\n",
+                                    g_stream_port, g_ctrl_port, g_midi_loaded);
                 sendto(disc_fd, resp, rlen, 0, (struct sockaddr *)&from, fromlen);
             }
         }
@@ -1792,6 +1996,9 @@ int main(void)
     if (touch_fd >= 0) { close(touch_fd); touch_fd = -1; }
     if (vkbd_fd  >= 0) { close(vkbd_fd);  vkbd_fd  = -1; }
     if (kbd_fd   >= 0) { ioctl(kbd_fd, UI_DEV_DESTROY); close(kbd_fd); kbd_fd = -1; }
+    if (midi_in_fd  >= 0) { close(midi_in_fd);  midi_in_fd = -1; }
+    if (midi_cap_fd >= 0) { close(midi_cap_fd); midi_cap_fd = -1; }
+    if (midi_cap_pid > 0) { kill(midi_cap_pid, SIGTERM); waitpid(midi_cap_pid, NULL, 0); }
     fb0_close();
     fprintf(stderr, "screenremote: exited cleanly\n");
     return 0;

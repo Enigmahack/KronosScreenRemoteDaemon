@@ -1,3 +1,0 @@
-0x00000000	usb_gadget_register_driver	/home/KronosScreenRemoteDaemon/vusb_midi/dummy_hcd	EXPORT_SYMBOL
-0x00000000	net2280_set_fifo_mode	/home/KronosScreenRemoteDaemon/vusb_midi/dummy_hcd	EXPORT_SYMBOL
-0x00000000	usb_gadget_unregister_driver	/home/KronosScreenRemoteDaemon/vusb_midi/dummy_hcd	EXPORT_SYMBOL

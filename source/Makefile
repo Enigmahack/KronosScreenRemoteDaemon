@@ -5,7 +5,7 @@ OUTDIR = ../build
 _VERSION := $(shell sed -n 's/.*SCREENREMOTE_VERSION "\([^"]*\)".*/\1/p' screenremote.c)
 BUILD_ID := $(shell date +%Y%m%d)-$(_VERSION)
 
-TARGETS = $(OUTDIR)/screenremote 
+TARGETS = $(OUTDIR)/screenremote
 
 all: $(OUTDIR) $(TARGETS)
 
@@ -15,8 +15,16 @@ $(OUTDIR):
 vkbd_ko.h:
 	$(MAKE) -C ../vkbd_module -f Makefile.module
 
-$(OUTDIR)/screenremote: screenremote.c vkbd_ko.h
+midi_inject_ko.h:
+	$(MAKE) -C ../midi_module -f Makefile.module
+
+midi_tcp_bin.h: midi_tcp.c
+	$(CC) $(CFLAGS) -lpthread -o midi_tcp_bin midi_tcp.c
+	xxd -i midi_tcp_bin > $@
+	rm -f midi_tcp_bin
+
+$(OUTDIR)/screenremote: screenremote.c vkbd_ko.h midi_inject_ko.h midi_tcp_bin.h
 	$(CC) $(CFLAGS) -DBUILD_ID=\"$(BUILD_ID)\" -o $@ screenremote.c
 
 clean:
-	rm -f $(TARGETS)
+	rm -f $(TARGETS) midi_inject_ko.h midi_tcp_bin.h midi_tcp_bin
