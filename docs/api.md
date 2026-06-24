@@ -348,12 +348,16 @@ pkt[3] = event_type   (1 = pen-down, 2 = pen-up, 3 = pen-move)
 pkt[4] = v_adc | (h_adc << 8)
 ```
 
-ADC values are computed from pixel coordinates:
+ADC values are computed from pixel coordinates using configurable touch calibration parameters (see [Section 12](#12-implementation-limits) for config keys):
 
 ```
-h_adc = 10 + (x * 236) / 799    (horizontal, range ~10-246)
-v_adc = 8  + (y * 237) / 599    (vertical,   range ~8-245)
+cx = x + touch_x_offset          (default: 10)
+cy = y + touch_y_offset          (default: 20)
+h_adc = clamp(round(cx * 255 / touch_x_range), 0, 255)
+v_adc = clamp(round(cy * 255 / touch_y_range), 0, 255)
 ```
+
+With defaults (`touch_x_offset=10`, `touch_x_range=813`, `touch_y_offset=20`, `touch_y_range=638`), pixel (0,0) maps to approximately ADC (3,8) and pixel (799,599) maps to approximately ADC (254,247). The calibration parameters can be adjusted in `screenremote.cfg` if the touch response is misaligned on a particular unit.
 
 ---
 
@@ -578,7 +582,7 @@ Response: VER=<version> BUILD=<build_id>\n
 Example:
 
 ```
-VER=1.5.4 BUILD=20240901-1.5.4\n
+VER=1.7.1 BUILD=20260624-1.7.1\n
 ```
 
 `BUILD` is set at compile time from the date and version string.
@@ -873,3 +877,7 @@ Every authentication attempt (success or failure) is appended to `/korg/rw/scree
 | MIDI_SEND max message size | 4096 bytes | Limited by the kernel module's static buffer |
 | SysEx capture buffer | 65536 bytes | Maximum response size from a single SYSEX command |
 | SysEx capture timeout | ~5 seconds | Initial 5 s recv timeout, then 1 s for trailing data |
+| Touch calibration: `touch_x_offset` | 10 | Pixels added to x before ADC scaling |
+| Touch calibration: `touch_x_range` | 813 | Pixel span mapped to ADC 0–255 (horizontal) |
+| Touch calibration: `touch_y_offset` | 20 | Pixels added to y before ADC scaling |
+| Touch calibration: `touch_y_range` | 638 | Pixel span mapped to ADC 0–255 (vertical) |

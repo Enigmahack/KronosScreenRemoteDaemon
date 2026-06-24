@@ -4,7 +4,8 @@
 # Changes take effect the next time screenremote starts (reboot, or rmmod/insmod).
 #
 # Lines beginning with # are comments and are ignored.
-# Recognised keys: stream_port, ctrl_port, screensaver_timeout
+# Recognised keys: stream_port, ctrl_port, screensaver_timeout,
+#   touch_x_offset, touch_x_range, touch_y_offset, touch_y_range
 #
 # Default values are shown below (commented out).
 # Uncomment and change a line to override the default.
@@ -16,3 +17,11 @@
 # Set to 0 to disable. Default is 300 (5 minutes).
 # Only affects fb0 (VGA mirror) — the Kronos display (fb1) is never touched.
 #screensaver_timeout=300
+
+# Touch calibration: adjusts the pixel-to-ADC mapping for touchscreen injection.
+# Defaults are correct for standard Kronos units. Only change if remote touch
+# events land at the wrong position on screen.
+#touch_x_offset=10
+#touch_x_range=813
+#touch_y_offset=20
+#touch_y_range=638
