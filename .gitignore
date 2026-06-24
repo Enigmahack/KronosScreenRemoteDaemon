@@ -12,22 +12,25 @@ vkbd_module/*.o
 vkbd_module/*.mod
 vkbd_module/*.mod.c
 vkbd_module/.*.cmd
+vkbd_module/.tmp_versions/
 vkbd_module/Module.symvers
 vkbd_module/modules.order
 
-# vusb_midi kernel module build artifacts
-vusb_midi/*.ko
-vusb_midi/*.o
-vusb_midi/*.mod
-vusb_midi/*.mod.c
-vusb_midi/.*.cmd
-vusb_midi/.tmp_versions/
-vusb_midi/Module.symvers
-vusb_midi/modules.order
-vusb_midi/modpost_local
+# midi_module kernel module build artifacts
+midi_module/*.ko
+midi_module/*.o
+midi_module/*.mod
+midi_module/*.mod.c
+midi_module/.*.cmd
+midi_module/.tmp_versions/
+midi_module/Module.symvers
+midi_module/modules.order
+midi_module/modpost_local
 
-# Generated header (produced by Makefile.module via xxd)
+# Generated headers (produced by Makefile / Makefile.module via xxd)
 source/vkbd_ko.h
+source/midi_inject_ko.h
+source/midi_tcp_bin.h
 
 # PackageMaker generated packages and payload binaries
 tools/PackageMaker/dist/

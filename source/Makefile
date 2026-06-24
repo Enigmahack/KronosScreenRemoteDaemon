@@ -1,5 +1,7 @@
-CC     = i686-linux-gnu-gcc
-CFLAGS = -Wall -O2 -static
+ifeq ($(origin CC),default)
+  CC := $(if $(shell command -v i686-linux-gnu-gcc 2>/dev/null),i686-linux-gnu-gcc,gcc)
+endif
+CFLAGS = -Wall -O2 -static $(if $(filter i686-linux-gnu-gcc,$(CC)),,-m32)
 OUTDIR = ../build
 
 _VERSION := $(shell sed -n 's/.*SCREENREMOTE_VERSION "\([^"]*\)".*/\1/p' screenremote.c)
@@ -27,4 +29,4 @@ $(OUTDIR)/screenremote: screenremote.c vkbd_ko.h midi_inject_ko.h midi_tcp_bin.h
 	$(CC) $(CFLAGS) -DBUILD_ID=\"$(BUILD_ID)\" -o $@ screenremote.c
 
 clean:
-	rm -f $(TARGETS) midi_inject_ko.h midi_tcp_bin.h midi_tcp_bin
+	rm -f $(TARGETS) vkbd_ko.h midi_inject_ko.h midi_tcp_bin.h midi_tcp_bin

@@ -14,8 +14,12 @@
 #include <linux/proc_fs.h>
 #include <linux/uaccess.h>
 #include <linux/vmalloc.h>
+#include <linux/spinlock.h>
 
 MODULE_LICENSE("GPL");
+
+static DEFINE_SPINLOCK(ring_lock);
+static int ring_dead;
 
 static unsigned long receive_fn = 0;
 module_param(receive_fn, ulong, 0444);
@@ -128,11 +132,19 @@ static ssize_t ring_fops_read(struct file *file, char __user *buf,
     uint32_t wpos, avail, i;
     size_t len;
     uint8_t tmp[512];
+    uint8_t  *data;
+    uint32_t *queue;
 
-    if (!hw_data || !hw_queue)
+    spin_lock(&ring_lock);
+    if (ring_dead || !hw_data || !hw_queue) {
+        spin_unlock(&ring_lock);
         return -ENODEV;
+    }
+    data  = hw_data;
+    queue = hw_queue;
+    spin_unlock(&ring_lock);
 
-    wpos = hw_queue[3];
+    wpos = queue[3];
     avail = wpos - ring_cursor;
 
     if (avail == 0)
@@ -146,7 +158,7 @@ static ssize_t ring_fops_read(struct file *file, char __user *buf,
     if (len > sizeof(tmp)) len = sizeof(tmp);
 
     for (i = 0; i < (uint32_t)len; i++)
-        tmp[i] = hw_data[(ring_cursor + i) & hw_mask];
+        tmp[i] = data[(ring_cursor + i) & hw_mask];
 
     if (copy_to_user(buf, tmp, len))
         return -EFAULT;
@@ -158,8 +170,10 @@ static ssize_t ring_fops_read(struct file *file, char __user *buf,
 static ssize_t ring_fops_write(struct file *file, const char __user *buf,
                                size_t count, loff_t *ppos)
 {
-    if (hw_queue)
+    spin_lock(&ring_lock);
+    if (!ring_dead && hw_queue)
         ring_cursor = hw_queue[3];
+    spin_unlock(&ring_lock);
     return count;
 }
 
@@ -177,13 +191,21 @@ static int midi_write(struct file *f, const char __user *buf,
                       unsigned long count, void *data)
 {
     receive_fn_t fn;
+    void *obj;
     int len = count > sizeof(midi_buf) ? sizeof(midi_buf) : count;
 
-    if (!port_obj || !receive_fn) return -ENODEV;
+    spin_lock(&ring_lock);
+    if (ring_dead || !port_obj || !receive_fn) {
+        spin_unlock(&ring_lock);
+        return -ENODEV;
+    }
+    fn  = (receive_fn_t)receive_fn;
+    obj = port_obj;
+    spin_unlock(&ring_lock);
+
     if (copy_from_user(midi_buf, buf, len)) return -EFAULT;
 
-    fn = (receive_fn_t)receive_fn;
-    fn(port_obj, midi_buf, len);
+    fn(obj, midi_buf, len);
     return count;
 }
 
@@ -227,6 +249,13 @@ static int __init midi_inject_init(void)
 
 static void __exit midi_inject_exit(void)
 {
+    spin_lock(&ring_lock);
+    ring_dead = 1;
+    hw_data   = NULL;
+    hw_queue  = NULL;
+    port_obj  = NULL;
+    spin_unlock(&ring_lock);
+
     if (proc_midi_ring)
         remove_proc_entry(".midi_ring", NULL);
     if (proc_midi_in)

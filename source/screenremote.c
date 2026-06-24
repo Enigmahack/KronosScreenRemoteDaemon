@@ -1999,6 +1999,11 @@ int main(void)
     if (midi_in_fd  >= 0) { close(midi_in_fd);  midi_in_fd = -1; }
     if (midi_cap_fd >= 0) { close(midi_cap_fd); midi_cap_fd = -1; }
     if (midi_cap_pid > 0) { kill(midi_cap_pid, SIGTERM); waitpid(midi_cap_pid, NULL, 0); }
+    if (g_midi_loaded) {
+        syscall(__NR_delete_module, "midi_inject", O_NONBLOCK);
+        g_midi_loaded = 0;
+    }
+    syscall(__NR_delete_module, "vkbd", O_NONBLOCK);
     fb0_close();
     fprintf(stderr, "screenremote: exited cleanly\n");
     return 0;
