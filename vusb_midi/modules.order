@@ -1,0 +1,5 @@
+kernel//home/KronosScreenRemoteDaemon/vusb_midi/dummy_hcd.ko
+kernel//home/KronosScreenRemoteDaemon/vusb_midi/vusb_midi.ko
+kernel//home/KronosScreenRemoteDaemon/vusb_midi/test_exit.ko
+kernel//home/KronosScreenRemoteDaemon/vusb_midi/test_alloc.ko
+kernel//home/KronosScreenRemoteDaemon/vusb_midi/test_param.ko

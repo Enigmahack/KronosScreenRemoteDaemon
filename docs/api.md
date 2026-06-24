@@ -214,10 +214,10 @@ The control port accepts text-line commands (newline-terminated, `\n`) that inje
 The daemon enforces a strict IP-based access control rule:
 
 - After a stream client successfully authenticates, **only connections from that client's IP address** are accepted on the control port.
-- If no stream client has ever connected (since the last daemon start), control connections are accepted from any IP.
+- If no stream client is connected, **all control connections are rejected**.
 - A control connection from a disallowed IP is immediately closed with no response.
 
-This means a client must authenticate on the stream port before it can use the control port.
+A client must authenticate on the stream port before it can use the control port.
 
 ### 5.3 Command format
 
@@ -741,11 +741,13 @@ Line 2: password (plain text)
 
 This is the credential store managed by the Kronos UI (the network/FTP user). If the submitted username matches line 1, authentication either succeeds (passwords match) or fails (passwords differ) and no further backends are tried.
 
-### 10.2 password1 directory fallback
+### 10.2 PublicID directory fallback
 
 If `KronosNet.conf` is missing or does not contain the submitted username, the daemon checks whether the directory `/korg/rw/HD/screenremote/password1` exists.
 
-If the directory is present, the daemon accepts the fixed credentials: username `kronos`, password `password1`. Any other username or password is rejected. If the directory does not exist, authentication fails with "user not found".
+If the directory is present, the daemon accepts username `kronos` with the device's PublicID as the password. The PublicID is the dashed form shown in the Kronos UI (Global > Basic, Menu > Display Public ID), e.g. `AA-BB-CC-DD-EE-FF-00-11`. Dashes are optional — the daemon strips them before comparing, so both `AA-BB-CC-DD-EE-FF-00-11` and `AABBCCDDEEFF0011` are accepted. Any other username or password is rejected. If the directory does not exist, authentication fails with "user not found".
+
+The PublicID is read from `/proc/id` (created by `GetPubIdMod.ko` at boot) and is unique per device. It is visible to the device owner but not guessable by an external attacker.
 
 This fallback is intended as an emergency recovery path for screen connect only. It does not grant FTP access. It covers cases where `KronosNet.conf` is absent — for example on a Nautilus where the file may not exist or may be named differently.
 

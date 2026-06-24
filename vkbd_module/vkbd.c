@@ -74,7 +74,7 @@ static void vkbd_setup(struct work_struct *work)
 		return;
 	}
 
-	vkbd_proc = create_proc_entry(".vkbd", 0222, NULL);
+	vkbd_proc = create_proc_entry(".vkbd", 0200, NULL);
 	if (vkbd_proc)
 		vkbd_proc->write_proc = vkbd_write_proc;
 

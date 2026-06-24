@@ -1,0 +1,8 @@
+obj-m += dummy_hcd.o vusb_midi.o test_exit.o test_alloc.o test_param.o
+EXTRA_CFLAGS := -fno-pic -fno-PIE -fno-common \
+    -include $(src)/include/kronos_compat.h \
+    -isystem $(src)/include \
+    -I$(srctree)/drivers/usb/gadget \
+    -DCONFIG_USB_GADGET=1 \
+    -DCONFIG_USB_GADGET_DUMMY_HCD=1 \
+    -DCONFIG_USB_GADGET_VBUS_DRAW=2

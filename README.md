@@ -18,33 +18,48 @@ Kronos Screen Remote Daemon: A framebuffer streaming daemon and virtual keyboard
 
 ```
 source/
-  screenremote.c          	- main daemon source (C99, i686, static)
-  screenremote.cfg.example	- example config file
-  Makefile                	- builds the screenremote binary
-  palette_data.h          	- Kronos display palette table
-  vkbd_ko.h               	- generated: embedded vkbd.ko as a C array (do not edit; not committed)
+  screenremote.c            - main daemon source (C99, i686, static)
+  screenremote.cfg.example  - example config file
+  Makefile                  - builds the screenremote binary
+  palette_data.h            - Kronos display palette table
+  no_tracepoints.h          - stub header for kernel tracepoint macros
+  vkbd_ko.h                 - generated: embedded vkbd.ko as a C array (do not edit; not committed)
 
 vkbd_module/
-  vkbd.c                  	- virtual keyboard kernel module source
-  Kbuild                  	- kernel build descriptor
-  Makefile.module         	- builds vkbd.ko, patches it, then generates vkbd_ko.h
-  vkbd.ko                 	- built by Makefile.module (not committed; generated)
+  vkbd.c                    - virtual keyboard kernel module source
+  Kbuild                    - kernel build descriptor
+  Makefile.module            - builds vkbd.ko, patches it, then generates vkbd_ko.h
+  vkbd.ko                   - built by Makefile.module (not committed; generated)
+
+vusb_midi/                   - experimental virtual USB MIDI module (not active; see notes below)
+  vusb_midi.c               - virtual USB MIDI gadget driver source
+  dummy_hcd.c               - dummy host controller driver source
+  test_alloc.c               - kernel allocator test module
+  test_exit.c                - module exit path test
+  test_param.c               - module parameter test
+  Kbuild                     - kernel build descriptor
+  Makefile.module            - builds kernel modules against 2.6.32.11 tree
+  patch_module.py            - ELF relocation patcher for vusb_midi modules
+  include/                   - compatibility headers for building against 2.6.32.11
 
 tools/
   PackageMaker/
-	payload/				- Your files, organised under the `mnt/` prefix (see below). Not committed — project-specific.
-		mnt/
-			korg/
-				rw/
-		md5sum/
-			md5sum 	   		- Kronos executable required for validating package md5
-	build_auto.py 			- auto-builds using default values
-	build_package.py  		- Interactive package builder. Run this to produce a USB package.
-	README.md				- README on how to use the PackageMaker
-	runPackageBuilder.bat	- Batch file to run python script automatically
-	sign_package.py		   	- Standalone signature generator. Re-sign or verify any package's scripts.
+    payload/                 - Build dependencies and user payload files
+      DisplayUpdaterMessage/ - Kronos updater UI binary (required by package builder)
+      md5sum/                - i386 Linux md5sum binary (required for package integrity checks)
+      mnt/korg/rw/           - your payload files, maps 1:1 to Kronos filesystem (not committed)
+    build_package.py         - interactive package builder (main entry point)
+    build_auto.py            - non-interactive one-shot builder for ScreenRemote
+    build_cleaner.py         - Factory State Restore builder (also standalone)
+    build_unroot.py          - Root Cleaner (unroot) builder (also standalone)
+    sign_package.py          - standalone signature generator / verifier
+    runPackageBuilder.bat    - Windows launcher for build_package.py
+    README.md                - detailed PackageMaker documentation
 
-patch_init_offset.py      	- fixes struct module init offset mismatch (see below)
+docs/
+  api.md                     - full API and wire protocol reference
+
+patch_init_offset.py         - fixes struct module init offset mismatch (see below)
 ```
 
 ---
@@ -101,7 +116,7 @@ Any client on the LAN can send `"KSCR?"` (5 bytes) to UDP port 7372. The daemon 
 Credentials are validated in this order:
 
 1. `/korg/rw/Startup/KronosNet.conf` - Korg UI-managed plaintext username/password
-2. **password1 directory fallback** - if the directory `/korg/rw/HD/screenremote/password1` exists, the user can authenticate with username `kronos` and password `password1`. This is an emergency recovery path for screen connect only (not FTP) and is intended for cases where `KronosNet.conf` is missing or the device is a Nautilus variant that does not have the file
+2. **PublicID directory fallback** - if the directory `/korg/rw/HD/screenremote/password1` exists, the user can authenticate with username `kronos` and the device's PublicID as the password (the dashed form from Global > Basic, Menu > Display Public ID, e.g. `AA-BB-CC-DD-EE-FF-00-11`; dashes are optional). This is an emergency recovery path for screen connect only (not FTP) and is intended for cases where `KronosNet.conf` is missing or the device is a Nautilus variant that does not have the file
 
 ### VGA mirror and screensaver
 
@@ -159,6 +174,12 @@ The Kronos kernel's `struct module` places the `init` function pointer at offset
 ```sh
 python3 patch_init_offset.py vkbd_module/vkbd.ko
 ```
+
+---
+
+## vusb_midi (experimental, inactive)
+
+The `vusb_midi/` directory contains an experimental virtual USB MIDI driver that attempted to use `dummy_hcd` to inject MIDI messages over Ethernet via a USB gadget interface. This approach was abandoned because `dummy_hcd` is incompatible with the Kronos's RTAI real-time kernel — the URB completion tasklets conflict with RTAI scheduling and cause kernel panics. The source is retained for reference. MIDI injection has since moved to a FIFO-based approach integrated into the daemon via a TCP bridge.
 
 ---
 

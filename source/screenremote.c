@@ -245,7 +245,7 @@ static const struct btn_def btn_table[] = {
 
 /* ── Access control ─────────────────────────────────────────── */
 /* IP (network byte order) of the current stream client. Only that host is
- * allowed to send control commands. 0 = no stream client yet → allow any. */
+ * allowed to send control commands. 0 = no stream client → reject all. */
 static uint32_t g_ctrl_allowed_ip = 0;
 
 /* Currently bound listen address (network byte order). Tracked so we can
@@ -275,12 +275,40 @@ static int write_all(int fd, const void *buf, size_t n)
     return 0;
 }
 
-/* ── Emergency fallback password directory ──────────────────────────────────
+/* ── Emergency fallback authentication ─────────────────────────────────────
  * If /korg/rw/HD/screenremote/password1/ exists as a directory, the user can
- * authenticate to screen connect (not FTP) with username "kronos" and
- * password "password1".  This provides a recovery path when KronosNet.conf
- * is missing or the device is a Nautilus variant without that file. */
+ * authenticate to screen connect (not FTP) with username "kronos" and the
+ * device's PublicID (read from /proc/id, dashes stripped) as the password.
+ * This provides a recovery path when KronosNet.conf is missing or the device
+ * is a Nautilus variant without that file. */
 #define PASSWORD1_DIR "/korg/rw/HD/screenremote/password1"
+
+static char g_pubid[17]; /* 16 hex chars + NUL, populated at startup */
+
+static void read_pubid(void)
+{
+    FILE *f = fopen("/proc/id", "r");
+    char raw[32];
+    int i, o = 0;
+    g_pubid[0] = '\0';
+    if (!f) return;
+    if (!fgets(raw, sizeof(raw), f)) { fclose(f); return; }
+    fclose(f);
+    for (i = 0; raw[i] && o < 16; i++)
+        if (raw[i] != '-' && raw[i] != '\n' && raw[i] != '\r')
+            g_pubid[o++] = raw[i];
+    g_pubid[o] = '\0';
+}
+
+static void strip_dashes(const char *in, char *out, int outsz)
+{
+    int o = 0;
+    while (*in && o < outsz - 1) {
+        if (*in != '-') out[o++] = *in;
+        in++;
+    }
+    out[o] = '\0';
+}
 
 /* Check /korg/rw/Startup/KronosNet.conf — Korg's UI-managed credential store.
  * Format: line 1 = username, line 2 = password (plain text, updated by the UI).
@@ -312,10 +340,12 @@ static int check_auth(const char *user, const char *pass, const char **out_reaso
     if (kr == 0) { *out_reason = NULL; return 0; }
     if (kr == 1) { *out_reason = "wrong password"; return -1; }
 
-    /* ── password1 directory fallback ── */
+    /* ── PublicID directory fallback ── */
     struct stat st;
-    if (stat(PASSWORD1_DIR, &st) == 0 && S_ISDIR(st.st_mode)) {
-        if (strcmp(user, "kronos") == 0 && strcmp(pass, "password1") == 0) {
+    if (stat(PASSWORD1_DIR, &st) == 0 && S_ISDIR(st.st_mode) && g_pubid[0]) {
+        char pass_stripped[17];
+        strip_dashes(pass, pass_stripped, sizeof(pass_stripped));
+        if (strcmp(user, "kronos") == 0 && strcmp(pass_stripped, g_pubid) == 0) {
             *out_reason = NULL;
             return 0;
         }
@@ -369,9 +399,19 @@ static int fb1_open(void)
         ioctl(fb1_fd, FBIOGET_VSCREENINFO, &fvar) < 0) {
         perror("fb1 ioctl"); return -1;
     }
+    if (fvar.bits_per_pixel != 8) {
+        fprintf(stderr, "screenremote: fb1 bpp=%u, expected 8\n",
+                fvar.bits_per_pixel);
+        return -1;
+    }
     fb_w        = fvar.xres;
     fb_h        = fvar.yres;
     fb1_stride  = ffix.line_length;
+    if (fb_w == 0 || fb_h == 0 || fb1_stride < fb_w) {
+        fprintf(stderr, "screenremote: fb1 bad geometry %ux%u stride=%u\n",
+                fb_w, fb_h, fb1_stride);
+        return -1;
+    }
     frame_bytes = fb_w * fb_h;
 
     {
@@ -693,6 +733,12 @@ static int do_handshake(int fd, uint8_t *mode_out, uint8_t *fps_out,
     }
 
     *mode_out = hdr[5];
+    if (*mode_out != MODE_PULL && *mode_out != MODE_CHANGE) {
+        fail[4] = 0x01;
+        write_all(fd, fail, 5);
+        log_access(peer_ip, 0, "invalid stream mode");
+        return -1;
+    }
     *fps_out  = hdr[6] ? hdr[6] : FPS_MAX;
     if (*fps_out > FPS_MAX) *fps_out = FPS_MAX;
 
@@ -841,6 +887,10 @@ static int sysinfo_collect(char *out, int outsz)
     int         ncpu = 0, i, n = 0;
     FILE       *f;
     char        line[256];
+#define SI_APPEND(...) do { \
+    if (n < outsz) n += snprintf(out + n, outsz - n, __VA_ARGS__); \
+    if (n >= outsz) n = outsz - 1; \
+} while (0)
 
     /* ── /proc/stat — CPU delta ───────────────────────────────── */
     memset(cur, 0, sizeof(cur));
@@ -883,7 +933,7 @@ static int sysinfo_collect(char *out, int outsz)
         unsigned long up = 0;
         f = fopen("/proc/uptime", "r");
         if (f) { fscanf(f, "%lu", &up); fclose(f); }
-        n += snprintf(out + n, outsz - n, "UPTIME=%lu\n", up);
+        SI_APPEND("UPTIME=%lu\n", up);
     }
 
     /* ── /proc/loadavg ────────────────────────────────────────── */
@@ -891,7 +941,7 @@ static int sysinfo_collect(char *out, int outsz)
         float l1 = 0, l5 = 0, l15 = 0;
         f = fopen("/proc/loadavg", "r");
         if (f) { fscanf(f, "%f %f %f", &l1, &l5, &l15); fclose(f); }
-        n += snprintf(out + n, outsz - n, "LOAD=%.2f %.2f %.2f\n", l1, l5, l15);
+        SI_APPEND("LOAD=%.2f %.2f %.2f\n", l1, l5, l15);
     }
 
     /* ── /proc/meminfo ────────────────────────────────────────── */
@@ -908,15 +958,14 @@ static int sysinfo_collect(char *out, int outsz)
             }
             fclose(f);
         }
-        n += snprintf(out + n, outsz - n,
-            "MEM_TOTAL_KB=%lu\nMEM_FREE_KB=%lu\nMEM_AVAIL_KB=%lu\n",
+        SI_APPEND("MEM_TOTAL_KB=%lu\nMEM_FREE_KB=%lu\nMEM_AVAIL_KB=%lu\n",
             total, mem_free, mem_free + bufs + cached);
     }
 
     /* ── CPU percentages ──────────────────────────────────────── */
-    n += snprintf(out + n, outsz - n, "CPU_PCT=%d\n", cpu_pct[0]);
+    SI_APPEND("CPU_PCT=%d\n", cpu_pct[0]);
     for (i = 0; i < ncpu; i++)
-        n += snprintf(out + n, outsz - n, "CPU%d_PCT=%d\n", i, cpu_pct[i + 1]);
+        SI_APPEND("CPU%d_PCT=%d\n", i, cpu_pct[i + 1]);
 
     /* ── /proc/KorgUsbAudio ───────────────────────────────────── */
     {
@@ -935,8 +984,7 @@ static int sysinfo_collect(char *out, int outsz)
             }
             fclose(f);
         }
-        n += snprintf(out + n, outsz - n,
-            "AUDIO_SR=%u\nAUDIO_OUT_CH=%u\nAUDIO_RTO=%lu\nAUDIO_MIDI_RT=%lu\n",
+        SI_APPEND("AUDIO_SR=%u\nAUDIO_OUT_CH=%u\nAUDIO_RTO=%lu\nAUDIO_MIDI_RT=%lu\n",
             sr, och, rto, midi_rt);
     }
 
@@ -946,8 +994,7 @@ static int sysinfo_collect(char *out, int outsz)
         if (statvfs("/korg/rw", &sv) == 0) {
             unsigned long free_mb  = (unsigned long)((unsigned long long)sv.f_bavail * sv.f_bsize >> 20);
             unsigned long total_mb = (unsigned long)((unsigned long long)sv.f_blocks * sv.f_bsize >> 20);
-            n += snprintf(out + n, outsz - n,
-                "DISK_FREE_MB=%lu\nDISK_TOTAL_MB=%lu\n", free_mb, total_mb);
+            SI_APPEND("DISK_FREE_MB=%lu\nDISK_TOTAL_MB=%lu\n", free_mb, total_mb);
         }
     }
 
@@ -957,8 +1004,7 @@ static int sysinfo_collect(char *out, int outsz)
         if (statvfs("/korg/rw2", &sv) == 0) {
             unsigned long free_mb  = (unsigned long)((unsigned long long)sv.f_bavail * sv.f_bsize >> 20);
             unsigned long total_mb = (unsigned long)((unsigned long long)sv.f_blocks * sv.f_bsize >> 20);
-            n += snprintf(out + n, outsz - n,
-                "RW2_FREE_MB=%lu\nRW2_TOTAL_MB=%lu\n", free_mb, total_mb);
+            SI_APPEND("RW2_FREE_MB=%lu\nRW2_TOTAL_MB=%lu\n", free_mb, total_mb);
         }
     }
 
@@ -977,14 +1023,13 @@ static int sysinfo_collect(char *out, int outsz)
                 if (statvfs(mnt, &sv) != 0) continue;
                 unsigned long free_mb  = (unsigned long)((unsigned long long)sv.f_bavail * sv.f_bsize >> 20);
                 unsigned long total_mb = (unsigned long)((unsigned long long)sv.f_blocks * sv.f_bsize >> 20);
-                n += snprintf(out + n, outsz - n,
-                    "USB%d_MNT=%s\nUSB%d_FREE_MB=%lu\nUSB%d_TOTAL_MB=%lu\n",
+                SI_APPEND("USB%d_MNT=%s\nUSB%d_FREE_MB=%lu\nUSB%d_TOTAL_MB=%lu\n",
                     usb_n, mnt, usb_n, free_mb, usb_n, total_mb);
                 usb_n++;
             }
             fclose(mf);
         }
-        n += snprintf(out + n, outsz - n, "USB_COUNT=%d\n", usb_n);
+        SI_APPEND("USB_COUNT=%d\n", usb_n);
     }
 
     /* ── Hardware monitor (W83627UHG) ─────────────────────────── */
@@ -1017,7 +1062,7 @@ static int sysinfo_collect(char *out, int outsz)
                 f = fopen(tpath, "r");
                 if (f) {
                     tv = 0; fscanf(f, "%d", &tv); fclose(f);
-                    n += snprintf(out + n, outsz - n, "TEMP%d=%d\n", i, tv / 1000);
+                    SI_APPEND("TEMP%d=%d\n", i, tv / 1000);
                 }
             }
             snprintf(tpath, sizeof(tpath),
@@ -1025,14 +1070,15 @@ static int sysinfo_collect(char *out, int outsz)
                      hwmon_base, sub);
             f = fopen(tpath, "r");
             if (f) { tv = 0; fscanf(f, "%d", &tv); fclose(f);
-                n += snprintf(out + n, outsz - n, "FAN1_RPM=%d\n", tv); }
+                SI_APPEND("FAN1_RPM=%d\n", tv); }
         }
     }
 
     /* ── Mode ─────────────────────────────────────────────────── */
-    n += snprintf(out + n, outsz - n, "MODE=%u\n", (unsigned)g_mode);
+    SI_APPEND("MODE=%u\n", (unsigned)g_mode);
 
-    n += snprintf(out + n, outsz - n, "OK\n");
+    SI_APPEND("OK\n");
+#undef SI_APPEND
     return n;
 }
 
@@ -1237,7 +1283,7 @@ static int handle_ctrl_persistent_data(void)
         if (c == '\n') {
             ctrl_lb[ctrl_lb_n - 1] = '\0';
             if (ctrl_lb_n > 1)
-                process_ctrl_cmd(ctrl_lb, -1);
+                process_ctrl_cmd(ctrl_lb, ctrl_fd);
             ctrl_lb_n = 0;
         }
     }
@@ -1370,9 +1416,13 @@ int main(void)
     signal(SIGINT,  sig_exit);
 
     read_config();
+    read_pubid();
 
     /* Ensure runtime directory exists (binary lives here, so it always should) */
     mkdir(SCREENREMOTE_DIR, 0755);
+
+    /* Truncate access log on each boot to avoid filling /korg/rw over time */
+    { FILE *lf = fopen(SCREENREMOTE_DIR "/access.log", "w"); if (lf) fclose(lf); }
 
     /* Extract and load virtual keyboard early so Eva discovers it before any client connects.
      * Use init_module(2) directly — system() needs /bin/sh which does not exist on non-rooted
@@ -1603,16 +1653,9 @@ int main(void)
             socklen_t plen = sizeof(peer);
             int new_fd = accept(stream_listen, (struct sockaddr *)&peer, &plen);
             if (new_fd >= 0) {
-                if (client_fd >= 0) close(client_fd);
-                shadow_valid = 0;
                 setsockopt(new_fd, SOL_SOCKET, SO_SNDTIMEO,
                            &send_to, sizeof(send_to));
                 { int nd = 1; setsockopt(new_fd, IPPROTO_TCP, TCP_NODELAY, &nd, sizeof(nd)); }
-                /* Large send buffer — bypasses net.core.wmem_max (requires root).
-                 * Default wmem_max on 2.6.32 is often 128 KB; sending 480 KB/frame
-                 * would force 3-4 write-block-wait-ACK cycles per frame (~40 ms each)
-                 * if the buffer is smaller than the frame.  With 512 KB the kernel
-                 * can absorb the full frame in one write call and send asynchronously. */
 #ifndef SO_SNDBUFFORCE
 #define SO_SNDBUFFORCE 32
 #endif
@@ -1620,6 +1663,8 @@ int main(void)
                 if (do_handshake(new_fd, &client_mode, &client_fps, &peer) < 0) {
                     close(new_fd);
                 } else {
+                    if (client_fd >= 0) close(client_fd);
+                    shadow_valid = 0;
                     client_fd = new_fd;
                     g_ctrl_allowed_ip = peer.sin_addr.s_addr;
                     clock_gettime(CLOCK_MONOTONIC, &last_frame);
@@ -1644,8 +1689,7 @@ int main(void)
             }
         }
 
-        /* Control command — only accept from the stream client's IP (or any if no
-         * stream client has ever connected yet). */
+        /* Control command — only accept from the authenticated stream client's IP. */
         if (ctrl_listen >= 0 && FD_ISSET(ctrl_listen, &rfds)) {
             struct sockaddr_in cpeer;
             socklen_t cplen = sizeof(cpeer);

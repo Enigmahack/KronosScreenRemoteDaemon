@@ -15,6 +15,17 @@ vkbd_module/.*.cmd
 vkbd_module/Module.symvers
 vkbd_module/modules.order
 
+# vusb_midi kernel module build artifacts
+vusb_midi/*.ko
+vusb_midi/*.o
+vusb_midi/*.mod
+vusb_midi/*.mod.c
+vusb_midi/.*.cmd
+vusb_midi/.tmp_versions/
+vusb_midi/Module.symvers
+vusb_midi/modules.order
+vusb_midi/modpost_local
+
 # Generated header (produced by Makefile.module via xxd)
 source/vkbd_ko.h
 
