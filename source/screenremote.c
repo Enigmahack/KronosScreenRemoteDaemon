@@ -1,42 +1,42 @@
 /*
- * screenremote.c — Kronos framebuffer streaming daemon
+ * screenremote.c �- Kronos framebuffer streaming daemon
  * Not yet tested on Nautilus, but should work with minor tweaks if needed.
  *
  * Streams /dev/fb1 (8bpp, 800×600) over TCP port 7373 (default; set by config).
  * Mirrors fb1 to /dev/fb0 (VGA out) when /korg/rw/screenremote/.mirror_enable exists.
  *
  * Stream handshake (TCP port 7373):
- *   Client → Server: MAGIC[4]="KSCR" + 0x02(ver) + mode(1) + fps(1) + ulen(1) + plen(1)
+ *   Client -> Server: MAGIC[4]="KSCR" + 0x02(ver) + mode(1) + fps(1) + ulen(1) + plen(1)
  *                    + username[ulen] + password[plen]
  *     mode: 0x01=Pull (server sends at fps), 0x02=Change (server sends on fb change)
- *   Server → Client: MAGIC[4] + status(1)  [+ width_LE16 + height_LE16 + 256×RGB8 if status=0x00]
+ *   Server -> Client: MAGIC[4] + status(1)  [+ width_LE16 + height_LE16 + 256×RGB8 if status=0x00]
  *     status: 0x00=ok  0x01=auth_fail  0x02=user_not_found
  *   Frames: [len_LE32][pixel_data]  (full) or dirty-rect PackBits RLE
  *
  * Control port 7374 (text line commands, newline-terminated):
- *   CTRL_PERSIST           — open a persistent session; server keeps the connection open
- *   MIRROR_ON / MIRROR_OFF — enable / disable VGA mirror output
- *   TOUCH nx ny            — tap at normalised float coords (press + release)
- *   TOUCH_DOWN nx ny       — pen-down only
- *   TOUCH_MOVE nx ny       — pen-move (client coalesces consecutive moves)
- *   TOUCH_UP nx ny         — pen-up only
- *   BUTTON name            — press + release a named front-panel button (see btn_table[])
- *   CHORD name1 name2      — press name1, press name2, release name2, release name1
- *   WHEEL CW|CCW           — one data-wheel tick clockwise or counter-clockwise
- *   SLIDER n value         — set CC slider/knob n (1–8) to value (0–127)
+ *   CTRL_PERSIST           �- open a persistent session; server keeps the connection open
+ *   MIRROR_ON / MIRROR_OFF �- enable / disable VGA mirror output
+ *   TOUCH nx ny            �- tap at normalised float coords (press + release)
+ *   TOUCH_DOWN nx ny       �- pen-down only
+ *   TOUCH_MOVE nx ny       �- pen-move (client coalesces consecutive moves)
+ *   TOUCH_UP nx ny         �- pen-up only
+ *   BUTTON name            �- press + release a named front-panel button (see btn_table[])
+ *   CHORD name1 name2      �- press name1, press name2, release name2, release name1
+ *   WHEEL CW|CCW           �- one data-wheel tick clockwise or counter-clockwise
+ *   SLIDER n value         �- set CC slider/knob n (1�- 8) to value (0�- 127)
  *                            Effect depends on active Control Assign page:
- *                            RT KNOBS/KARMA → moves knob n; slider-active → moves slider n
- *   VSLIDER value          — set value slider position (0–127)
- *   KEY code val           — raw key inject: code 1–511, val 0=release 1=press
- *   REFRESH                — force full-frame resend (clears shadow_valid)
- *   MIDI_SEND hex          — inject raw MIDI bytes (hex pairs, spaces allowed)
- *   SYSEX hex              — send SysEx (must start F0), capture response (up to 5 s)
- *                            → SYSEX_RESP hex\n  or  ERR TIMEOUT\n
- *   MIDI_STATUS            → MIDI_LOADED=n\nMIDI_IN=n\nMIDI_CAPTURE=n\nOK\n
- *   SS_TIMEOUT n           — set screensaver timeout at runtime (seconds; 0 = disable)
- *   STATE                  → MODE=N\n  (0=init 1=Setlist 2=Combi 3=Program 4=Sequence 5=Sampling 6=Global 7=Disk)
- *   VERSION                → VER=x.x.x BUILD=xxx\n
- *   SYSINFO                → multi-line key=value block terminated by OK\n
+ *                            RT KNOBS/KARMA -> moves knob n; slider-active -> moves slider n
+ *   VSLIDER value          �- set value slider position (0�- 127)
+ *   KEY code val           �- raw key inject: code 1�- 511, val 0=release 1=press
+ *   REFRESH                �- force full-frame resend (clears shadow_valid)
+ *   MIDI_SEND hex          �- inject raw MIDI bytes (hex pairs, spaces allowed)
+ *   SYSEX hex              �- send SysEx (must start F0), capture response (up to 5 s)
+ *                           -> SYSEX_RESP hex\n  or  ERR TIMEOUT\n
+ *   MIDI_STATUS            �-> MIDI_LOADED=n\nMIDI_IN=n\nMIDI_CAPTURE=n\nOK\n
+ *   SS_TIMEOUT n           �- set screensaver timeout at runtime (seconds; 0 = disable)
+ *   STATE                  �-> MODE=N\n  (0=init 1=Setlist 2=Combi 3=Program 4=Sequence 5=Sampling 6=Global 7=Disk)
+ *   VERSION                �-> VER=x.x.x BUILD=xxx\n
+ *   SYSINFO                �-> multi-line key=value block terminated by OK\n
  *                            (UPTIME, LOAD, MEM_*, CPU_*, AUDIO_*, DISK_*, USB_*, TEMP*, FAN*, MODE)
  *
  * UDP discovery port 7372 (fixed, never configurable):
@@ -79,12 +79,12 @@
 #include "midi_inject_ko.h"
 #include "midi_tcp_bin.h"
 
-/* �Keyboard injection (uinput fallback) */
+/* �Keyboard injection (uinput fallback) */
 #define KBD_EV_SYN  0
 #define KBD_EV_KEY  1
 
-/* �Version */
-#define SCREENREMOTE_VERSION "1.7.2"
+/* �Version */
+#define SCREENREMOTE_VERSION "1.7.4"
 #ifndef BUILD_ID
 #define BUILD_ID "dev"
 #endif
@@ -112,7 +112,7 @@ static int  g_ctrl_port   = CTRL_PORT;
 
 static const uint8_t MAGIC[4] = {'K','S','C','R'};
 
-/* �Framebuffer state */
+/* �Framebuffer state */
 static int       fb1_fd = -1,  fb0_fd = -1;
 static uint8_t  *fb1_map = NULL, *fb0_map = NULL;
 static uint32_t  fb1_stride, fb0_stride;
@@ -146,9 +146,9 @@ static int      ss_prev_valid = 0;
 
 /* Touch calibration */
 static int g_touch_x_offset = 10;   /* pixels added to x before ADC scaling      */
-static int g_touch_x_range  = 813;  /* total pixel span → ADC 0-255              */
+static int g_touch_x_range  = 813;  /* total pixel span -> ADC 0-255             */
 static int g_touch_y_offset = 20;   /* pixels added to y before ADC scaling      */
-static int g_touch_y_range  = 638;  /* total pixel span → ADC 0-255              */
+static int g_touch_y_range  = 638;  /* total pixel span -> ADC 0-255             */
 
 /* Mode state */
 static uint32_t g_mode        = 0;   /* 0=init 1=Setlist 2=Combi 3=Program
@@ -163,7 +163,7 @@ static cpu_snap_t g_si_prev[SI_NCPU + 1]; /* [0]=aggregate  [1..4]=per-cpu  */
 static int        g_si_prev_valid = 0;
 
 /* Touch / button injection */
-static int touch_fd = -1;  /* fd to /dev/rtf5 O_WRONLY — injects into Eva's FIFO */
+static int touch_fd = -1;  /* fd to /dev/rtf5 O_WRONLY - injects into Eva's FIFO */
 static int vkbd_fd  = -1;  /* fd to /proc/.vkbd (vkbd.ko virtual keyboard) */
 static int kbd_fd   = -1;  /* fd to physical USB keyboard evdev node (fallback) */
 static int midi_in_fd    = -1;  /* fd to /proc/.midi_in (MIDI injection) */
@@ -172,7 +172,7 @@ static pid_t midi_cap_pid = -1;
 static int g_midi_loaded = 0;
 #define MIDI_TCP_PORT 9875
 
-/* Button table — pkt[2]=dev, pkt[3]=code, pkt[4]=0x7f/0x00 for press/release */
+/* Button table�- pkt[2]=dev, pkt[3]=code, pkt[4]=0x7f/0x00 for press/release */
 struct btn_def { const char *name; uint32_t dev; uint32_t code; };
 static const struct btn_def btn_table[] = {
     /* Exit / Enter */
@@ -289,14 +289,10 @@ static int write_all(int fd, const void *buf, size_t n)
     return 0;
 }
 
-/* Emergency fallback authentication 
- * If /korg/rw/HD/screenremote/password1/ exists as a directory, the user can
- * authenticate to screen connect (not FTP) with username "kronos" and the
- * device's PublicID (read from /proc/id, dashes stripped) as the password.
- * This provides a recovery path when KronosNet.conf is missing or the device
- * is a Nautilus variant without that file. */
-#define PASSWORD1_DIR "/korg/rw/HD/screenremote/password1"
-
+/* Emergency fallback authentication
+ * When KronosNet.conf does not recognise the user, username "kronos" with the
+ * device's PublicID (read from /proc/id, dashes optional) is accepted for
+ * screen connect only (not FTP).  No directory flag required. */
 static char g_pubid[17]; /* 16 hex chars + NUL, populated at startup */
 
 static void read_pubid(void)
@@ -324,7 +320,7 @@ static void strip_dashes(const char *in, char *out, int outsz)
     out[o] = '\0';
 }
 
-/* Check /korg/rw/Startup/KronosNet.conf�- Korg's UI-managed credential store.
+/* Check /korg/rw/Startup/KronosNet.conf�- Korg's UI-managed credential store.
  * Format: line 1 = username, line 2 = password (plain text, updated by the UI).
  * Returns 0=match, 1=username matched but wrong password, -1=not this user/unavailable. */
 static int kronosnet_auth(const char *user, const char *pass)
@@ -338,28 +334,27 @@ static int kronosnet_auth(const char *user, const char *pass)
     stored_user[strcspn(stored_user, "\r\n")] = '\0';
     stored_pass[strcspn(stored_pass, "\r\n")] = '\0';
     if (stored_user[0] == '\0') return -1;
-    if (strcmp(stored_user, user) != 0) return -1;  /* not the KronosNet user - try system auth */
+    if (strcmp(stored_user, user) != 0) return -1;  /* not the KronosNet user */
     return (strcmp(stored_pass, pass) == 0) ? 0 : 1;
 }
 
 /* Validate credentials.  Priority:
  *   1. KronosNet.conf  (Korg UI-managed, covers the 'kronos' / network user)
- *   2. password1 directory fallback  (emergency recovery for screenconnect)
+ *   2. PublicID fallback  (emergency recovery for screenconnect)
  * Returns 0=ok, -1=wrong password, -2=lookup error.
  * *out_reason describes the failure (never NULL on error). */
 static int check_auth(const char *user, const char *pass, const char **out_reason)
 {
-    /* �KronosNet.conf�*/
+    /* KronosNet.conf */
     int kr = kronosnet_auth(user, pass);
     if (kr == 0) { *out_reason = NULL; return 0; }
     if (kr == 1) { *out_reason = "wrong password"; return -1; }
 
-    /* �PublicID directory fallback */
-    struct stat st;
-    if (stat(PASSWORD1_DIR, &st) == 0 && S_ISDIR(st.st_mode) && g_pubid[0]) {
+    /* PublicID fallback */
+    if (strcmp(user, "kronos") == 0 && g_pubid[0]) {
         char pass_stripped[17];
         strip_dashes(pass, pass_stripped, sizeof(pass_stripped));
-        if (strcmp(user, "kronos") == 0 && strcmp(pass_stripped, g_pubid) == 0) {
+        if (strcmp(pass_stripped, g_pubid) == 0) {
             *out_reason = NULL;
             return 0;
         }
@@ -907,7 +902,7 @@ static int sysinfo_collect(char *out, int outsz)
     if (n >= outsz) n = outsz - 1; \
 } while (0)
 
-    /* �/proc/stat - CPU delta */
+    /* �/proc/stat - CPU delta */
     memset(cur, 0, sizeof(cur));
     f = fopen("/proc/stat", "r");
     if (f) {
@@ -977,7 +972,7 @@ static int sysinfo_collect(char *out, int outsz)
             total, mem_free, mem_free + bufs + cached);
     }
 
-    /* �CPU percentages */
+    /* �CPU percentages */
     SI_APPEND("CPU_PCT=%d\n", cpu_pct[0]);
     for (i = 0; i < ncpu; i++)
         SI_APPEND("CPU%d_PCT=%d\n", i, cpu_pct[i + 1]);
@@ -1145,6 +1140,7 @@ static int            sysex_pending     = 0;    /* 1 = capture in progress      
 static int            sysex_resp_fd     = -1;   /* fd to send response to when done */
 static int            sysex_cap_offset  = 0;    /* bytes captured so far            */
 static int            sysex_got_first   = 0;    /* received at least one byte       */
+static int            sysex_in_f0       = 0;    /* inside F0...F7 block             */
 static struct timespec sysex_t0;                /* capture start time               */
 #define SYSEX_INITIAL_TIMEOUT_MS  5000
 #define SYSEX_TAIL_TIMEOUT_MS     1000
@@ -1206,6 +1202,7 @@ static int sysex_start_async(const uint8_t *sysex, int sysex_len, int resp_fd)
     sysex_resp_fd    = resp_fd;
     sysex_cap_offset = 0;
     sysex_got_first  = 0;
+    sysex_in_f0      = 0;
     clock_gettime(CLOCK_MONOTONIC, &sysex_t0);
     return 1;
 }
@@ -1233,29 +1230,55 @@ static void sysex_finish(void)
     sysex_resp_fd    = -1;
     sysex_pending    = 0;
     sysex_cap_offset = 0;
+    sysex_in_f0      = 0;
 }
 
 /* Called from the main loop when select() reports midi_cap_fd readable,
- * or on each iteration to check the timeout.  Non-blocking. */
+ * or on each iteration to check the timeout.  Non-blocking.
+ *
+ * midi_tcp now forwards all parsed MIDI messages (not only SysEx responses),
+ * so this function always drains midi_cap_fd to prevent socket-buffer buildup.
+ * When a SysEx capture is pending it filters for F0...F7 blocks only;
+ * interleaved channel messages and real-time bytes are discarded. */
 static void sysex_poll(int readable)
 {
-    if (!sysex_pending) return;
-
     if (readable && midi_cap_fd >= 0) {
-        int n = recv(midi_cap_fd, sysex_capbuf + sysex_cap_offset,
-                     SYSEX_CAP_SIZE - sysex_cap_offset, MSG_DONTWAIT);
-        if (n > 0) {
-            int j, done = 0;
-            for (j = sysex_cap_offset; j < sysex_cap_offset + n; j++)
-                if (sysex_capbuf[j] == 0xF7) { done = 1; break; }
-            sysex_cap_offset += n;
-            if (!sysex_got_first) {
-                sysex_got_first = 1;
-                clock_gettime(CLOCK_MONOTONIC, &sysex_t0);
+        uint8_t tmp[4096];
+        int n = recv(midi_cap_fd, tmp, sizeof(tmp), MSG_DONTWAIT);
+        if (n > 0 && sysex_pending) {
+            int j;
+            for (j = 0; j < n; j++) {
+                uint8_t b = tmp[j];
+                /* Real-time bytes may appear anywhere; skip without
+                 * affecting the SysEx parse state. */
+                if (b >= 0xF8) continue;
+                /* SysEx start: begin capturing; discard any partial
+                 * previous attempt if responses were back-to-back. */
+                if (b == 0xF0) {
+                    sysex_in_f0      = 1;
+                    sysex_cap_offset = 0;
+                }
+                if (sysex_in_f0 && sysex_cap_offset < SYSEX_CAP_SIZE) {
+                    sysex_capbuf[sysex_cap_offset++] = b;
+                    if (!sysex_got_first) {
+                        sysex_got_first = 1;
+                        clock_gettime(CLOCK_MONOTONIC, &sysex_t0);
+                    }
+                }
+                /* SysEx end: deliver the captured response. */
+                if (b == 0xF7 && sysex_in_f0) {
+                    sysex_finish();
+                    return;
+                }
+                /* Any other status byte that isn't a real-time or SysEx
+                 * byte resets SysEx tracking (stray non-SysEx MIDI). */
+                if ((b & 0x80) && b != 0xF0)
+                    sysex_in_f0 = 0;
             }
-            if (done) { sysex_finish(); return; }
         }
     }
+
+    if (!sysex_pending) return;
 
     /* Timeout check */
     struct timespec now;
@@ -1878,7 +1901,7 @@ int main(void)
             FD_SET(ctrl_fd, &rfds);
             if (ctrl_fd > maxfd) maxfd = ctrl_fd;
         }
-        if (sysex_pending && midi_cap_fd >= 0) {
+        if (midi_cap_fd >= 0) {
             FD_SET(midi_cap_fd, &rfds);
             if (midi_cap_fd > maxfd) maxfd = midi_cap_fd;
         }
@@ -1910,11 +1933,10 @@ int main(void)
         r = select(maxfd + 1, &rfds, NULL, NULL, &tv);
         if (r < 0) continue;
 
-        /* Async SysEx capture - collect response bytes or timeout.
-         * Runs every iteration so timeouts are checked even when no
-         * data arrives.  Does NOT block - recv uses MSG_DONTWAIT. */
-        if (sysex_pending)
-            sysex_poll(midi_cap_fd >= 0 && FD_ISSET(midi_cap_fd, &rfds));
+        /* Drain midi_tcp output every iteration: collects SysEx responses
+         * when a capture is pending, discards other MIDI bytes otherwise.
+         * Always non-blocking (MSG_DONTWAIT inside sysex_poll). */
+        sysex_poll(midi_cap_fd >= 0 && FD_ISSET(midi_cap_fd, &rfds));
 
         /* New streaming client */
         if (stream_listen >= 0 && FD_ISSET(stream_listen, &rfds)) {

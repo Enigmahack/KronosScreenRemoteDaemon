@@ -625,7 +625,7 @@ The hex string is decoded and written to `/proc/.midi_in` which passes the bytes
 
 ### SYSEX
 
-Send a SysEx message and capture the response. The daemon injects the SysEx via the `midi_tcp` subprocess which handles both injection and response capture from the hardware ring buffer.
+Send a SysEx message and capture the response. The daemon injects the SysEx via the `midi_tcp` subprocess and monitors the MIDI output stream for the reply.
 
 ```
 Request:  SYSEX <hex>\n
@@ -639,7 +639,9 @@ Response: SYSEX_RESP <hex>\n      (captured response as hex)
 |----------|------|-------------|
 | hex | string | Hex-encoded SysEx message (must start with `F0`, should end with `F7`). Spaces allowed between hex pairs. |
 
-The capture timeout is approximately 5 seconds. The response includes all bytes received from the Kronos during the capture window, up to 65536 bytes. For SysEx request/response to work, **Global > MIDI > "Enable Exclusive" must be ON** on the Kronos, or SysEx messages are silently ignored.
+The capture timeout is approximately 5 seconds. The response includes the first complete F0...F7 SysEx message received from the Kronos after the request is sent, up to 65536 bytes. For SysEx request/response to work, **Global > MIDI > "Enable Exclusive" must be ON** on the Kronos, or SysEx messages are silently ignored.
+
+**Asynchronous delivery.** The `midi_tcp` subprocess forwards all MIDI output from the Kronos (note events, CC, SysEx, real-time bytes) as a continuous stream without buffering or request/response pairing. Non-SysEx MIDI events such as note-on/note-off may arrive interleaved with the SysEx response. Delivery order within the stream is preserved (TCP guarantees this), but clients must be prepared to discard or buffer non-SysEx messages that arrive while waiting for a response. Response correlation is by payload content: Korg SysEx messages carry a manufacturer ID (0x42), model ID (0x58 for Kronos), and a function code that identifies the message type — match on those rather than on timing or position in the stream.
 
 ---
 
@@ -805,23 +807,13 @@ Line 2: password (plain text)
 
 This is the credential store managed by the Kronos UI (the network/FTP user). If the submitted username matches line 1, authentication either succeeds (passwords match) or fails (passwords differ) and no further backends are tried.
 
-### 10.2 PublicID directory fallback
+### 10.2 PublicID fallback
 
-If `KronosNet.conf` is missing or does not contain the submitted username, the daemon checks whether the directory `/korg/rw/HD/screenremote/password1` exists.
-
-If the directory is present, the daemon accepts username `kronos` with the device's PublicID as the password. The PublicID is the dashed form shown in the Kronos UI (Global > Basic, Menu > Display Public ID), e.g. `AA-BB-CC-DD-EE-FF-00-11`. Dashes are optional — the daemon strips them before comparing, so both `AA-BB-CC-DD-EE-FF-00-11` and `AABBCCDDEEFF0011` are accepted. Any other username or password is rejected. If the directory does not exist, authentication fails with "user not found".
+If `KronosNet.conf` is missing or does not contain the submitted username, the daemon accepts username `kronos` with the device's PublicID as the password. The PublicID is the dashed form shown in the Kronos UI (Global > Basic, Menu > Display Public ID), e.g. `AA-BB-CC-DD-EE-FF-00-11`. Dashes are optional — the daemon strips them before comparing, so both `AA-BB-CC-DD-EE-FF-00-11` and `AABBCCDDEEFF0011` are accepted. Any other username or password is rejected.
 
 The PublicID is read from `/proc/id` (created by `GetPubIdMod.ko` at boot) and is unique per device. It is visible to the device owner but not guessable by an external attacker.
 
-This fallback is intended as an emergency recovery path for screen connect only. It does not grant FTP access. It covers cases where `KronosNet.conf` is absent — for example on a Nautilus where the file may not exist or may be named differently.
-
-To enable the fallback, create the directory on the Kronos:
-
-```sh
-mkdir -p /korg/rw/HD/screenremote/password1
-```
-
-To disable it, remove the directory.
+This fallback is intended as an emergency recovery path for screen connect only. It does not grant FTP access. It covers cases where `KronosNet.conf` is absent — for example on a Nautilus where the file may not exist or may be named differently. No directory flag or configuration is required to enable it.
 
 ### 10.3 Access log
 

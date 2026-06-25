@@ -118,7 +118,7 @@ Any client on the LAN can send `"KSCR?"` (5 bytes) to UDP port 7372. The daemon 
 Credentials are validated in this order:
 
 1. `/korg/rw/Startup/KronosNet.conf` - Korg UI-managed plaintext username/password
-2. **PublicID directory fallback** - if the directory `/korg/rw/HD/screenremote/password1` exists, the user can authenticate with username `kronos` and the device's PublicID as the password (the dashed form from Global > Basic, Menu > Display Public ID, e.g. `AA-BB-CC-DD-EE-FF-00-11`; dashes are optional). This is an emergency recovery path for screen connect only (not FTP) and is intended for cases where `KronosNet.conf` is missing or the device is a Nautilus variant that does not have the file
+2. **PublicID fallback** - if `KronosNet.conf` does not recognise the user, `kronos` + the device's PublicID is always accepted as a password (the dashed form from Global > Basic, Menu > Display Public ID, e.g. `AA-BB-CC-DD-EE-FF-00-11`; dashes are optional). This is an emergency recovery path for screen connect only (not FTP), covering cases where `KronosNet.conf` is missing or the device is a Nautilus variant that does not have the file. No directory flag is required.
 
 ### VGA mirror and screensaver
 
@@ -135,7 +135,7 @@ At startup the daemon also loads `midi_inject.ko` (embedded as `midi_inject_ko.h
 - `/proc/.midi_in` — write raw MIDI bytes to inject into the Kronos MIDI engine (OA.ko)
 - `/proc/.midi_ring` — read SysEx responses from the hardware ring buffer (Block 5) at kernel speed
 
-The daemon then spawns an embedded `midi_tcp` subprocess (built from `source/midi_tcp.c`, embedded as `midi_tcp_bin.h`) that listens on TCP port 9875 (localhost only). This subprocess bridges MIDI injection and SysEx response capture: it writes to `/proc/.midi_in` and reads from `/proc/.midi_ring` (or falls back to direct shared memory access). The daemon connects to the subprocess on localhost and uses it to handle `MIDI_SEND`, `SYSEX`, and `MIDI_STATUS` control commands.
+The daemon then spawns an embedded `midi_tcp` subprocess (built from `source/midi_tcp.c`, embedded as `midi_tcp_bin.h`) that listens on TCP port 9875 (localhost only). This subprocess is a single-threaded MIDI bridge: it writes inbound TCP bytes directly to `/proc/.midi_in` and reads MIDI output from `/proc/.midi_ring` (or falls back to shared memory), parsing the byte stream into complete MIDI messages and forwarding each one to TCP as it arrives. All message types — note on/off, CC, SysEx, real-time — are forwarded in the order they are produced by the Kronos, without buffering or request/response pairing. The daemon connects to the subprocess on localhost and uses it to handle `MIDI_SEND`, `SYSEX`, and `MIDI_STATUS` control commands. Because MIDI output is delivered asynchronously and unfiltered, SysEx responses may arrive interleaved with other MIDI messages; clients match responses to requests by inspecting the SysEx payload (Korg manufacturer ID 0x42, model ID 0x58, and function code) rather than by timing or stream position.
 
 If the kernel symbols cannot be resolved (e.g. the Kronos OS version is too old or the symbols are stripped), MIDI injection is silently disabled and `MIDI_STATUS` will report `MIDI_LOADED=0`.
 

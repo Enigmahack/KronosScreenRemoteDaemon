@@ -5,6 +5,12 @@
  * Inbound:  TCP → /proc/.midi_in (kernel module injection)
  * Outbound: /proc/.midi_ring (upgraded) or shared memory (fallback) → TCP
  *
+ * All MIDI output is parsed into complete messages and forwarded to the TCP
+ * client immediately as each message completes — SysEx, regular channel
+ * messages, and real-time bytes alike.  The TCP client must tolerate
+ * asynchronous, interleaved delivery and correlate SysEx responses to
+ * requests by message content rather than timing.
+ *
  * Usage: midi_tcp [-p port] [-d] [-s]
  *   -p port  TCP port (default 9875)
  *   -d       debug output
@@ -22,24 +28,12 @@
 #include <sys/select.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
-#include <sys/time.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <stdint.h>
-#include <pthread.h>
 
 static int debug = 0;
 static volatile int running = 1;
-
-/* SysEx capture thread state */
-#define SYSEX_CAP_SIZE 65536
-static uint8_t sysex_capbuf[SYSEX_CAP_SIZE];
-static volatile int sysex_caplen = 0;
-static volatile int sysex_capturing = 0;
-static volatile int sysex_done = 0;
-static pthread_t capture_tid;
-static pthread_mutex_t capture_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t capture_start_cond = PTHREAD_COND_INITIALIZER;
 
 static void sighandler(int sig) { running = 0; }
 
@@ -176,66 +170,158 @@ static void reset_midi_out(struct midi_out_reader *r) {
     }
 }
 
-/* Global reference so capture thread can access it */
-static struct midi_out_reader *g_midi_out = NULL;
+/* ------------------------------------------------------------------ */
+/*  MIDI parser                                                         */
+/* ------------------------------------------------------------------ */
 
-static void *sysex_capture_thread(void *arg)
+/* Total message length (including status) for channel messages 0x8n-0xEn.
+ * Index = (status >> 4) & 0x07. */
+static const int chan_msg_len[7] = {
+    3,  /* 0x8n Note Off */
+    3,  /* 0x9n Note On */
+    3,  /* 0xAn Poly Aftertouch */
+    3,  /* 0xBn Control Change */
+    2,  /* 0xCn Program Change */
+    2,  /* 0xDn Channel Aftertouch */
+    3,  /* 0xEn Pitch Bend */
+};
+
+/* Length for system-common messages 0xF1-0xF6.
+ * Index = b & 0x0F (1=F1 .. 6=F6). */
+static const int syscom_len[7] = {
+    0,  /* unused */
+    2,  /* 0xF1 MTC Quarter Frame */
+    3,  /* 0xF2 Song Position */
+    2,  /* 0xF3 Song Select */
+    1,  /* 0xF4 undefined */
+    1,  /* 0xF5 undefined */
+    1,  /* 0xF6 Tune Request */
+};
+
+#define SYSEX_BUF_SIZE 65536
+
+struct midi_parser {
+    uint8_t  buf[SYSEX_BUF_SIZE];
+    int      len;
+    int      expected;
+    int      in_sysex;
+    uint8_t  running_status;
+};
+
+static void parser_init(struct midi_parser *p) {
+    memset(p, 0, sizeof(*p));
+}
+
+/* Feed one byte through the parser.  Sends a complete MIDI message to
+ * client_fd as soon as one is assembled.  Real-time bytes (0xF8-0xFF)
+ * are emitted immediately without disturbing parser state, so they
+ * are correctly interleaved even inside a SysEx message. */
+static void parser_feed(struct midi_parser *p, uint8_t b, int client_fd)
 {
-    (void)arg;
-    while (running) {
-        pthread_mutex_lock(&capture_mutex);
-        while (!sysex_capturing && running)
-            pthread_cond_wait(&capture_start_cond, &capture_mutex);
-        pthread_mutex_unlock(&capture_mutex);
+    /* Real-time: single byte, pass through immediately. */
+    if (b >= 0xF8) {
+        if (debug)
+            fprintf(stderr, "MIDI->TCP 1 byte (rt): %02x\n", b);
+        if (client_fd >= 0)
+            send(client_fd, &b, 1, 0);
+        return;
+    }
 
-        if (!running) break;
-
-        int caplen = 0;
-        int got_f7 = 0;
-        int idle_loops = 0;
-        struct timeval t0, tnow;
-        gettimeofday(&t0, NULL);
-
-        while (caplen < SYSEX_CAP_SIZE && running) {
-            int chunk = read_midi_out(g_midi_out,
-                                       sysex_capbuf + caplen,
-                                       SYSEX_CAP_SIZE - caplen);
-            if (chunk > 0) {
+    /* SysEx end: flush accumulated SysEx message. */
+    if (b == 0xF7) {
+        if (p->in_sysex) {
+            if (p->len < SYSEX_BUF_SIZE)
+                p->buf[p->len++] = b;
+            if (debug) {
                 int j;
-                for (j = caplen; j < caplen + chunk; j++)
-                    if (sysex_capbuf[j] == 0xF7) got_f7++;
-                caplen += chunk;
-                idle_loops = 0;
-
-                if (got_f7) {
-                    usleep(500);
-                    chunk = read_midi_out(g_midi_out,
-                                           sysex_capbuf + caplen,
-                                           SYSEX_CAP_SIZE - caplen);
-                    if (chunk > 0) {
-                        caplen += chunk;
-                        got_f7 = 0;
-                    } else {
-                        break;
-                    }
-                }
-            } else {
-                idle_loops++;
-                if (idle_loops > 100000) break;
+                fprintf(stderr, "MIDI->TCP %d bytes (SysEx):", p->len);
+                for (j = 0; j < p->len && j < 16; j++)
+                    fprintf(stderr, " %02x", p->buf[j]);
+                if (p->len > 16) fprintf(stderr, " ...");
+                fprintf(stderr, "\n");
             }
+            if (client_fd >= 0)
+                send(client_fd, p->buf, p->len, 0);
+            p->len = 0;
+            p->in_sysex = 0;
+            p->running_status = 0;
+        }
+        return;
+    }
 
-            gettimeofday(&tnow, NULL);
-            long elapsed_ms = (tnow.tv_sec - t0.tv_sec) * 1000 +
-                              (tnow.tv_usec - t0.tv_usec) / 1000;
-            if (elapsed_ms > 3000) break;
+    /* SysEx body: accumulate until F7. */
+    if (p->in_sysex) {
+        if (p->len < SYSEX_BUF_SIZE)
+            p->buf[p->len++] = b;
+        return;
+    }
+
+    /* New status byte. */
+    if (b & 0x80) {
+        if (b == 0xF0) {
+            p->in_sysex = 1;
+            p->len = 0;
+            p->buf[p->len++] = b;
+            p->running_status = 0;
+            p->expected = 0;
+            return;
         }
 
-        sysex_caplen = caplen;
-        sysex_capturing = 0;
-        sysex_done = 1;
+        if (b >= 0xF1 && b <= 0xF6) {
+            /* System common — cancels running status. */
+            int slen = syscom_len[b & 0x0F];
+            p->running_status = 0;
+            p->buf[0] = b;
+            p->len = 1;
+            p->expected = slen;
+            if (slen == 1) {
+                if (debug) fprintf(stderr, "MIDI->TCP 1 byte (syscom): %02x\n", b);
+                if (client_fd >= 0) send(client_fd, p->buf, 1, 0);
+                p->len = 0;
+            }
+            return;
+        }
+
+        /* Channel message (0x80-0xEF). */
+        p->running_status = b;
+        p->expected = chan_msg_len[(b >> 4) & 0x07];
+        p->buf[0] = b;
+        p->len = 1;
+        return;
     }
-    return NULL;
+
+    /* Data byte. */
+
+    /* Apply running status when starting a new message without an explicit status. */
+    if (p->len == 0) {
+        if (!p->running_status)
+            return;
+        p->expected = chan_msg_len[(p->running_status >> 4) & 0x07];
+        p->buf[0] = p->running_status;
+        p->len = 1;
+    }
+
+    if (p->expected > 0 && p->len < p->expected) {
+        p->buf[p->len++] = b;
+        if (p->len == p->expected) {
+            if (debug) {
+                int j;
+                fprintf(stderr, "MIDI->TCP %d bytes:", p->len);
+                for (j = 0; j < p->len && j < 16; j++)
+                    fprintf(stderr, " %02x", p->buf[j]);
+                fprintf(stderr, "\n");
+            }
+            if (client_fd >= 0)
+                send(client_fd, p->buf, p->len, 0);
+            /* Keep running_status; reset len so next data byte re-uses it. */
+            p->len = 0;
+        }
+    }
 }
+
+/* ------------------------------------------------------------------ */
+/*  main                                                                */
+/* ------------------------------------------------------------------ */
 
 int main(int argc, char *argv[]) {
     int port = 9875;
@@ -245,6 +331,7 @@ int main(int argc, char *argv[]) {
     int midi_fd = -1;
     struct sockaddr_in addr;
     struct midi_out_reader midi_out;
+    struct midi_parser parser;
     uint8_t buf[4096];
 
     while ((opt = getopt(argc, argv, "p:ds")) != -1) {
@@ -285,8 +372,7 @@ int main(int argc, char *argv[]) {
         setsid();
     }
 
-    g_midi_out = &midi_out;
-    pthread_create(&capture_tid, NULL, sysex_capture_thread, NULL);
+    parser_init(&parser);
 
     fprintf(stderr, "midi_tcp: listening on port %d%s\n", port,
             midi_out.ring_fd >= 0 ? " (upgraded ring)" : "");
@@ -312,6 +398,7 @@ int main(int argc, char *argv[]) {
             break;
         }
 
+        /* New connection: replace any existing client. */
         if (FD_ISSET(server_fd, &rfds)) {
             struct sockaddr_in caddr;
             socklen_t clen = sizeof(caddr);
@@ -328,12 +415,14 @@ int main(int argc, char *argv[]) {
                     fprintf(stderr, "warning: can't open /proc/.midi_in\n");
 
                 reset_midi_out(&midi_out);
+                parser_init(&parser);
 
                 if (debug)
                     fprintf(stderr, "client connected\n");
             }
         }
 
+        /* Inbound MIDI from TCP client → write directly to kernel. */
         if (client_fd >= 0 && FD_ISSET(client_fd, &rfds)) {
             int n = recv(client_fd, buf, sizeof(buf), 0);
             if (n <= 0) {
@@ -343,69 +432,26 @@ int main(int argc, char *argv[]) {
                 if (midi_fd >= 0) { close(midi_fd); midi_fd = -1; }
             } else {
                 if (debug) {
-                    fprintf(stderr, "TCP->MIDI %d bytes:", n);
                     int i;
+                    fprintf(stderr, "TCP->MIDI %d bytes:", n);
                     for (i = 0; i < n && i < 16; i++)
                         fprintf(stderr, " %02x", buf[i]);
                     if (n > 16) fprintf(stderr, " ...");
                     fprintf(stderr, "\n");
                 }
-                if (midi_fd >= 0) {
-                    int is_sysex = (n > 0 && buf[0] == 0xF0);
-
-                    if (is_sysex && midi_out.valid) {
-                        sysex_caplen = 0;
-                        sysex_done = 0;
-                        sysex_capturing = 1;
-                        pthread_cond_signal(&capture_start_cond);
-                        usleep(50);
-                    }
-
+                if (midi_fd >= 0)
                     write(midi_fd, buf, n);
-
-                    if (is_sysex && midi_out.valid) {
-                        int wait_ms = 0;
-                        while (!sysex_done && wait_ms < 4000) {
-                            usleep(1000);
-                            wait_ms++;
-                        }
-
-                        if (sysex_caplen > 0) {
-                            if (debug) {
-                                fprintf(stderr, "MIDI->TCP %d bytes (SysEx):",
-                                        sysex_caplen);
-                                int j;
-                                for (j = 0; j < sysex_caplen && j < 16; j++)
-                                    fprintf(stderr, " %02x", sysex_capbuf[j]);
-                                if (sysex_caplen > 16) fprintf(stderr, " ...");
-                                fprintf(stderr, "\n");
-                            }
-                            send(client_fd, sysex_capbuf, sysex_caplen, 0);
-                        }
-                    }
-                }
             }
         }
 
+        /* Outbound MIDI from Kronos → parse → TCP. */
         if (client_fd >= 0) {
             int n = read_midi_out(&midi_out, buf, sizeof(buf));
-            if (n > 0) {
-                if (debug) {
-                    fprintf(stderr, "MIDI->TCP %d bytes:", n);
-                    int i;
-                    for (i = 0; i < n && i < 16; i++)
-                        fprintf(stderr, " %02x", buf[i]);
-                    if (n > 16) fprintf(stderr, " ...");
-                    fprintf(stderr, "\n");
-                }
-                send(client_fd, buf, n, 0);
-            }
+            int i;
+            for (i = 0; i < n; i++)
+                parser_feed(&parser, buf[i], client_fd);
         }
     }
-
-    sysex_capturing = 1;
-    pthread_cond_signal(&capture_start_cond);
-    pthread_join(capture_tid, NULL);
 
     if (midi_out.ring_fd >= 0) close(midi_out.ring_fd);
     if (client_fd >= 0) close(client_fd);

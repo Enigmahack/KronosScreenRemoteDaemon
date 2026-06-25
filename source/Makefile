@@ -21,7 +21,7 @@ midi_inject_ko.h:
 	$(MAKE) -C ../midi_module -f Makefile.module
 
 midi_tcp_bin.h: midi_tcp.c
-	$(CC) $(CFLAGS) -lpthread -o midi_tcp_bin midi_tcp.c
+	$(CC) $(CFLAGS) -o midi_tcp_bin midi_tcp.c
 	xxd -i midi_tcp_bin > $@
 	rm -f midi_tcp_bin
 
