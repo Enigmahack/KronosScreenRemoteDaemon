@@ -1135,6 +1135,19 @@ static int hex_decode(const char *hex, uint8_t *out, int maxlen)
 static uint8_t sysex_capbuf[SYSEX_CAP_SIZE];
 static char    sysex_hexbuf[SYSEX_CAP_SIZE * 2 + 32];
 
+/* ── Async SysEx capture state ─────────────────────────────────
+ * Instead of blocking the main select() loop while waiting for a
+ * MIDI response (up to 5 s), we send the SysEx, add midi_cap_fd
+ * to the select set, and collect the response across iterations.
+ * Touch/button/frame processing continues uninterrupted. */
+static int            sysex_pending     = 0;    /* 1 = capture in progress          */
+static int            sysex_resp_fd     = -1;   /* fd to send response to when done */
+static int            sysex_cap_offset  = 0;    /* bytes captured so far            */
+static int            sysex_got_first   = 0;    /* received at least one byte       */
+static struct timespec sysex_t0;                /* capture start time               */
+#define SYSEX_INITIAL_TIMEOUT_MS  5000
+#define SYSEX_TAIL_TIMEOUT_MS     1000
+
 static void start_midi_capture(void)
 {
     pid_t pid;
@@ -1179,32 +1192,78 @@ static void start_midi_capture(void)
 }
 
 
-static int sysex_send_and_capture(const uint8_t *sysex, int sysex_len)
+/* Start an async SysEx capture: send the message and let the main loop
+ * collect the response via sysex_poll().  Returns 1 if started, 0 on error. */
+static int sysex_start_async(const uint8_t *sysex, int sysex_len, int resp_fd)
 {
-    int caplen = 0;
-    struct timeval tv;
-
-    if (midi_cap_fd < 0)
+    if (midi_cap_fd < 0 || sysex_pending)
         return 0;
 
     send(midi_cap_fd, sysex, sysex_len, 0);
 
-    tv.tv_sec = 5; tv.tv_usec = 0;
-    setsockopt(midi_cap_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    sysex_pending    = 1;
+    sysex_resp_fd    = resp_fd;
+    sysex_cap_offset = 0;
+    sysex_got_first  = 0;
+    clock_gettime(CLOCK_MONOTONIC, &sysex_t0);
+    return 1;
+}
 
-    while (caplen < SYSEX_CAP_SIZE) {
-        int n = recv(midi_cap_fd, sysex_capbuf + caplen,
-                     SYSEX_CAP_SIZE - caplen, 0);
-        if (n <= 0) break;
-        caplen += n;
+static void sysex_send_response(void)
+{
+    if (sysex_resp_fd >= 0 && sysex_cap_offset > 0) {
+        int rlen = sprintf(sysex_hexbuf, "SYSEX_RESP ");
+        int i;
+        for (i = 0; i < sysex_cap_offset; i++)
+            rlen += sprintf(sysex_hexbuf + rlen, "%02X", sysex_capbuf[i]);
+        sysex_hexbuf[rlen++] = '\n';
+        write_all(sysex_resp_fd, sysex_hexbuf, rlen);
+    } else if (sysex_resp_fd >= 0) {
+        write_all(sysex_resp_fd, "ERR TIMEOUT\n", 12);
+    }
+}
 
-        if (caplen == n) {
-            tv.tv_sec = 1; tv.tv_usec = 0;
-            setsockopt(midi_cap_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+static void sysex_finish(void)
+{
+    sysex_send_response();
+    /* Close one-shot fd; persistent ctrl_fd stays open */
+    if (sysex_resp_fd >= 0 && sysex_resp_fd != ctrl_fd)
+        close(sysex_resp_fd);
+    sysex_resp_fd    = -1;
+    sysex_pending    = 0;
+    sysex_cap_offset = 0;
+}
+
+/* Called from the main loop when select() reports midi_cap_fd readable,
+ * or on each iteration to check the timeout.  Non-blocking. */
+static void sysex_poll(int readable)
+{
+    if (!sysex_pending) return;
+
+    if (readable && midi_cap_fd >= 0) {
+        int n = recv(midi_cap_fd, sysex_capbuf + sysex_cap_offset,
+                     SYSEX_CAP_SIZE - sysex_cap_offset, MSG_DONTWAIT);
+        if (n > 0) {
+            int j, done = 0;
+            for (j = sysex_cap_offset; j < sysex_cap_offset + n; j++)
+                if (sysex_capbuf[j] == 0xF7) { done = 1; break; }
+            sysex_cap_offset += n;
+            if (!sysex_got_first) {
+                sysex_got_first = 1;
+                clock_gettime(CLOCK_MONOTONIC, &sysex_t0);
+            }
+            if (done) { sysex_finish(); return; }
         }
     }
 
-    return caplen;
+    /* Timeout check */
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    long ms = (now.tv_sec - sysex_t0.tv_sec) * 1000
+            + (now.tv_nsec - sysex_t0.tv_nsec) / 1000000;
+    long limit = sysex_got_first ? SYSEX_TAIL_TIMEOUT_MS : SYSEX_INITIAL_TIMEOUT_MS;
+    if (ms >= limit)
+        sysex_finish();
 }
 
 /* Process one already-parsed command line.
@@ -1404,23 +1463,19 @@ static void process_ctrl_cmd(const char *line, int fd)
     } else if (strncmp(line, "SYSEX ", 6) == 0) {
         if (midi_in_fd < 0 || midi_cap_fd < 0) {
             REPLY("ERR MIDI_NOT_LOADED\n", 20);
+        } else if (sysex_pending) {
+            REPLY("ERR SYSEX_BUSY\n", 15);
         } else {
             uint8_t sb[4096];
             int slen = hex_decode(line + 6, sb, sizeof(sb));
             if (slen <= 0 || sb[0] != 0xF0) {
                 REPLY("ERR BAD_SYSEX\n", 14);
             } else {
-                int caplen, i, rlen;
-                caplen = sysex_send_and_capture(sb, slen);
-                if (caplen > 0) {
-                    rlen = sprintf(sysex_hexbuf, "SYSEX_RESP ");
-                    for (i = 0; i < caplen; i++)
-                        rlen += sprintf(sysex_hexbuf + rlen, "%02X", sysex_capbuf[i]);
-                    sysex_hexbuf[rlen++] = '\n';
-                    REPLY(sysex_hexbuf, rlen);
-                } else {
-                    REPLY("ERR TIMEOUT\n", 12);
-                }
+                /* Start async capture — response sent by sysex_poll/sysex_finish
+                 * in a later select iteration.  fd is kept open until then. */
+                if (!sysex_start_async(sb, slen, fd))
+                    REPLY("ERR SYSEX_FAIL\n", 15);
+                /* Caller must NOT close fd if sysex_pending && sysex_resp_fd == fd */
             }
         }
 
@@ -1822,6 +1877,10 @@ int main(void)
             FD_SET(ctrl_fd, &rfds);
             if (ctrl_fd > maxfd) maxfd = ctrl_fd;
         }
+        if (sysex_pending && midi_cap_fd >= 0) {
+            FD_SET(midi_cap_fd, &rfds);
+            if (midi_cap_fd > maxfd) maxfd = midi_cap_fd;
+        }
 
         /* Adaptive timeout: wait only until the next frame is due.
          * If we're already behind (frame work exceeded the budget),
@@ -1849,6 +1908,12 @@ int main(void)
         if (maxfd < 0) { usleep(500000); continue; }
         r = select(maxfd + 1, &rfds, NULL, NULL, &tv);
         if (r < 0) continue;
+
+        /* Async SysEx capture — collect response bytes or timeout.
+         * Runs every iteration so timeouts are checked even when no
+         * data arrives.  Does NOT block — recv uses MSG_DONTWAIT. */
+        if (sysex_pending)
+            sysex_poll(midi_cap_fd >= 0 && FD_ISSET(midi_cap_fd, &rfds));
 
         /* New streaming client */
         if (stream_listen >= 0 && FD_ISSET(stream_listen, &rfds)) {
@@ -1930,9 +1995,12 @@ int main(void)
                             fprintf(stderr, "screenremote: persistent ctrl from %s\n",
                                     inet_ntoa(cpeer.sin_addr));
                         } else {
-                            /* One-shot: firstline already read; process it and close */
+                            /* One-shot: firstline already read; process it and close.
+                             * Exception: SYSEX starts an async capture — fd stays open
+                             * until sysex_finish() sends the response and closes it. */
                             process_ctrl_cmd(firstline, cfd);
-                            close(cfd);
+                            if (!(sysex_pending && sysex_resp_fd == cfd))
+                                close(cfd);
                         }
                     }
                 } else {
@@ -1947,6 +2015,11 @@ int main(void)
         if (ctrl_fd >= 0 && FD_ISSET(ctrl_fd, &rfds)) {
             if (handle_ctrl_persistent_data() < 0) {
                 fprintf(stderr, "screenremote: persistent ctrl disconnected\n");
+                if (sysex_pending && sysex_resp_fd == ctrl_fd) {
+                    sysex_resp_fd = -1;
+                    sysex_pending = 0;
+                    sysex_cap_offset = 0;
+                }
                 close(ctrl_fd);
                 ctrl_fd        = -1;
                 ctrl_lb_n      = 0;
