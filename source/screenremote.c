@@ -79,17 +79,17 @@
 #include "midi_inject_ko.h"
 #include "midi_tcp_bin.h"
 
-/* ── keyboard injection (uinput fallback) ───────────────────── */
+/* �Keyboard injection (uinput fallback) */
 #define KBD_EV_SYN  0
 #define KBD_EV_KEY  1
 
-/* ── Version ─────────────────────────────────────────────────── */
-#define SCREENREMOTE_VERSION "1.7.1"
+/* �Version */
+#define SCREENREMOTE_VERSION "1.7.2"
 #ifndef BUILD_ID
 #define BUILD_ID "dev"
 #endif
 
-/* ── Config ─────────────────────────────────────────────────── */
+/* Config */
 #define SCREENREMOTE_DIR  "/korg/rw/screenremote"
 #define VKBD_KO           SCREENREMOTE_DIR "/vkbd.ko"
 #define MIDI_INJECT_KO    SCREENREMOTE_DIR "/midi_inject.ko"
@@ -99,7 +99,7 @@
 #define FB_DST       "/dev/fb0"
 #define STREAM_PORT  7373       /* default; overridden by config file */
 #define CTRL_PORT    7374       /* default; overridden by config file */
-#define DISC_PORT    7372       /* fixed UDP discovery port — never configurable */
+#define DISC_PORT    7372       /* fixed UDP discovery port - never configurable */
 #define CFG_PATH     SCREENREMOTE_DIR "/screenremote.cfg"
 #define MIRROR_FLAG  SCREENREMOTE_DIR "/.mirror_enable"
 
@@ -112,14 +112,14 @@ static int  g_ctrl_port   = CTRL_PORT;
 
 static const uint8_t MAGIC[4] = {'K','S','C','R'};
 
-/* ── Framebuffer state ──────────────────────────────────────── */
+/* �Framebuffer state */
 static int       fb1_fd = -1,  fb0_fd = -1;
 static uint8_t  *fb1_map = NULL, *fb0_map = NULL;
 static uint32_t  fb1_stride, fb0_stride;
 static uint32_t  fb_w, fb_h;           /* 800, 600 */
 static uint32_t  frame_bytes;          /* fb_w * fb_h */
 
-static uint16_t  pal_r[PAL_ENTRIES];   /* raw palette — used for streaming handshake */
+static uint16_t  pal_r[PAL_ENTRIES];   /* raw palette - used for streaming handshake */
 static uint16_t  pal_g[PAL_ENTRIES];
 static uint16_t  pal_b[PAL_ENTRIES];
 static uint16_t  pal_t[PAL_ENTRIES];
@@ -129,10 +129,10 @@ static uint8_t  *staging = NULL;       /* current-tick capture of fb1, fb_w*fb_h
 static uint8_t  *rle_buf = NULL;       /* PackBits encode scratch, 2*frame_bytes */
 static int       shadow_valid = 0;
 
-/* ── Mirror state ───────────────────────────────────────────── */
+/* Mirror state */
 static int       mirror_on = 0;
 
-/* ── Screensaver (VGA/fb0 only) ─────────────────────────────── */
+/* Screensaver (VGA/fb0 only) */
 #define SS_TIMEOUT_DEF  300   /* seconds idle before blanking; 0=disabled */
 #define SS_CHECK_S        5   /* how often to sample fb1 for changes */
 #define SS_SAMPLE_N      16   /* pixel positions sampled per check */
@@ -144,17 +144,17 @@ static time_t   last_ss_chk   = 0;
 static uint8_t  ss_prev[SS_SAMPLE_N];
 static int      ss_prev_valid = 0;
 
-/* ── Touch calibration ──────────────────────────────────────── */
+/* Touch calibration */
 static int g_touch_x_offset = 10;   /* pixels added to x before ADC scaling      */
 static int g_touch_x_range  = 813;  /* total pixel span → ADC 0-255              */
 static int g_touch_y_offset = 20;   /* pixels added to y before ADC scaling      */
 static int g_touch_y_range  = 638;  /* total pixel span → ADC 0-255              */
 
-/* ── Mode state ─────────────────────────────────────────────── */
+/* Mode state */
 static uint32_t g_mode        = 0;   /* 0=init 1=Setlist 2=Combi 3=Program
                                          4=Sequence 5=Sampling 6=Global 7=Disk */
 
-/* ── Sysinfo CPU snapshot (populated on-demand, only while connected) ─ */
+/* Sysinfo CPU snapshot (populated on-demand, only while connected) */
 typedef struct {
     unsigned long user, nice, sys, idle, iowait, irq, softirq;
 } cpu_snap_t;
@@ -162,7 +162,7 @@ typedef struct {
 static cpu_snap_t g_si_prev[SI_NCPU + 1]; /* [0]=aggregate  [1..4]=per-cpu  */
 static int        g_si_prev_valid = 0;
 
-/* ── Touch / button injection ───────────────────────────────── */
+/* Touch / button injection */
 static int touch_fd = -1;  /* fd to /dev/rtf5 O_WRONLY — injects into Eva's FIFO */
 static int vkbd_fd  = -1;  /* fd to /proc/.vkbd (vkbd.ko virtual keyboard) */
 static int kbd_fd   = -1;  /* fd to physical USB keyboard evdev node (fallback) */
@@ -257,27 +257,27 @@ static const struct btn_def btn_table[] = {
     { NULL, 0u, 0u }
 };
 
-/* ── Access control ─────────────────────────────────────────── */
+/* Access control */
 /* IP (network byte order) of the current stream client. Only that host is
- * allowed to send control commands. 0 = no stream client → reject all. */
+ * allowed to send control commands. 0 = no stream client, 1 = reject all. */
 static uint32_t g_ctrl_allowed_ip = 0;
 
 /* Currently bound listen address (network byte order). Tracked so we can
  * detect IP changes and rebind the stream/ctrl listeners. */
 static uint32_t g_bound_ip = INADDR_ANY;
 
-/* ── Persistent control connection ──────────────────────────── */
+/* Persistent control connection */
 static int  ctrl_fd     = -1;   /* accepted persistent ctrl socket, -1 if none */
 static char ctrl_lb[2048];      /* partial line accumulation buffer */
 static int  ctrl_lb_n   = 0;    /* bytes in ctrl_lb */
 
-/* ── Signal flag ────────────────────────────────────────────── */
+/* Signal flag */
 static volatile sig_atomic_t g_exit = 0;
 
 static void sig_exit(int sig) { (void)sig; g_exit = 1; }
 
-/* ── Kernel message log (dmesg) ─────────────────────────────── */
-/* ── I/O helper ─────────────────────────────────────────────── */
+/* Kernel message log (dmesg) */
+/* I/O helper */
 static int write_all(int fd, const void *buf, size_t n)
 {
     const uint8_t *p = buf;
@@ -289,7 +289,7 @@ static int write_all(int fd, const void *buf, size_t n)
     return 0;
 }
 
-/* ── Emergency fallback authentication ─────────────────────────────────────
+/* Emergency fallback authentication 
  * If /korg/rw/HD/screenremote/password1/ exists as a directory, the user can
  * authenticate to screen connect (not FTP) with username "kronos" and the
  * device's PublicID (read from /proc/id, dashes stripped) as the password.
@@ -324,7 +324,7 @@ static void strip_dashes(const char *in, char *out, int outsz)
     out[o] = '\0';
 }
 
-/* Check /korg/rw/Startup/KronosNet.conf — Korg's UI-managed credential store.
+/* Check /korg/rw/Startup/KronosNet.conf�- Korg's UI-managed credential store.
  * Format: line 1 = username, line 2 = password (plain text, updated by the UI).
  * Returns 0=match, 1=username matched but wrong password, -1=not this user/unavailable. */
 static int kronosnet_auth(const char *user, const char *pass)
@@ -338,7 +338,7 @@ static int kronosnet_auth(const char *user, const char *pass)
     stored_user[strcspn(stored_user, "\r\n")] = '\0';
     stored_pass[strcspn(stored_pass, "\r\n")] = '\0';
     if (stored_user[0] == '\0') return -1;
-    if (strcmp(stored_user, user) != 0) return -1;  /* not the KronosNet user — try system auth */
+    if (strcmp(stored_user, user) != 0) return -1;  /* not the KronosNet user - try system auth */
     return (strcmp(stored_pass, pass) == 0) ? 0 : 1;
 }
 
@@ -349,12 +349,12 @@ static int kronosnet_auth(const char *user, const char *pass)
  * *out_reason describes the failure (never NULL on error). */
 static int check_auth(const char *user, const char *pass, const char **out_reason)
 {
-    /* ── KronosNet.conf ── */
+    /* �KronosNet.conf�*/
     int kr = kronosnet_auth(user, pass);
     if (kr == 0) { *out_reason = NULL; return 0; }
     if (kr == 1) { *out_reason = "wrong password"; return -1; }
 
-    /* ── PublicID directory fallback ── */
+    /* �PublicID directory fallback */
     struct stat st;
     if (stat(PASSWORD1_DIR, &st) == 0 && S_ISDIR(st.st_mode) && g_pubid[0]) {
         char pass_stripped[17];
@@ -386,7 +386,7 @@ static void log_access(const char *ip, int accepted, const char *reason)
     fclose(f);
 }
 
-/* ── Apply palette to fb0 ───────────────────────────────────── */
+/* Apply palette to fb0 */
 static void apply_palette_to_fb0(void)
 {
     struct fb_cmap cmap;
@@ -400,7 +400,7 @@ static void apply_palette_to_fb0(void)
     ioctl(fb0_fd, FBIOPUTCMAP, &cmap);
 }
 
-/* ── Framebuffer open/close ─────────────────────────────────── */
+/* Framebuffer open/close */
 static int fb1_open(void)
 {
     struct fb_fix_screeninfo ffix;
@@ -494,7 +494,7 @@ static void fb0_close(void)
     fprintf(stderr, "screenremote: fb0 mirror disabled\n");
 }
 
-/* ── Screensaver helpers ─────────────────────────────────────── */
+/* Screensaver helpers */
 static void ss_sample(uint8_t *out)
 {
     int i;
@@ -514,7 +514,7 @@ static void ss_reset(time_t now)
     ss_active     = 0;
 }
 
-/* ── Mirror ─────────────────────────────────────────────────── */
+/* Mirror */
 static void do_mirror(void)
 {
     uint32_t y;
@@ -534,7 +534,7 @@ static void check_mirror_flag(void)
     else      { fb0_close(); mirror_on = 0; ss_active = 0; }
 }
 
-/* ── Network ────────────────────────────────────────────────── */
+/* Network */
 static int network_ok(void)
 {
     struct ifaddrs *ifa, *p;
@@ -575,7 +575,7 @@ static uint32_t find_lan_ip(void)
     return found;
 }
 
-/* ── Config ──────────────────────────────────────────────────── */
+/* Config */
 static void read_config(void)
 {
     FILE *f = fopen(CFG_PATH, "r");
@@ -583,20 +583,20 @@ static void read_config(void)
     char line[128];
     while (fgets(line, sizeof(line), f)) {
         int v;
-        if      (sscanf(line, "stream_port=%d", &v) == 1 && v > 0 && v <= 65535)
-            g_stream_port = v;
+        if (sscanf(line, "stream_port=%d", &v) == 1 && v > 0 && v <= 65535)
+           g_stream_port = v;
         else if (sscanf(line, "ctrl_port=%d",   &v) == 1 && v > 0 && v <= 65535)
-            g_ctrl_port = v;
+           g_ctrl_port = v;
         else if (sscanf(line, "screensaver_timeout=%d", &v) == 1 && v >= 0)
-            g_ss_timeout = v;
+           g_ss_timeout = v;
         else if (sscanf(line, "touch_x_offset=%d", &v) == 1)
-            g_touch_x_offset = v;
+           g_touch_x_offset = v;
         else if (sscanf(line, "touch_x_range=%d", &v) == 1 && v > 0)
-            g_touch_x_range = v;
+           g_touch_x_range = v;
         else if (sscanf(line, "touch_y_offset=%d", &v) == 1)
-            g_touch_y_offset = v;
+           g_touch_y_offset = v;
         else if (sscanf(line, "touch_y_range=%d", &v) == 1 && v > 0)
-            g_touch_y_range = v;
+           g_touch_y_range = v;
     }
     fclose(f);
     fprintf(stderr, "screenremote: config loaded: stream=%d ctrl=%d\n",
@@ -639,7 +639,7 @@ static int make_udp_disc(void)
     return fd;
 }
 
-/* ── Protocol ───────────────────────────────────────────────── */
+/* Protocol */
 /* Cork/uncork helper: batches header + body into one TCP burst. */
 #define TCP_CORK_ON(fd)  do { int _c=1; setsockopt((fd),IPPROTO_TCP,TCP_CORK,&_c,sizeof(_c)); } while(0)
 #define TCP_CORK_OFF(fd) do { int _c=0; setsockopt((fd),IPPROTO_TCP,TCP_CORK,&_c,sizeof(_c)); } while(0)
@@ -681,7 +681,8 @@ static int send_frame(int fd)
     }
     TCP_CORK_OFF(fd);
     return 0;
-fail:
+
+    fail:
     TCP_CORK_OFF(fd);
     return -1;
 }
@@ -758,7 +759,7 @@ static int do_handshake(int fd, uint8_t *mode_out, uint8_t *fps_out,
 
     i = 0;
     memcpy(rsp + i, MAGIC, 4);              i += 4;
-    rsp[i++] = 0x00;                        /* status ok */
+    rsp[i++] = 0x00;                       /* status ok */
     rsp[i++] = (uint8_t)(fb_w & 0xFF);     /* width LE16 */
     rsp[i++] = (uint8_t)(fb_w >> 8);
     rsp[i++] = (uint8_t)(fb_h & 0xFF);     /* height LE16 */
@@ -856,7 +857,7 @@ static void inject_touch(int type, int x, int y)
     send_rtf5_event(0x11u, (uint32_t)type, v_adc | (h_adc << 8u));
 }
 
-/* ── Embedded .ko extraction ─────────────────────────────────── */
+/* Embedded .ko extraction */
 static void extract_ko(const char *path, const unsigned char *data, unsigned int len)
 {
     struct stat st;
@@ -867,7 +868,7 @@ static void extract_ko(const char *path, const unsigned char *data, unsigned int
     if (fd >= 0) { write(fd, data, len); close(fd); }
 }
 
-/* ── Mode button keycode → g_mode ───────────────────────────── */
+/* Mode button keycode - g_mode */
 static void mode_from_btn(uint32_t dev, uint32_t code)
 {
     if (dev != 0x07u) return;
@@ -906,7 +907,7 @@ static int sysinfo_collect(char *out, int outsz)
     if (n >= outsz) n = outsz - 1; \
 } while (0)
 
-    /* ── /proc/stat — CPU delta ───────────────────────────────── */
+    /* �/proc/stat - CPU delta */
     memset(cur, 0, sizeof(cur));
     f = fopen("/proc/stat", "r");
     if (f) {
@@ -942,7 +943,7 @@ static int sysinfo_collect(char *out, int outsz)
     memcpy(g_si_prev, cur, sizeof(g_si_prev));
     g_si_prev_valid = 1;
 
-    /* ── /proc/uptime ─────────────────────────────────────────── */
+    /*  /proc/uptime */
     {
         unsigned long up = 0;
         f = fopen("/proc/uptime", "r");
@@ -950,7 +951,7 @@ static int sysinfo_collect(char *out, int outsz)
         SI_APPEND("UPTIME=%lu\n", up);
     }
 
-    /* ── /proc/loadavg ────────────────────────────────────────── */
+    /*  /proc/loadavg */
     {
         float l1 = 0, l5 = 0, l15 = 0;
         f = fopen("/proc/loadavg", "r");
@@ -958,7 +959,7 @@ static int sysinfo_collect(char *out, int outsz)
         SI_APPEND("LOAD=%.2f %.2f %.2f\n", l1, l5, l15);
     }
 
-    /* ── /proc/meminfo ────────────────────────────────────────── */
+    /*  /proc/meminfo */
     {
         unsigned long total = 0, mem_free = 0, bufs = 0, cached = 0;
         f = fopen("/proc/meminfo", "r");
@@ -976,12 +977,12 @@ static int sysinfo_collect(char *out, int outsz)
             total, mem_free, mem_free + bufs + cached);
     }
 
-    /* ── CPU percentages ──────────────────────────────────────── */
+    /* �CPU percentages */
     SI_APPEND("CPU_PCT=%d\n", cpu_pct[0]);
     for (i = 0; i < ncpu; i++)
         SI_APPEND("CPU%d_PCT=%d\n", i, cpu_pct[i + 1]);
 
-    /* ── /proc/KorgUsbAudio ───────────────────────────────────── */
+    /*  /proc/KorgUsbAudio */
     {
         unsigned int  sr = 0, ich = 0, och = 0;
         unsigned long rto = 0, midi_rt = 0;
@@ -1002,7 +1003,7 @@ static int sysinfo_collect(char *out, int outsz)
             sr, och, rto, midi_rt);
     }
 
-    /* ── /korg/rw disk space ──────────────────────────────────── */
+    /*  /korg/rw disk space (SSD 1) */
     {
         struct statvfs sv;
         if (statvfs("/korg/rw", &sv) == 0) {
@@ -1012,7 +1013,7 @@ static int sysinfo_collect(char *out, int outsz)
         }
     }
 
-    /* ── /korg/rw2 disk space (second internal SSD) ───────────── */
+    /*  /korg/rw2 disk space (SSD 2) */
     {
         struct statvfs sv;
         if (statvfs("/korg/rw2", &sv) == 0) {
@@ -1022,7 +1023,7 @@ static int sysinfo_collect(char *out, int outsz)
         }
     }
 
-    /* ── USB drives (/proc/mounts — /dev/sdc+ are USB storage) ── */
+    /* USB drives (/proc/mounts - /dev/sdc+ are USB storage) */
     /* sda=SSD1, sdb=SSD2 are internal; sdc and above are external */
     {
         FILE *mf = fopen("/proc/mounts", "r");
@@ -1046,7 +1047,7 @@ static int sysinfo_collect(char *out, int outsz)
         SI_APPEND("USB_COUNT=%d\n", usb_n);
     }
 
-    /* ── Hardware monitor (W83627UHG) ─────────────────────────── */
+    /* Hardware monitor */
     /* hwmon index is non-deterministic across boots/module loads.
      * Try hwmon0..4 with both the old /device/ sub-path and the
      * newer direct layout. */
@@ -1088,7 +1089,7 @@ static int sysinfo_collect(char *out, int outsz)
         }
     }
 
-    /* ── Mode ─────────────────────────────────────────────────── */
+    /* Mode */
     SI_APPEND("MODE=%u\n", (unsigned)g_mode);
 
     SI_APPEND("OK\n");
@@ -1096,7 +1097,7 @@ static int sysinfo_collect(char *out, int outsz)
     return n;
 }
 
-/* ── MIDI helpers ───────────────────────────────────────────── */
+/* MIDI helpers */
 
 static void resolve_kallsyms(unsigned long *recv_fn, unsigned long *reg_fn)
 {
@@ -1135,7 +1136,7 @@ static int hex_decode(const char *hex, uint8_t *out, int maxlen)
 static uint8_t sysex_capbuf[SYSEX_CAP_SIZE];
 static char    sysex_hexbuf[SYSEX_CAP_SIZE * 2 + 32];
 
-/* ── Async SysEx capture state ─────────────────────────────────
+/* Async SysEx capture state
  * Instead of blocking the main select() loop while waiting for a
  * MIDI response (up to 5 s), we send the SysEx, add midi_cap_fd
  * to the select set, and collect the response across iterations.
@@ -1156,7 +1157,7 @@ static void start_midi_capture(void)
     extract_ko(MIDI_TCP_BIN, midi_tcp_bin, midi_tcp_bin_len);
     chmod(MIDI_TCP_BIN, 0755);
 
-    /* Ensure loopback is up — Kronos doesn't configure it by default */
+    /* Ensure loopback is up - Kronos doesn't configure it by default */
     system("ifconfig lo 127.0.0.1 up 2>/dev/null");
 
     pid = fork();
@@ -1471,7 +1472,7 @@ static void process_ctrl_cmd(const char *line, int fd)
             if (slen <= 0 || sb[0] != 0xF0) {
                 REPLY("ERR BAD_SYSEX\n", 14);
             } else {
-                /* Start async capture — response sent by sysex_poll/sysex_finish
+                /* Start async capture - response sent by sysex_poll/sysex_finish
                  * in a later select iteration.  fd is kept open until then. */
                 if (!sysex_start_async(sb, slen, fd))
                     REPLY("ERR SYSEX_FAIL\n", 15);
@@ -1513,7 +1514,7 @@ static int handle_ctrl_persistent_data(void)
     return 0;
 }
 
-/* ── PackBits RLE encoder ───────────────────────────────────────
+/* PackBits RLE encoder
  * Standard PackBits (Apple/TIFF variant):
  *   header 0x00–0x7F → n+1 literal bytes follow
  *   header 0x81–0xFF → repeat next byte (257-n) times
@@ -1554,7 +1555,7 @@ static uint32_t packbits_encode(const uint8_t *src, uint32_t n, uint8_t *dst)
     return di;
 }
 
-/* ── Dirty row scan ─────────────────────────────────────────────
+/* Dirty row scan
  * Find the first and last changed row by comparing staging vs shadow
  * line by line.  Both buffers must be valid before calling this. */
 static void find_dirty_rows(uint32_t *first_out, uint32_t *count_out)
@@ -1572,7 +1573,7 @@ static void find_dirty_rows(uint32_t *first_out, uint32_t *count_out)
 }
 
 /* Send a dirty-rect update with PackBits RLE payload.
- * Wire format: [payload_len LE32][first_row LE16][row_count LE16][rle_bytes…]
+ * Wire format: [payload_len LE32][first_row LE16][row_count LE16][rle_bytes]
  * Invariant: payload_len < frame_bytes so clients can discriminate by len.
  * Falls back to send_frame_buf() if RLE expands to >= frame_bytes (degenerate). */
 static int send_dirty_rect(int fd, uint32_t first_row, uint32_t row_count)
@@ -1603,12 +1604,12 @@ static int send_dirty_rect(int fd, uint32_t first_row, uint32_t row_count)
     return 0;
 }
 
-/* ── Frame capture + change detection ──────────────────────────
- * Copies fb1 → staging in one device-memory pass, then compares
+/* Frame capture + change detection
+ * Copies fb1 -> staging in one device-memory pass, then compares
  * staging (RAM) against shadow (RAM).  Returns 1 if the frame
  * changed or shadow is not yet valid.
  *
- * After a successful send, swap staging ↔ shadow so shadow holds
+ * After a successful send, swap staging -> shadow so shadow holds
  * the just-sent frame without an extra copy. */
 static int capture_to_staging(void)
 {
@@ -1624,7 +1625,7 @@ static int capture_to_staging(void)
     return memcmp(staging, shadow, frame_bytes) != 0;
 }
 
-/* ── Main ───────────────────────────────────────────────────── */
+/*  Main */
 int main(void)
 {
     int stream_listen, ctrl_listen, disc_fd = -1, client_fd = -1;
@@ -1756,7 +1757,7 @@ int main(void)
             last_mirror_chk = now;
         }
 
-        /* Periodic network check — re-bind if IP changed (DHCP, link down/up) */
+        /* Periodic network check - re-bind if IP changed (DHCP, link down/up) */
         if (now - last_net_chk >= 10) {
             last_net_chk = now;
             uint32_t cur_ip = find_lan_ip();
@@ -1846,7 +1847,7 @@ int main(void)
                         close(client_fd); client_fd = -1; shadow_valid = 0;
                         g_ctrl_allowed_ip = 0;
                     } else {
-                        /* Swap staging ↔ shadow: shadow now holds the sent frame. */
+                        /* Swap staging -> shadow: shadow now holds the sent frame. */
                         uint8_t *tmp = shadow; shadow = staging; staging = tmp;
                         shadow_valid = 1;
                     }
@@ -1854,7 +1855,7 @@ int main(void)
             }
         }
 
-        /* Build select set — listeners may be -1 during rebind */
+        /* Build select set - listeners may be -1 during rebind */
         FD_ZERO(&rfds);
         maxfd = -1;
         if (stream_listen >= 0) {
@@ -1909,9 +1910,9 @@ int main(void)
         r = select(maxfd + 1, &rfds, NULL, NULL, &tv);
         if (r < 0) continue;
 
-        /* Async SysEx capture — collect response bytes or timeout.
+        /* Async SysEx capture - collect response bytes or timeout.
          * Runs every iteration so timeouts are checked even when no
-         * data arrives.  Does NOT block — recv uses MSG_DONTWAIT. */
+         * data arrives.  Does NOT block - recv uses MSG_DONTWAIT. */
         if (sysex_pending)
             sysex_poll(midi_cap_fd >= 0 && FD_ISSET(midi_cap_fd, &rfds));
 
@@ -1958,7 +1959,7 @@ int main(void)
             }
         }
 
-        /* Control command — only accept from the authenticated stream client's IP. */
+        /* Control command - only accept from the authenticated stream client's IP. */
         if (ctrl_listen >= 0 && FD_ISSET(ctrl_listen, &rfds)) {
             struct sockaddr_in cpeer;
             socklen_t cplen = sizeof(cpeer);
@@ -1966,8 +1967,8 @@ int main(void)
             if (cfd >= 0) {
                 if (g_ctrl_allowed_ip != 0 &&
                     cpeer.sin_addr.s_addr == g_ctrl_allowed_ip) {
-                    /* Read the first line to decide: "CTRL_PERSIST" → persistent
-                     * connection (replaces any previous ctrl_fd); anything else →
+                    /* Read the first line to decide: "CTRL_PERSIST" -> persistent
+                     * connection (replaces any previous ctrl_fd); anything else ->
                      * one-shot command+response then close (used by QueryAsync). */
                     char firstline[2048]; int fl = 0;
                     struct timeval rto = {0, 200000};  /* 200 ms read timeout */
@@ -1996,7 +1997,7 @@ int main(void)
                                     inet_ntoa(cpeer.sin_addr));
                         } else {
                             /* One-shot: firstline already read; process it and close.
-                             * Exception: SYSEX starts an async capture — fd stays open
+                             * Exception: SYSEX starts an async capture - fd stays open
                              * until sysex_finish() sends the response and closes it. */
                             process_ctrl_cmd(firstline, cfd);
                             if (!(sysex_pending && sysex_resp_fd == cfd))
