@@ -3,7 +3,7 @@
  *
  * Listens on TCP port 9875 (same as Korg's MIDID).
  * Inbound:  TCP → /proc/.midi_in (kernel module injection)
- * Outbound: /proc/.midi_ring (upgraded) or shared memory (fallback) → TCP
+ * Outbound: /proc/.midi_ring → TCP
  *
  * All MIDI output is parsed into complete messages and broadcast to ALL
  * connected TCP clients simultaneously — SysEx, regular channel messages,
@@ -27,8 +27,6 @@
 #include <signal.h>
 #include <sys/socket.h>
 #include <sys/select.h>
-#include <sys/ioctl.h>
-#include <sys/mman.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <stdint.h>
@@ -58,136 +56,34 @@ static void broadcast(const uint8_t *buf, int len)
 }
 
 /* ------------------------------------------------------------------ */
-/*  MIDI output reader — two backends: /proc/.midi_ring or shm         */
+/*  MIDI output reader — /proc/.midi_ring                              */
 /* ------------------------------------------------------------------ */
 
 struct midi_out_reader {
-    /* /proc/.midi_ring backend */
     int ring_fd;
-
-    /* shared-memory fallback */
-    uint8_t *container;
-    uint8_t *ring_data;
-    uint32_t *p_write;
-    uint32_t mask;
-    uint32_t our_cursor;
     int valid;
 };
 
-static int shm_fd = -1;
-
-static void *lock_block(int id, int *sz) {
-    unsigned int kva = ioctl(shm_fd, 0x64, id);
-    int size = ioctl(shm_fd, 0x65, id);
-    if (size <= 0) return NULL;
-    if (sz) *sz = size;
-    unsigned int po = kva & 0xFFF, pb = kva & ~0xFFF;
-    void *m = mmap(NULL, po + size, PROT_READ, MAP_SHARED | 0x8000, shm_fd, pb);
-    if (m == MAP_FAILED)
-        m = mmap(NULL, po + size, PROT_READ, MAP_SHARED, shm_fd, pb);
-    if (m == MAP_FAILED) return NULL;
-    return (uint8_t *)m + po;
-}
-
 static int setup_midi_out(struct midi_out_reader *r) {
     memset(r, 0, sizeof(*r));
-    r->ring_fd = -1;
-
-    /* Try upgraded /proc/.midi_ring first */
     r->ring_fd = open("/proc/.midi_ring", O_RDWR);
-    if (r->ring_fd >= 0) {
-        r->valid = 1;
-        if (debug)
-            fprintf(stderr, "MIDI Out: using /proc/.midi_ring (upgraded)\n");
-        return 0;
-    }
-
-    /* Fallback: shared memory */
-    int sz3;
-    shm_fd = open("/proc/.shm", O_RDONLY);
-    if (shm_fd < 0) { perror("open /proc/.shm"); return -1; }
-
-    r->container = lock_block(3, &sz3);
-    if (!r->container || sz3 < 0x210) {
-        fprintf(stderr, "can't map container\n");
+    if (r->ring_fd < 0) {
+        if (debug) fprintf(stderr, "MIDI Out: /proc/.midi_ring unavailable\n");
         return -1;
     }
-
-    int entry = 0x14C;
-    int blk_id = *(uint32_t *)(r->container + entry + 0x44);
-    r->mask = *(uint32_t *)(r->container + entry + 0x4C);
-    r->p_write = (uint32_t *)(r->container + entry + 0x50);
-
-    if (r->mask == 0) {
-        fprintf(stderr, "MIDI Out queue mask=0, will retry on connect\n");
-        return 0;
-    }
-
-    int blksz;
-    r->ring_data = lock_block(blk_id, &blksz);
-    if (!r->ring_data) {
-        fprintf(stderr, "can't map block %d\n", blk_id);
-        return -1;
-    }
-
-    r->our_cursor = *r->p_write;
     r->valid = 1;
-
-    if (debug)
-        fprintf(stderr, "MIDI Out: shm fallback, block=%d mask=0x%x cursor=%u\n",
-                blk_id, r->mask, r->our_cursor);
+    if (debug) fprintf(stderr, "MIDI Out: using /proc/.midi_ring\n");
     return 0;
 }
 
 static int read_midi_out(struct midi_out_reader *r, uint8_t *buf, int maxlen) {
-    /* /proc/.midi_ring backend — kernel handles cursors and masking */
-    if (r->ring_fd >= 0)
-        return read(r->ring_fd, buf, maxlen);
-
-    /* Shared memory fallback */
-    uint32_t w, avail, i;
-    int len;
-
-    if (!r->valid && r->container) {
-        int entry = 0x14C;
-        r->mask = *(uint32_t *)(r->container + entry + 0x4C);
-        if (r->mask > 0 && !r->ring_data) {
-            int blk_id = *(uint32_t *)(r->container + entry + 0x44);
-            int blksz;
-            r->ring_data = lock_block(blk_id, &blksz);
-            if (r->ring_data) {
-                r->p_write = (uint32_t *)(r->container + entry + 0x50);
-                r->our_cursor = *r->p_write;
-                r->valid = 1;
-                if (debug)
-                    fprintf(stderr, "MIDI Out: late init OK, mask=0x%x cursor=%u\n",
-                            r->mask, r->our_cursor);
-            }
-        }
-    }
-
-    if (!r->valid) return 0;
-
-    w = *r->p_write;
-    if (w == r->our_cursor) return 0;
-
-    avail = w - r->our_cursor;
-    len = avail > (uint32_t)maxlen ? maxlen : (int)avail;
-
-    for (i = 0; i < (uint32_t)len; i++)
-        buf[i] = r->ring_data[(r->our_cursor + i) & r->mask];
-
-    r->our_cursor += len;
-    return len;
+    if (r->ring_fd < 0) return 0;
+    return read(r->ring_fd, buf, maxlen);
 }
 
 static void reset_midi_out(struct midi_out_reader *r) {
-    if (r->ring_fd >= 0) {
-        /* Write anything to /proc/.midi_ring to reset cursor */
+    if (r->ring_fd >= 0)
         write(r->ring_fd, "R", 1);
-    } else if (r->valid && r->p_write) {
-        r->our_cursor = *r->p_write;
-    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -394,7 +290,7 @@ int main(int argc, char *argv[]) {
     parser_init(&parser);
 
     fprintf(stderr, "midi_tcp: listening on port %d%s (hub, max %d clients)\n",
-            port, midi_out.ring_fd >= 0 ? " (upgraded ring)" : "", MAX_CLIENTS);
+            port, midi_out.valid ? " (midi_ring)" : " (no MIDI out)", MAX_CLIENTS);
 
     while (running) {
         fd_set rfds;

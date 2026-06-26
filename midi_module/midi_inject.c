@@ -2,19 +2,19 @@
  * midi_inject.ko — MIDI injection + output capture for Korg Kronos
  *
  * /proc/.midi_in   — write raw MIDI bytes to inject into OA.ko MIDI IN
- * /proc/.midi_ring — read MIDI output: merges DIN MIDI OUT hook + Block 5 SysEx
+ * /proc/.midi_ring — read MIDI output: unified ring fed by ReadNextMessage hook
+ *                    and Block 5 SysEx drain
  *
  * Module params:
- *   receive_fn=0x...   MidiInPortGeneric7Receive (required for MIDI IN injection)
- *   register_fn=0x...  RegisterMidiInPort (required for port object discovery)
- *   midi_out_fn=0x...  CSTGMidiOutPortSerial::SendSingleByte(unsigned char)
- *   midi_rt_fn=0x...   CSTGMidiOutPortSerial::SendRealTime(unsigned char)
- *
- * When midi_out_fn / midi_rt_fn are provided, an inline hook is installed on
- * each function.  Every byte the Kronos sends to DIN MIDI OUT is copied into a
- * software ring buffer and returned by /proc/.midi_ring reads.  Block 5 (Korg
- * internal SysEx path) is also drained and appended so SysEx responses from
- * the SYSEX control command continue to work.
+ *   receive_fn=0x...        MidiInPortGeneric7Receive (required for MIDI IN injection)
+ *   register_fn=0x...       RegisterMidiInPort (required for port object discovery)
+ *   midi_dispatch_fn=0x...  CSTGMidiOutPort::ReadNextMessage VA (all MIDI out)
+ *                           Mangled: _ZN15CSTGMidiOutPort15ReadNextMessageEPhj
+ *                           Kronos 1 (D510, OA@0x59d17000): 0x59E054A0
+ *   can_send_fn=0x...       KorgUsbMidiOutputCanSend — hooked to always return 1
+ *                           so the USB output thread calls ReadNextMessage even
+ *                           without a USB host connected. Linux-context safe.
+ *                           Kronos 1: 0x58f70390
  */
 
 #include <linux/module.h>
@@ -24,6 +24,7 @@
 #include <linux/vmalloc.h>
 #include <linux/spinlock.h>
 #include <linux/notifier.h>
+#include <asm/cacheflush.h>
 
 MODULE_LICENSE("GPL");
 
@@ -37,11 +38,11 @@ module_param(receive_fn, ulong, 0444);
 static unsigned long register_fn = 0;
 module_param(register_fn, ulong, 0444);
 
-static unsigned long midi_out_fn = 0;
-module_param(midi_out_fn, ulong, 0444);
+static unsigned long midi_dispatch_fn = 0;
+module_param(midi_dispatch_fn, ulong, 0444);
 
-static unsigned long midi_rt_fn = 0;
-module_param(midi_rt_fn, ulong, 0444);
+static unsigned long can_send_fn = 0;
+module_param(can_send_fn, ulong, 0444);
 
 /* ------------------------------------------------------------------ */
 /*  MIDI IN injection state                                            */
@@ -79,55 +80,96 @@ static void ring_disable(void)
 }
 
 /* ------------------------------------------------------------------ */
-/*  DIN MIDI OUT capture ring                                          */
+/*  Unified MIDI OUT ring (dispatcher hook + Block 5 drain)           */
 /* ------------------------------------------------------------------ */
 
-#define OUT_RING_BITS  13               /* 8192 bytes */
-#define OUT_RING_SIZE  (1 << OUT_RING_BITS)
-#define OUT_RING_MASK  (OUT_RING_SIZE - 1)
+#define UNI_RING_BITS  14               /* 16384 bytes */
+#define UNI_RING_SIZE  (1 << UNI_RING_BITS)
+#define UNI_RING_MASK  (UNI_RING_SIZE - 1)
 
-static uint8_t  out_ring[OUT_RING_SIZE];
-static uint32_t out_ring_wpos = 0;
-static uint32_t out_ring_rpos = 0;
-static DEFINE_SPINLOCK(out_ring_lock);
+static uint8_t  uni_ring[UNI_RING_SIZE];
+static uint32_t uni_wpos = 0;
+static uint32_t uni_rpos = 0;
+static DEFINE_SPINLOCK(uni_lock);
 
-static void out_ring_push(uint8_t byte)
+static void uni_ring_push_buf(const uint8_t *buf, uint32_t len)
 {
     unsigned long flags;
-    spin_lock_irqsave(&out_ring_lock, flags);
-    out_ring[out_ring_wpos & OUT_RING_MASK] = byte;
-    out_ring_wpos++;
-    spin_unlock_irqrestore(&out_ring_lock, flags);
+    uint32_t i;
+    spin_lock_irqsave(&uni_lock, flags);
+    for (i = 0; i < len; i++) {
+        uni_ring[uni_wpos & UNI_RING_MASK] = buf[i];
+        uni_wpos++;
+    }
+    spin_unlock_irqrestore(&uni_lock, flags);
+}
+
+/* Drain any new Block 5 bytes into uni_ring.  Called from ring_fops_read. */
+static void drain_blk5_to_uni(void)
+{
+    uint8_t  tmp[128];
+    uint8_t  *data;
+    uint32_t *queue;
+    uint32_t  mask, wpos, avail, take, first;
+
+    spin_lock(&ring_lock);
+    if (ring_dead || !hw_data || !hw_queue) { spin_unlock(&ring_lock); return; }
+    data  = hw_data;
+    queue = hw_queue;
+    mask  = hw_mask;
+    spin_unlock(&ring_lock);
+
+    if (probe_kernel_read(&wpos, &queue[3], sizeof(wpos))) {
+        ring_disable();
+        return;
+    }
+    avail = wpos - ring_cursor;
+    if (!avail) return;
+    if (avail > mask + 1) avail = mask + 1;
+
+    while (avail > 0) {
+        take  = avail < (uint32_t)sizeof(tmp) ? avail : (uint32_t)sizeof(tmp);
+        first = (mask + 1) - (ring_cursor & mask);
+        if (first > take) first = take;
+
+        if (probe_kernel_read(tmp, &data[ring_cursor & mask], first)) {
+            ring_disable(); return;
+        }
+        if (first < take) {
+            if (probe_kernel_read(tmp + first, &data[0], take - first)) {
+                ring_disable(); return;
+            }
+        }
+        uni_ring_push_buf(tmp, take);
+        ring_cursor += take;
+        avail       -= take;
+    }
 }
 
 /* ------------------------------------------------------------------ */
 /*  Inline hook infrastructure                                         */
 /* ------------------------------------------------------------------ */
 
-/* Executable trampoline memory: original 5 bytes + JMP rel32 back */
-static uint8_t *tramp_out = NULL;
-static uint8_t *tramp_rt  = NULL;
+static uint8_t *tramp_dispatch  = NULL;  static uint8_t orig_dispatch[6];
+static uint8_t *tramp_can_send  = NULL;  static uint8_t orig_can_send[6];
 
-static uint8_t orig_out[5];
-static uint8_t orig_rt[5];
-
-/* Hook handlers — calling convention regparm(3): this→EAX, byte→EDX.
- * Captures the byte then calls the original via the trampoline. */
-static void __attribute__((regparm(3)))
-hook_send_single_byte(void *self, uint8_t byte)
+/* Post-call hook for CSTGMidiOutPort::ReadNextMessage — regparm(3): self→EAX, buf→EDX, maxlen→ECX.
+ * Calls original first (fills buf), then captures the returned bytes into the unified ring. */
+static int __attribute__((regparm(3)))
+hook_read_next_msg(void *self, uint8_t *buf, uint32_t maxlen)
 {
-    typedef void (*orig_t)(void *, uint8_t) __attribute__((regparm(3)));
-    out_ring_push(byte);
-    ((orig_t)tramp_out)(self, byte);
+    typedef int (*orig_t)(void *, uint8_t *, uint32_t)
+        __attribute__((regparm(3)));
+    int n = ((orig_t)tramp_dispatch)(self, buf, maxlen);
+    if (n > 0 && (uint32_t)n <= maxlen)
+        uni_ring_push_buf(buf, (uint32_t)n);
+    return n;
 }
 
-static void __attribute__((regparm(3)))
-hook_send_real_time(void *self, uint8_t byte)
-{
-    typedef void (*orig_t)(void *, uint8_t) __attribute__((regparm(3)));
-    out_ring_push(byte);
-    ((orig_t)tramp_rt)(self, byte);
-}
+/* Hook KorgUsbMidiOutputCanSend to always return 1 so the USB MIDI output
+ * thread unconditionally calls ReadNextMessage even without a USB host.
+ * Called from Linux context (kOAMidiOutput thread) — vmalloc-safe. */
+static int hook_can_send(void) { return 1; }
 
 /* Temporarily disable CR0.WP so kernel .text is writable. */
 static unsigned long saved_cr0;
@@ -149,45 +191,50 @@ static void write_jmp(uint8_t *dst, uint8_t *tgt)
 }
 
 /* Install inline hook:
- *   - allocates executable trampoline memory
- *   - saves original 5 bytes into orig[]
- *   - builds trampoline: orig[5] + JMP back to fn+5
- *   - patches fn[0..4] with JMP to hook_fn
+ *   - allocates 16-byte executable trampoline
+ *   - saves save_len original bytes into orig[] (must be ≥ 5, padded to instruction boundary)
+ *   - builds trampoline: orig[save_len] + JMP back to fn+save_len
+ *   - patches fn[0..4] with JMP to hook_fn (always a 5-byte E9 rel32)
+ *
+ * save_len must be ≥ 5.  Use 6 for standard i386 cdecl/regparm prologues where
+ * the third instruction (and/sub esp) spans bytes 3–5 of the function.
+ *
  * Returns 0 on success, negative on failure (hook NOT installed). */
 static int install_hook(unsigned long fn_addr, void *hook_fn,
-                        uint8_t **tramp_ptr, uint8_t *orig)
+                        uint8_t **tramp_ptr, uint8_t *orig, int save_len)
 {
     uint8_t *fn = (uint8_t *)fn_addr;
     uint8_t *tramp;
     unsigned long flags;
 
-    if (!fn_addr) return -EINVAL;
+    if (!fn_addr || save_len < 5) return -EINVAL;
 
-    /* Allocate executable memory for the trampoline */
-#ifdef PAGE_KERNEL_EXEC
-    tramp = __vmalloc(16, GFP_KERNEL, PAGE_KERNEL_EXEC);
-#else
-    tramp = vmalloc(16);
-#endif
+    /* Allocate trampoline from the direct-mapped region (get_free_page) so it is
+     * always present in kernel page tables — no lazy vmalloc fault.  This is
+     * required for hooks called from RTAI real-time tasks, whose trap handler
+     * does not recover vmalloc #PF.  set_memory_x makes the page executable
+     * (needed on PAE kernels with NX support). */
+    tramp = (uint8_t *)__get_free_page(GFP_KERNEL);
     if (!tramp) {
-        printk(KERN_ERR "midi_inject: vmalloc trampoline failed\n");
+        printk(KERN_ERR "midi_inject: get_free_page trampoline failed\n");
         return -ENOMEM;
     }
+    set_memory_x((unsigned long)tramp, 1);
     *tramp_ptr = tramp;
 
-    /* Build trampoline: [5 original bytes][JMP fn+5] */
-    memcpy(orig, fn, 5);
-    memcpy(tramp, orig, 5);
-    write_jmp(tramp + 5, fn + 5);
+    /* Copy save_len bytes (covering all instructions that overlap the 5-byte patch) */
+    memcpy(orig, fn, save_len);
+    memcpy(tramp, orig, save_len);
+    write_jmp(tramp + save_len, fn + save_len);
 
-    /* Patch target: write JMP to hook under disabled write-protect */
+    /* Patch target: write 5-byte JMP to hook.  Bytes 5..save_len-1 of fn are
+     * left unchanged — they are part of instructions already in the trampoline. */
     local_irq_save(flags);
     wp_disable();
     write_jmp(fn, (uint8_t *)hook_fn);
     wp_enable();
     local_irq_restore(flags);
 
-    /* Flush instruction cache on all CPUs */
     /* x86 has coherent instruction cache — no explicit flush needed after
      * patching .text.  Compiler barrier prevents reordering around the patch. */
     asm volatile("" ::: "memory");
@@ -204,7 +251,7 @@ static void remove_hook(unsigned long fn_addr, uint8_t *orig, uint8_t **tramp_pt
         unsigned long flags;
         local_irq_save(flags);
         wp_disable();
-        memcpy((uint8_t *)fn_addr, orig, 5);
+        memcpy((uint8_t *)fn_addr, orig, 5);  /* restore only the 5 bytes we patched */
         wp_enable();
         local_irq_restore(flags);
     }
@@ -212,7 +259,8 @@ static void remove_hook(unsigned long fn_addr, uint8_t *orig, uint8_t **tramp_pt
      * patching .text.  Compiler barrier prevents reordering around the patch. */
     asm volatile("" ::: "memory");
     if (*tramp_ptr) {
-        vfree(*tramp_ptr);
+        set_memory_nx((unsigned long)*tramp_ptr, 1);
+        free_page((unsigned long)*tramp_ptr);
         *tramp_ptr = NULL;
     }
     printk(KERN_INFO "midi_inject: unhooked 0x%lx\n", fn_addr);
@@ -230,9 +278,8 @@ static int midi_module_notify(struct notifier_block *nb,
         (strcmp(mod->name, "OA") == 0 ||
          strcmp(mod->name, "loadmod") == 0)) {
         ring_disable();
-        /* Unhook before the function addresses become invalid */
-        remove_hook(midi_out_fn, orig_out, &tramp_out);
-        remove_hook(midi_rt_fn,  orig_rt,  &tramp_rt);
+        remove_hook(can_send_fn,      orig_can_send, &tramp_can_send);
+        remove_hook(midi_dispatch_fn, orig_dispatch, &tramp_dispatch);
         printk(KERN_INFO "midi_inject: %s unloading, disabled\n", mod->name);
     }
     return NOTIFY_OK;
@@ -322,7 +369,7 @@ static int setup_ring(void)
 }
 
 /* ------------------------------------------------------------------ */
-/*  /proc/.midi_ring — merged DIN out hook ring + Block 5             */
+/*  /proc/.midi_ring — unified MIDI out (dispatcher hook + Block 5)   */
 /* ------------------------------------------------------------------ */
 
 static ssize_t ring_fops_read(struct file *file, char __user *buf,
@@ -330,77 +377,28 @@ static ssize_t ring_fops_read(struct file *file, char __user *buf,
 {
     uint8_t tmp[512];
     size_t len = 0;
+    unsigned long flags;
+    uint32_t wpos, avail;
+    size_t take, i;
 
-    /* Source 1: DIN MIDI OUT hook ring (keyboard notes, CC, SysEx via DIN) */
-    {
-        unsigned long flags;
-        uint32_t wpos, avail;
-        spin_lock_irqsave(&out_ring_lock, flags);
-        wpos  = out_ring_wpos;
-        avail = wpos - out_ring_rpos;
-        if (avail > 0) {
-            size_t i;
-            size_t take = avail;
-            if (take > sizeof(tmp)) take = sizeof(tmp);
-            if (take > count)       take = count;
-            for (i = 0; i < take; i++)
-                tmp[i] = out_ring[(out_ring_rpos + i) & OUT_RING_MASK];
-            out_ring_rpos += take;
-            len = take;
-        }
-        spin_unlock_irqrestore(&out_ring_lock, flags);
-    }
+    /* Drain Block 5 (Korg internal SysEx) into unified ring */
+    drain_blk5_to_uni();
 
-    /* Source 2: Block 5 (Korg internal SysEx path, e.g. SYSEX command responses) */
-    if (len < sizeof(tmp)) {
-        uint8_t  *data;
-        uint32_t *queue;
-        uint32_t  mask;
-        uint32_t  wpos, avail;
-        size_t    take, first;
-
-        spin_lock(&ring_lock);
-        if (ring_dead || !hw_data || !hw_queue) {
-            spin_unlock(&ring_lock);
-            goto out;
-        }
-        data  = hw_data;
-        queue = hw_queue;
-        mask  = hw_mask;
-        spin_unlock(&ring_lock);
-
-        if (probe_kernel_read(&wpos, &queue[3], sizeof(wpos))) {
-            ring_disable();
-            printk(KERN_WARNING "midi_inject: ring memory gone\n");
-            goto out;
-        }
-
-        avail = wpos - ring_cursor;
-        if (avail == 0) goto out;
-        if (avail > (mask + 1)) avail = mask + 1;
-
+    /* Read from unified ring */
+    spin_lock_irqsave(&uni_lock, flags);
+    wpos  = uni_wpos;
+    avail = wpos - uni_rpos;
+    if (avail > 0) {
         take = avail;
-        if (take > sizeof(tmp) - len) take = sizeof(tmp) - len;
-        if (take > count - len)       take = count - len;
-
-        first = (mask + 1) - (ring_cursor & mask);
-        if (first > take) first = take;
-
-        if (probe_kernel_read(tmp + len, &data[ring_cursor & mask], first)) {
-            ring_disable();
-            goto out;
-        }
-        if (first < take) {
-            if (probe_kernel_read(tmp + len + first, &data[0], take - first)) {
-                ring_disable();
-                goto out;
-            }
-        }
-        ring_cursor += take;
-        len += take;
+        if (take > sizeof(tmp)) take = sizeof(tmp);
+        if (take > count)       take = count;
+        for (i = 0; i < take; i++)
+            tmp[i] = uni_ring[(uni_rpos + i) & UNI_RING_MASK];
+        uni_rpos += take;
+        len = take;
     }
+    spin_unlock_irqrestore(&uni_lock, flags);
 
-out:
     if (len == 0) return 0;
     if (copy_to_user(buf, tmp, len)) return -EFAULT;
     return (ssize_t)len;
@@ -409,21 +407,21 @@ out:
 static ssize_t ring_fops_write(struct file *file, const char __user *buf,
                                size_t count, loff_t *ppos)
 {
-    /* Reset both ring read cursors to current write positions */
-    {
-        unsigned long flags;
-        spin_lock_irqsave(&out_ring_lock, flags);
-        out_ring_rpos = out_ring_wpos;
-        spin_unlock_irqrestore(&out_ring_lock, flags);
-    }
-    {
-        uint32_t wpos;
-        spin_lock(&ring_lock);
-        if (!ring_dead && hw_queue &&
-            !probe_kernel_read(&wpos, &hw_queue[3], sizeof(wpos)))
-            ring_cursor = wpos;
-        spin_unlock(&ring_lock);
-    }
+    unsigned long flags;
+    uint32_t wpos;
+
+    /* Reset Block 5 cursor to current write position */
+    spin_lock(&ring_lock);
+    if (!ring_dead && hw_queue &&
+        !probe_kernel_read(&wpos, &hw_queue[3], sizeof(wpos)))
+        ring_cursor = wpos;
+    spin_unlock(&ring_lock);
+
+    /* Reset unified ring read cursor */
+    spin_lock_irqsave(&uni_lock, flags);
+    uni_rpos = uni_wpos;
+    spin_unlock_irqrestore(&uni_lock, flags);
+
     return (ssize_t)count;
 }
 
@@ -468,38 +466,48 @@ static int __init midi_inject_init(void)
     int ret;
     int have_ring = 0;
 
-    printk(KERN_INFO "midi_inject: receive=0x%lx register=0x%lx"
-           " midi_out=0x%lx midi_rt=0x%lx\n",
-           receive_fn, register_fn, midi_out_fn, midi_rt_fn);
+    printk(KERN_INFO "midi_inject: receive=0x%lx register=0x%lx dispatch=0x%lx can_send=0x%lx\n",
+           receive_fn, register_fn, midi_dispatch_fn, can_send_fn);
 
-    if (!receive_fn || !register_fn) {
-        printk(KERN_ERR "midi_inject: receive_fn and register_fn required\n");
-        return -EINVAL;
+    /* MIDI IN injection — port discovery uses a bytecode pattern in RegisterMidiInPort
+     * that is specific to the compiled OA.ko.  If it fails (different OS or model),
+     * degrade gracefully: output capture hooks still load. */
+    if (receive_fn && register_fn) {
+        port_obj = find_port_object();
+        if (!port_obj) {
+            printk(KERN_WARNING "midi_inject: port discovery failed (pattern mismatch?) "
+                   "— MIDI IN injection unavailable, output capture unaffected\n");
+        } else {
+            ret = setup_ring();
+            if (ret < 0)
+                printk(KERN_WARNING "midi_inject: Block 5 ring setup failed (%d)\n", ret);
+            else
+                have_ring = 1;
+        }
+    } else {
+        printk(KERN_WARNING "midi_inject: receive_fn/register_fn not set — MIDI IN unavailable\n");
     }
 
-    port_obj = find_port_object();
-    if (!port_obj) return -ENODEV;
+    /* CanSend hook: forces USB MIDI output thread to always call ReadNextMessage,
+     * even without a USB host.  Falls back gracefully — USB submission fails silently
+     * when no host is present, which is normal operation for the Kronos.
+     * Symbol is in KorgUsbAudioDriver.ko; if not found on this model the hook
+     * is simply skipped and ReadNextMessage only fires when USB host is connected. */
+    if (can_send_fn)
+        install_hook(can_send_fn, hook_can_send, &tramp_can_send, orig_can_send, 6);
 
-    ret = setup_ring();
-    if (ret < 0)
-        printk(KERN_WARNING "midi_inject: Block 5 ring setup failed (%d)\n", ret);
-    else
-        have_ring = 1;
-
-    /* Install DIN MIDI OUT hooks if addresses provided */
-    if (midi_out_fn) {
-        if (install_hook(midi_out_fn, hook_send_single_byte,
-                         &tramp_out, orig_out) == 0)
+    if (midi_dispatch_fn) {
+        /* save_len=6: ReadNextMessage prologue crosses byte 5 (and esp,0xfffffff0 = 83 E4 F0) */
+        if (install_hook(midi_dispatch_fn, hook_read_next_msg,
+                         &tramp_dispatch, orig_dispatch, 6) == 0)
             have_ring = 1;
         else
-            printk(KERN_WARNING "midi_inject: SendSingleByte hook failed\n");
+            printk(KERN_WARNING "midi_inject: ReadNextMessage hook failed\n");
     }
-    if (midi_rt_fn) {
-        if (install_hook(midi_rt_fn, hook_send_real_time,
-                         &tramp_rt, orig_rt) == 0)
-            have_ring = 1;
-        else
-            printk(KERN_WARNING "midi_inject: SendRealTime hook failed\n");
+
+    if (!have_ring && !tramp_can_send) {
+        printk(KERN_ERR "midi_inject: no output path active — aborting\n");
+        return -ENODEV;
     }
 
     proc_midi_in = create_proc_entry(".midi_in", 0666, NULL);
@@ -514,10 +522,11 @@ static int __init midi_inject_init(void)
 
     register_module_notifier(&midi_nb);
 
-    printk(KERN_INFO "midi_inject: ready — port=%p blk5=%s din_hook=%s\n",
+    printk(KERN_INFO "midi_inject: ready — port=%p blk5=%s can_send=%s dispatch=%s\n",
            port_obj,
-           hw_data    ? "ok"  : "none",
-           tramp_out  ? "ok"  : "none");
+           hw_data        ? "ok" : "none",
+           tramp_can_send ? "ok" : "none",
+           tramp_dispatch ? "ok" : "none");
     return 0;
 }
 
@@ -526,9 +535,9 @@ static void __exit midi_inject_exit(void)
     unregister_module_notifier(&midi_nb);
 
     /* Remove hooks before any in-flight calls can use freed trampoline memory.
-     * synchronize_rcu() ensures all CPUs have left the hook path. */
-    remove_hook(midi_out_fn, orig_out, &tramp_out);
-    remove_hook(midi_rt_fn,  orig_rt,  &tramp_rt);
+     * synchronize_rcu() ensures all CPUs have left the hook paths. */
+    remove_hook(can_send_fn,      orig_can_send, &tramp_can_send);
+    remove_hook(midi_dispatch_fn, orig_dispatch, &tramp_dispatch);
     synchronize_rcu();
 
     ring_disable();

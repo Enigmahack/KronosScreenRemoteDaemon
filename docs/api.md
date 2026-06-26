@@ -13,11 +13,12 @@ This document describes every network interface exposed by the `screenremote` da
 5. [Control port - overview and access control](#5-control-port---overview-and-access-control)
 6. [Control port - session modes](#6-control-port---session-modes)
 7. [Control port - command reference](#7-control-port---command-reference)
-8. [Button name reference](#8-button-name-reference)
-9. [SYSINFO field reference](#9-sysinfo-field-reference)
-10. [Authentication internals](#10-authentication-internals)
-11. [Error handling and disconnection](#11-error-handling-and-disconnection)
-12. [Implementation limits](#12-implementation-limits)
+8. [MIDI bridge — port 9875](#8-midi-bridge--port-9875)
+9. [Button name reference](#9-button-name-reference)
+10. [SYSINFO field reference](#10-sysinfo-field-reference)
+11. [Authentication internals](#11-authentication-internals)
+12. [Error handling and disconnection](#12-error-handling-and-disconnection)
+13. [Implementation limits](#13-implementation-limits)
 
 ---
 
@@ -28,7 +29,7 @@ This document describes every network interface exposed by the `screenremote` da
 | TCP | 7373 | Yes (`stream_port` in config) | Framebuffer stream |
 | TCP | 7374 | Yes (`ctrl_port` in config) | Remote control |
 | UDP | 7372 | No | LAN discovery |
-| TCP | 9875 | No | MIDI bridge (localhost only; internal daemon↔midi_tcp) |
+| TCP | 9875 | No | MIDI bridge; hub mode, up to 8 clients, no auth required; see [Section 8](#8-midi-bridge--port-9875) |
 
 The daemon binds the stream and control ports to the first usable LAN IPv4 address it finds (skipping loopback and link-local). If no LAN interface is up, it waits and retries every 5 seconds. The UDP discovery socket always binds to `INADDR_ANY`.
 
@@ -348,7 +349,7 @@ pkt[3] = event_type   (1 = pen-down, 2 = pen-up, 3 = pen-move)
 pkt[4] = v_adc | (h_adc << 8)
 ```
 
-ADC values are computed from pixel coordinates using configurable touch calibration parameters (see [Section 12](#12-implementation-limits) for config keys):
+ADC values are computed from pixel coordinates using configurable touch calibration parameters (see [Section 13](#13-implementation-limits) for config keys):
 
 ```
 cx = x + touch_x_offset          (default: 10)
@@ -363,7 +364,7 @@ With defaults (`touch_x_offset=10`, `touch_x_range=813`, `touch_y_offset=20`, `t
 
 ### BUTTON
 
-Press and release a named front-panel button. See [Section 8](#8-button-name-reference) for the full list of button names.
+Press and release a named front-panel button. See [Section 9](#9-button-name-reference) for the full list of button names.
 
 ```
 Request:  BUTTON <name>\n
@@ -598,7 +599,7 @@ Request:  SYSINFO\n
 Response: <key>=<value>\n ... OK\n
 ```
 
-See [Section 9](#9-sysinfo-field-reference) for the full field reference.
+See [Section 10](#10-sysinfo-field-reference) for the full field reference.
 
 Note: CPU percentage fields require two successive `SYSINFO` calls to be meaningful. The first call will report `-1` for all `CPU*_PCT` fields because there is no prior sample to compute a delta from. The second and subsequent calls report the average CPU utilisation since the previous call.
 
@@ -641,7 +642,7 @@ Response: SYSEX_RESP <hex>\n      (captured response as hex)
 
 The capture timeout is approximately 5 seconds. The response includes the first complete F0...F7 SysEx message received from the Kronos after the request is sent, up to 65536 bytes. For SysEx request/response to work, **Global > MIDI > "Enable Exclusive" must be ON** on the Kronos, or SysEx messages are silently ignored.
 
-**Asynchronous delivery.** The `midi_tcp` subprocess forwards all MIDI output from the Kronos (note events, CC, SysEx, real-time bytes) as a continuous stream without buffering or request/response pairing. Non-SysEx MIDI events such as note-on/note-off may arrive interleaved with the SysEx response. Delivery order within the stream is preserved (TCP guarantees this), but clients must be prepared to discard or buffer non-SysEx messages that arrive while waiting for a response. Response correlation is by payload content: Korg SysEx messages carry a manufacturer ID (0x42), model ID (0x58 for Kronos), and a function code that identifies the message type — match on those rather than on timing or position in the stream.
+**Asynchronous delivery.** The `midi_tcp` subprocess forwards all MIDI output from the Kronos (note events, CC, SysEx, real-time bytes) as a continuous stream without buffering or request/response pairing. Non-SysEx MIDI events such as note-on/note-off may arrive interleaved with the SysEx response. Delivery order within the stream is preserved (TCP guarantees this), but clients must be prepared to discard or buffer non-SysEx messages that arrive while waiting for a response. Response correlation is by payload content: Korg SysEx messages carry a manufacturer ID (0x42), model ID (0x68 for Kronos), and a function code that identifies the message type — match on those rather than on timing or position in the stream.
 
 ---
 
@@ -661,11 +662,73 @@ Response: MIDI_LOADED=<0|1>\n
 |-------|-------------|
 | `MIDI_LOADED` | 1 if `midi_inject.ko` was loaded successfully |
 | `MIDI_IN` | 1 if `/proc/.midi_in` is open and writable |
-| `MIDI_CAPTURE` | 1 if the `midi_tcp` subprocess is connected and SysEx capture is available |
+| `MIDI_CAPTURE` | 1 if `/proc/.midi_ring` is available and MIDI output capture is active (channel messages and SysEx) |
 
 ---
 
-## 8. Button name reference
+## 8. MIDI bridge — port 9875
+
+The MIDI bridge is a standalone TCP service (`midi_tcp` subprocess) that runs alongside the main daemon. Unlike the stream and control ports it requires **no authentication** and is accessible from any host on the network.
+
+### 8.1 Connection
+
+Connect to TCP port 9875. The port is not configurable. Up to 8 clients may be connected simultaneously; connections beyond that limit are rejected with no response. `TCP_NODELAY` is set on all client sockets.
+
+### 8.2 Outbound — Kronos MIDI output → client
+
+Once connected the server streams raw MIDI bytes captured from the Kronos MIDI output engine. There is no framing or length prefix — the byte stream follows the standard MIDI byte protocol and clients are responsible for parsing it into complete messages.
+
+**Captured message types:**
+
+| Type | Status byte | Notes |
+|------|-------------|-------|
+| Note Off | `0x8n` | |
+| Note On | `0x9n` | |
+| Polyphonic Aftertouch | `0xAn` | |
+| Control Change | `0xBn` | |
+| Program Change | `0xCn` | |
+| Channel Aftertouch | `0xDn` | |
+| Pitch Bend | `0xEn` | |
+| System Common | `0xF1`–`0xF6` | MTC, Song Position, Song Select, Tune Request |
+| SysEx | `0xF0` … `0xF7` | Korg SysEx responses; drained from internal Block 5 ring |
+| Real-time | `0xF8`–`0xFF` | Clock, Start, Continue, Stop, Active Sensing — only if MIDI clock output is enabled on the Kronos |
+
+**What is NOT captured:**
+
+Internal Korg STG message-bus traffic (e.g. patch-name parameter broadcasts) never reaches the physical MIDI output layer and will not appear in the stream. These were incorrectly captured in versions prior to 1.7.4.
+
+**Duplicate events:**
+
+The capture hook fires once per active physical output port. If the Kronos has more than one MIDI output port enabled (e.g. both DIN serial and USB), each note event will appear **twice** in the stream in rapid succession. Clients should either deduplicate consecutive identical messages within a short time window (~5 ms) or treat each copy as an independent event, depending on the application.
+
+**Running status:**
+
+The `midi_tcp` parser handles running status internally and broadcasts complete, fully-formed messages (each with an explicit status byte) to connected clients. Clients do not need to implement running-status tracking.
+
+**Ring buffer and backpressure:**
+
+The kernel module buffers output in a 16 KB circular ring. Data written to the ring before any client is connected is discarded when the first client connects (ring cursor is reset). The ring is shared across all connected clients; if one slow client causes backpressure and the ring fills, older data is silently overwritten.
+
+### 8.3 Inbound — client MIDI → Kronos
+
+Write raw MIDI bytes to the TCP connection to inject them into the Kronos MIDI receive engine (`MidiInPortGeneric7Receive`). Any valid MIDI message type is accepted: note on/off, CC, program change, pitch bend, SysEx, real-time, etc.
+
+Maximum single write: 4096 bytes (kernel module buffer limit). Larger payloads must be split across multiple writes.
+
+### 8.4 Hub semantics
+
+All connected clients share the same single input and output channel:
+
+- Kronos MIDI output is broadcast to **all** connected clients simultaneously via `send(..., MSG_DONTWAIT)`. A blocked or slow client does not affect delivery to other clients (the send is non-blocking; data to a full-buffer client is dropped for that delivery).
+- MIDI injected by any client is delivered to the Kronos. Other clients do **not** receive an echo of injected data unless the Kronos itself echoes it back as MIDI output.
+
+### 8.5 Ring cursor reset
+
+The ring cursor is reset (pre-connection buffered data discarded) when the **first** client connects to an otherwise empty hub. Clients that connect while others are already active begin receiving from the current write position and may receive mid-message data if they arrive during an active capture burst. Clients should implement standard MIDI re-sync logic (scan forward for the next status byte with bit 7 set if the first byte received is a data byte).
+
+---
+
+## 9. Button name reference
 
 Button names are case-sensitive and must be uppercase.
 
@@ -754,7 +817,7 @@ Button names are case-sensitive and must be uppercase.
 
 ---
 
-## 9. SYSINFO field reference
+## 10. SYSINFO field reference
 
 All fields are plain ASCII decimal unless otherwise noted. Fields that cannot be read from the system are omitted from the response.
 
@@ -794,7 +857,7 @@ OK\n
 
 ---
 
-## 10. Authentication internals
+## 11. Authentication internals
 
 Authentication is attempted in priority order. The first backend that recognises the username determines the result.
 
@@ -826,7 +889,7 @@ Every authentication attempt (success or failure) is appended to `/korg/rw/scree
 
 ---
 
-## 11. Error handling and disconnection
+## 12. Error handling and disconnection
 
 ### Stream port
 
@@ -847,7 +910,7 @@ Every authentication attempt (success or failure) is appended to `/korg/rw/scree
 
 ---
 
-## 12. Implementation limits
+## 13. Implementation limits
 
 | Limit | Value | Notes |
 |-------|-------|-------|
@@ -869,6 +932,9 @@ Every authentication attempt (success or failure) is appended to `/korg/rw/scree
 | MIDI_SEND max message size | 4096 bytes | Limited by the kernel module's static buffer |
 | SysEx capture buffer | 65536 bytes | Maximum response size from a single SYSEX command |
 | SysEx capture timeout | ~5 seconds | Initial 5 s recv timeout, then 1 s for trailing data |
+| MIDI bridge max clients | 8 | Connections beyond this are rejected with no response |
+| MIDI bridge output ring | 16384 bytes | Kernel circular ring shared across all clients; oldest data overwritten on overflow |
+| MIDI bridge inbound buffer | 4096 bytes | Per-write maximum for MIDI injection; split larger payloads across writes |
 | Touch calibration: `touch_x_offset` | 10 | Pixels added to x before ADC scaling |
 | Touch calibration: `touch_x_range` | 813 | Pixel span mapped to ADC 0–255 (horizontal) |
 | Touch calibration: `touch_y_offset` | 20 | Pixels added to y before ADC scaling |

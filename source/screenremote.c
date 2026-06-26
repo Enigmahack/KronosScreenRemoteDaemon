@@ -84,7 +84,7 @@
 #define KBD_EV_KEY  1
 
 /* �Version */
-#define SCREENREMOTE_VERSION "1.7.4"
+#define SCREENREMOTE_VERSION "1.7.6"
 #ifndef BUILD_ID
 #define BUILD_ID "dev"
 #endif
@@ -1094,25 +1094,21 @@ static int sysinfo_collect(char *out, int outsz)
 
 /* MIDI helpers */
 
-static void resolve_kallsyms(unsigned long *recv_fn, unsigned long *reg_fn,
-                              unsigned long *out_fn,  unsigned long *rt_fn)
+static void resolve_kallsyms(unsigned long *recv_fn,    unsigned long *reg_fn,
+                              unsigned long *dispatch_fn, unsigned long *can_send_fn)
 {
     FILE *f = fopen("/proc/kallsyms", "r");
     char line[256];
-    *recv_fn = 0; *reg_fn = 0; *out_fn = 0; *rt_fn = 0;
+    *recv_fn = *reg_fn = *dispatch_fn = *can_send_fn = 0;
     if (!f) return;
     while (fgets(line, sizeof(line), f)) {
-        unsigned long addr; char type, name[128];
-        if (sscanf(line, "%lx %c %127s", &addr, &type, name) != 3) continue;
-        if (!*recv_fn && strstr(name, "MidiInPortGeneric7Receive"))
-            *recv_fn = addr;
-        else if (!*reg_fn && strstr(name, "RegisterMidiInPort"))
-            *reg_fn = addr;
-        else if (!*out_fn && strstr(name, "CSTGMidiOutPortSerial14SendSingleByte"))
-            *out_fn = addr;
-        else if (!*rt_fn && strstr(name, "CSTGMidiOutPortSerial12SendRealTime"))
-            *rt_fn = addr;
-        if (*recv_fn && *reg_fn && *out_fn && *rt_fn) break;
+        unsigned long addr; char type, name[256];
+        if (sscanf(line, "%lx %c %255s", &addr, &type, name) != 3) continue;
+        if      (!*recv_fn     && strstr(name, "MidiInPortGeneric7Receive"))   *recv_fn     = addr;
+        else if (!*reg_fn      && strstr(name, "RegisterMidiInPort"))          *reg_fn      = addr;
+        else if (!*dispatch_fn && strstr(name, "ReadNextMessageEPhj"))         *dispatch_fn = addr;
+        else if (!*can_send_fn && strstr(name, "KorgUsbMidiOutputCanSend"))    *can_send_fn = addr;
+        if (*recv_fn && *reg_fn && *dispatch_fn && *can_send_fn) break;
     }
     fclose(f);
 }
@@ -1689,13 +1685,15 @@ int main(void)
 
     /* Load MIDI injection module */
     {
-        unsigned long recv_fn = 0, reg_fn = 0, out_fn = 0, rt_fn = 0;
-        resolve_kallsyms(&recv_fn, &reg_fn, &out_fn, &rt_fn);
-        if (recv_fn && reg_fn) {
-            char params[320];
+        unsigned long recv_fn = 0, reg_fn = 0;
+        unsigned long dispatch_fn = 0, can_send_fn = 0;
+        resolve_kallsyms(&recv_fn, &reg_fn, &dispatch_fn, &can_send_fn);
+        if (dispatch_fn || can_send_fn) {
+            char params[512];
             snprintf(params, sizeof(params),
-                     "receive_fn=0x%lx register_fn=0x%lx midi_out_fn=0x%lx midi_rt_fn=0x%lx",
-                     recv_fn, reg_fn, out_fn, rt_fn);
+                     "receive_fn=0x%lx register_fn=0x%lx "
+                     "midi_dispatch_fn=0x%lx can_send_fn=0x%lx",
+                     recv_fn, reg_fn, dispatch_fn, can_send_fn);
             extract_ko(MIDI_INJECT_KO, midi_inject_ko, midi_inject_ko_len);
             long ret = syscall(SYS_init_module,
                                (void *)midi_inject_ko,
@@ -1703,13 +1701,18 @@ int main(void)
                                params);
             if (ret == 0 || errno == EEXIST) {
                 g_midi_loaded = 1;
-                fprintf(stderr, "screenremote: midi_inject %s\n",
-                        ret == 0 ? "loaded" : "already loaded");
+                fprintf(stderr, "screenremote: midi_inject %s "
+                        "(recv=%s reg=%s dispatch=%s can_send=%s)\n",
+                        ret == 0 ? "loaded" : "already loaded",
+                        recv_fn      ? "ok" : "none",
+                        reg_fn       ? "ok" : "none",
+                        dispatch_fn  ? "ok" : "none",
+                        can_send_fn  ? "ok" : "none");
             } else {
                 fprintf(stderr, "screenremote: midi_inject failed (%ld)\n", ret);
             }
         } else {
-            fprintf(stderr, "screenremote: kallsyms resolve failed, MIDI disabled\n");
+            fprintf(stderr, "screenremote: no usable MIDI symbols in kallsyms — MIDI disabled\n");
         }
 
         if (g_midi_loaded) {
