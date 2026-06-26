@@ -1,15 +1,16 @@
 /*
- * midi_tcp — TCP MIDI bridge for Korg Kronos
+ * midi_tcp — TCP MIDI bridge for Korg Kronos (hub mode)
  *
  * Listens on TCP port 9875 (same as Korg's MIDID).
  * Inbound:  TCP → /proc/.midi_in (kernel module injection)
  * Outbound: /proc/.midi_ring (upgraded) or shared memory (fallback) → TCP
  *
- * All MIDI output is parsed into complete messages and forwarded to the TCP
- * client immediately as each message completes — SysEx, regular channel
- * messages, and real-time bytes alike.  The TCP client must tolerate
- * asynchronous, interleaved delivery and correlate SysEx responses to
- * requests by message content rather than timing.
+ * All MIDI output is parsed into complete messages and broadcast to ALL
+ * connected TCP clients simultaneously — SysEx, regular channel messages,
+ * and real-time bytes alike.  Up to MAX_CLIENTS simultaneous connections
+ * are supported.  MIDI input received from any client is injected into
+ * the Kronos; clients are independent and see each other's injected data
+ * only if the Kronos echoes it back.
  *
  * Usage: midi_tcp [-p port] [-d] [-s]
  *   -p port  TCP port (default 9875)
@@ -32,10 +33,29 @@
 #include <netinet/tcp.h>
 #include <stdint.h>
 
+#define MAX_CLIENTS 8
+
 static int debug = 0;
 static volatile int running = 1;
 
 static void sighandler(int sig) { running = 0; }
+
+/* ------------------------------------------------------------------ */
+/*  Hub state                                                           */
+/* ------------------------------------------------------------------ */
+
+static int client_fds[MAX_CLIENTS];
+static int num_clients = 0;
+static int midi_fd = -1;
+
+static void broadcast(const uint8_t *buf, int len)
+{
+    int i;
+    for (i = 0; i < MAX_CLIENTS; i++) {
+        if (client_fds[i] >= 0)
+            send(client_fds[i], buf, len, MSG_DONTWAIT);
+    }
+}
 
 /* ------------------------------------------------------------------ */
 /*  MIDI output reader — two backends: /proc/.midi_ring or shm         */
@@ -212,18 +232,17 @@ static void parser_init(struct midi_parser *p) {
     memset(p, 0, sizeof(*p));
 }
 
-/* Feed one byte through the parser.  Sends a complete MIDI message to
- * client_fd as soon as one is assembled.  Real-time bytes (0xF8-0xFF)
- * are emitted immediately without disturbing parser state, so they
- * are correctly interleaved even inside a SysEx message. */
-static void parser_feed(struct midi_parser *p, uint8_t b, int client_fd)
+/* Feed one byte through the parser.  Broadcasts a complete MIDI message to
+ * all connected clients as soon as one is assembled.  Real-time bytes
+ * (0xF8-0xFF) are emitted immediately without disturbing parser state, so
+ * they are correctly interleaved even inside a SysEx message. */
+static void parser_feed(struct midi_parser *p, uint8_t b)
 {
-    /* Real-time: single byte, pass through immediately. */
+    /* Real-time: single byte, broadcast immediately. */
     if (b >= 0xF8) {
         if (debug)
             fprintf(stderr, "MIDI->TCP 1 byte (rt): %02x\n", b);
-        if (client_fd >= 0)
-            send(client_fd, &b, 1, 0);
+        broadcast(&b, 1);
         return;
     }
 
@@ -240,8 +259,7 @@ static void parser_feed(struct midi_parser *p, uint8_t b, int client_fd)
                 if (p->len > 16) fprintf(stderr, " ...");
                 fprintf(stderr, "\n");
             }
-            if (client_fd >= 0)
-                send(client_fd, p->buf, p->len, 0);
+            broadcast(p->buf, p->len);
             p->len = 0;
             p->in_sysex = 0;
             p->running_status = 0;
@@ -276,7 +294,7 @@ static void parser_feed(struct midi_parser *p, uint8_t b, int client_fd)
             p->expected = slen;
             if (slen == 1) {
                 if (debug) fprintf(stderr, "MIDI->TCP 1 byte (syscom): %02x\n", b);
-                if (client_fd >= 0) send(client_fd, p->buf, 1, 0);
+                broadcast(p->buf, 1);
                 p->len = 0;
             }
             return;
@@ -311,8 +329,7 @@ static void parser_feed(struct midi_parser *p, uint8_t b, int client_fd)
                     fprintf(stderr, " %02x", p->buf[j]);
                 fprintf(stderr, "\n");
             }
-            if (client_fd >= 0)
-                send(client_fd, p->buf, p->len, 0);
+            broadcast(p->buf, p->len);
             /* Keep running_status; reset len so next data byte re-uses it. */
             p->len = 0;
         }
@@ -327,8 +344,8 @@ int main(int argc, char *argv[]) {
     int port = 9875;
     int foreground = 0;
     int opt;
-    int server_fd, client_fd = -1;
-    int midi_fd = -1;
+    int server_fd;
+    int i;
     struct sockaddr_in addr;
     struct midi_out_reader midi_out;
     struct midi_parser parser;
@@ -345,6 +362,8 @@ int main(int argc, char *argv[]) {
     signal(SIGINT, sighandler);
     signal(SIGTERM, sighandler);
     signal(SIGPIPE, SIG_IGN);
+
+    for (i = 0; i < MAX_CLIENTS; i++) client_fds[i] = -1;
 
     if (setup_midi_out(&midi_out) < 0)
         fprintf(stderr, "Warning: MIDI output monitoring unavailable\n");
@@ -365,7 +384,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    if (listen(server_fd, 2) < 0) { perror("listen"); return 1; }
+    if (listen(server_fd, MAX_CLIENTS) < 0) { perror("listen"); return 1; }
 
     if (!foreground) {
         if (fork() > 0) _exit(0);
@@ -374,8 +393,8 @@ int main(int argc, char *argv[]) {
 
     parser_init(&parser);
 
-    fprintf(stderr, "midi_tcp: listening on port %d%s\n", port,
-            midi_out.ring_fd >= 0 ? " (upgraded ring)" : "");
+    fprintf(stderr, "midi_tcp: listening on port %d%s (hub, max %d clients)\n",
+            port, midi_out.ring_fd >= 0 ? " (upgraded ring)" : "", MAX_CLIENTS);
 
     while (running) {
         fd_set rfds;
@@ -384,9 +403,11 @@ int main(int argc, char *argv[]) {
 
         FD_ZERO(&rfds);
         FD_SET(server_fd, &rfds);
-        if (client_fd >= 0) {
-            FD_SET(client_fd, &rfds);
-            if (client_fd > maxfd) maxfd = client_fd;
+        for (i = 0; i < MAX_CLIENTS; i++) {
+            if (client_fds[i] >= 0) {
+                FD_SET(client_fds[i], &rfds);
+                if (client_fds[i] > maxfd) maxfd = client_fds[i];
+            }
         }
 
         tv.tv_sec = 0;
@@ -398,44 +419,65 @@ int main(int argc, char *argv[]) {
             break;
         }
 
-        /* New connection: replace any existing client. */
+        /* New connection: add to first available slot, or reject if hub is full. */
         if (FD_ISSET(server_fd, &rfds)) {
             struct sockaddr_in caddr;
             socklen_t clen = sizeof(caddr);
             int new_fd = accept(server_fd, (struct sockaddr *)&caddr, &clen);
             if (new_fd >= 0) {
-                if (client_fd >= 0) close(client_fd);
-                client_fd = new_fd;
-                int nodelay = 1;
-                setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+                int slot = -1;
+                for (i = 0; i < MAX_CLIENTS; i++) {
+                    if (client_fds[i] < 0) { slot = i; break; }
+                }
+                if (slot < 0) {
+                    /* Hub full - reject connection */
+                    close(new_fd);
+                    if (debug) fprintf(stderr, "hub full, rejected connection\n");
+                } else {
+                    int nodelay = 1;
+                    setsockopt(new_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
 
-                if (midi_fd >= 0) close(midi_fd);
-                midi_fd = open("/proc/.midi_in", O_WRONLY);
-                if (midi_fd < 0)
-                    fprintf(stderr, "warning: can't open /proc/.midi_in\n");
+                    /* Open MIDI injection and reset ring cursor on first client */
+                    if (num_clients == 0) {
+                        if (midi_fd >= 0) { close(midi_fd); midi_fd = -1; }
+                        midi_fd = open("/proc/.midi_in", O_WRONLY);
+                        if (midi_fd < 0)
+                            fprintf(stderr, "warning: can't open /proc/.midi_in\n");
+                        reset_midi_out(&midi_out);
+                        parser_init(&parser);
+                    }
 
-                reset_midi_out(&midi_out);
-                parser_init(&parser);
+                    client_fds[slot] = new_fd;
+                    num_clients++;
 
-                if (debug)
-                    fprintf(stderr, "client connected\n");
+                    if (debug)
+                        fprintf(stderr, "client[%d] connected (total=%d)\n",
+                                slot, num_clients);
+                }
             }
         }
 
-        /* Inbound MIDI from TCP client → write directly to kernel. */
-        if (client_fd >= 0 && FD_ISSET(client_fd, &rfds)) {
-            int n = recv(client_fd, buf, sizeof(buf), 0);
+        /* Inbound MIDI from any TCP client → inject into Kronos. */
+        for (i = 0; i < MAX_CLIENTS; i++) {
+            if (client_fds[i] < 0 || !FD_ISSET(client_fds[i], &rfds)) continue;
+            int n = recv(client_fds[i], buf, sizeof(buf), 0);
             if (n <= 0) {
-                if (debug) fprintf(stderr, "client disconnected\n");
-                close(client_fd);
-                client_fd = -1;
-                if (midi_fd >= 0) { close(midi_fd); midi_fd = -1; }
+                if (debug)
+                    fprintf(stderr, "client[%d] disconnected (total=%d)\n",
+                            i, num_clients - 1);
+                close(client_fds[i]);
+                client_fds[i] = -1;
+                num_clients--;
+                if (num_clients == 0 && midi_fd >= 0) {
+                    close(midi_fd);
+                    midi_fd = -1;
+                }
             } else {
                 if (debug) {
-                    int i;
-                    fprintf(stderr, "TCP->MIDI %d bytes:", n);
-                    for (i = 0; i < n && i < 16; i++)
-                        fprintf(stderr, " %02x", buf[i]);
+                    int j;
+                    fprintf(stderr, "TCP[%d]->MIDI %d bytes:", i, n);
+                    for (j = 0; j < n && j < 16; j++)
+                        fprintf(stderr, " %02x", buf[j]);
                     if (n > 16) fprintf(stderr, " ...");
                     fprintf(stderr, "\n");
                 }
@@ -444,17 +486,18 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        /* Outbound MIDI from Kronos → parse → TCP. */
-        if (client_fd >= 0) {
+        /* Outbound MIDI from Kronos → parse → broadcast to all clients. */
+        if (num_clients > 0) {
             int n = read_midi_out(&midi_out, buf, sizeof(buf));
-            int i;
-            for (i = 0; i < n; i++)
-                parser_feed(&parser, buf[i], client_fd);
+            int j;
+            for (j = 0; j < n; j++)
+                parser_feed(&parser, buf[j]);
         }
     }
 
     if (midi_out.ring_fd >= 0) close(midi_out.ring_fd);
-    if (client_fd >= 0) close(client_fd);
+    for (i = 0; i < MAX_CLIENTS; i++)
+        if (client_fds[i] >= 0) close(client_fds[i]);
     if (midi_fd >= 0) close(midi_fd);
     close(server_fd);
     fprintf(stderr, "midi_tcp: shutdown\n");

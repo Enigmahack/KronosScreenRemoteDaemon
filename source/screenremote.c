@@ -1094,11 +1094,12 @@ static int sysinfo_collect(char *out, int outsz)
 
 /* MIDI helpers */
 
-static void resolve_kallsyms(unsigned long *recv_fn, unsigned long *reg_fn)
+static void resolve_kallsyms(unsigned long *recv_fn, unsigned long *reg_fn,
+                              unsigned long *out_fn,  unsigned long *rt_fn)
 {
     FILE *f = fopen("/proc/kallsyms", "r");
     char line[256];
-    *recv_fn = 0; *reg_fn = 0;
+    *recv_fn = 0; *reg_fn = 0; *out_fn = 0; *rt_fn = 0;
     if (!f) return;
     while (fgets(line, sizeof(line), f)) {
         unsigned long addr; char type, name[128];
@@ -1107,7 +1108,11 @@ static void resolve_kallsyms(unsigned long *recv_fn, unsigned long *reg_fn)
             *recv_fn = addr;
         else if (!*reg_fn && strstr(name, "RegisterMidiInPort"))
             *reg_fn = addr;
-        if (*recv_fn && *reg_fn) break;
+        else if (!*out_fn && strstr(name, "CSTGMidiOutPortSerial14SendSingleByte"))
+            *out_fn = addr;
+        else if (!*rt_fn && strstr(name, "CSTGMidiOutPortSerial12SendRealTime"))
+            *rt_fn = addr;
+        if (*recv_fn && *reg_fn && *out_fn && *rt_fn) break;
     }
     fclose(f);
 }
@@ -1684,13 +1689,13 @@ int main(void)
 
     /* Load MIDI injection module */
     {
-        unsigned long recv_fn = 0, reg_fn = 0;
-        resolve_kallsyms(&recv_fn, &reg_fn);
+        unsigned long recv_fn = 0, reg_fn = 0, out_fn = 0, rt_fn = 0;
+        resolve_kallsyms(&recv_fn, &reg_fn, &out_fn, &rt_fn);
         if (recv_fn && reg_fn) {
-            char params[256];
+            char params[320];
             snprintf(params, sizeof(params),
-                     "receive_fn=0x%lx register_fn=0x%lx",
-                     recv_fn, reg_fn);
+                     "receive_fn=0x%lx register_fn=0x%lx midi_out_fn=0x%lx midi_rt_fn=0x%lx",
+                     recv_fn, reg_fn, out_fn, rt_fn);
             extract_ko(MIDI_INJECT_KO, midi_inject_ko, midi_inject_ko_len);
             long ret = syscall(SYS_init_module,
                                (void *)midi_inject_ko,
