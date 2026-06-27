@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""One-shot build script -- reads version from first argument (default 1.5.4)."""
+"""One-shot RELEASE build -- reads version from first argument (default 1.5.4).
+
+Release builds leave the GRUB menu untouched (factory timeout=0 + hiddenmenu) and
+write no on-device diagnostics.  Use build_auto_debug.py for a visible menu and
+FTP-readable install/boot logs while validating a new version.
+"""
 import sys, shutil
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
@@ -9,37 +14,30 @@ from build_package import (
     _auto_detect_commands, _MD5SUM_PAYLOAD_REL, _DISPLAY_MSG_PAYLOAD_REL,
 )
 
+DEBUG       = False
 pkg_name    = "ScreenRemote"
 pkg_name_id = "ScreenRemote"
 version     = sys.argv[1] if len(sys.argv) > 1 else "1.5.4"
-debug_log   = "/korg/rw/HD/ScreenRemote/kronosmods_boot.log"
+debug_log   = "/korg/rw/HD/ScreenRemote/kronosmods_boot.log" if DEBUG else ""
 payload_dir = Path(__file__).parent / "payload"
 
-boot_cmds_raw, uninstall_cmds, daemon_paths = _auto_detect_commands(payload_dir)
+# kronosmods_init defers all of these behind a /proc/.oacmd sentinel and a
+# background block (see _make_kronosmods_init), so no per-command wrapping here.
+boot_cmds, uninstall_cmds, daemon_paths = _auto_detect_commands(payload_dir)
 install_cmds = [
     "chmod 755 {} 2>/dev/null || true".format(path)
     for path in daemon_paths
 ]
 
-# Wrap daemon starts in a background sentinel wait so screenremote doesn't
-# compete with factory module loading in Scenario 1 (GRUB hook, non-rooted).
-# /proc/.oacmd is created by OA.ko — once it exists, OA is loaded and its MIDI
-# symbols (MidiInPortGeneric7Receive, KorgUsbMidiOutputCanSend, etc.) are in
-# /proc/kallsyms, enabling midi_inject.ko to load.  OA.ko loads after the
-# ethernet driver and OmapNKS4Module, so this sentinel covers all three concerns.
-# In Scenario 2 (rooted / OA.clonos.rc), OA.ko is already loaded when
-# kronosmods_init runs (loadoa completes before OA.clonos.rc executes), so the
-# wait exits immediately (0 iterations).
-boot_cmds = []
-for _cmd in boot_cmds_raw:
-    if "screenremote" in _cmd:
-        boot_cmds.append(
-            "( _w=0; while [ ! -e /proc/.oacmd ]"
-            " && [ \"$_w\" -lt 90 ]; do sleep 1; _w=$(( _w + 1 )); done;"
-            " {} ) &".format(_cmd)
-        )
-    else:
-        boot_cmds.append(_cmd)
+# vkbd.ko / midi_inject.ko are embedded in the screenremote binary and loaded via
+# init_module(2), so _auto_detect_commands can't see them as .ko files.  Unload
+# them explicitly on uninstall, after the daemon is killed (sleep lets it release
+# the modules' /proc fds — THIS_MODULE refs — so rmmod doesn't return EBUSY).
+uninstall_cmds += [
+    "sleep 1",
+    "rmmod midi_inject 2>/dev/null || true",
+    "rmmod vkbd 2>/dev/null || true",
+]
 
 pkg_id       = "{}_{}".format(pkg_name_id, version.replace(".", "_"))
 tarball_name = "{}.tar.gz".format(pkg_id)
@@ -48,7 +46,7 @@ out_dir.mkdir(parents=True, exist_ok=True)
 
 extra_files = {
     "mnt/korg/rw/kronosmods_init": (_make_kronosmods_init(boot_cmds, debug_log), 0o755),
-    "mnt/korg/kronos_init":        (_make_kronos_init(),                           0o755),
+    "mnt/korg/kronos_init":        (_make_kronos_init(DEBUG),                      0o755),
 }
 
 tarball_path = out_dir / tarball_name
@@ -56,7 +54,7 @@ _build_tarball(payload_dir, tarball_path, extra_files)
 tarball_md5  = _md5_file(tarball_path)
 
 pretar_text  = _make_pretar(tarball_name, tarball_md5, pkg_name)
-posttar_text = _make_posttar(pkg_name, install_cmds, True, debug_log)
+posttar_text = _make_posttar(pkg_name, install_cmds, True, DEBUG)
 sig          = _sha1_signature(pretar_text.encode(), posttar_text.encode())
 
 install_info = (

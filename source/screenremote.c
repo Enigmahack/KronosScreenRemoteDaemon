@@ -85,7 +85,7 @@
 #define KBD_EV_KEY  1
 
 /* �Version */
-#define SCREENREMOTE_VERSION "1.7.7a"
+#define SCREENREMOTE_VERSION "1.7.9"
 #ifndef BUILD_ID
 #define BUILD_ID "dev"
 #endif
@@ -1818,19 +1818,39 @@ int main(void)
     /* Truncate access log on each boot to avoid filling /korg/rw over time */
     { FILE *lf = fopen(SCREENREMOTE_DIR "/access.log", "w"); if (lf) fclose(lf); }
 
+    /* Kill-switch: if the folder /korg/rw/HD/_nomod exists, load NO kernel modules.
+     * FTP reaches only /korg/rw/HD, so this folder can be created over FTP
+     * (mkdir _nomod) + reboot to bring a unit up with no kernel hooks.  Required to
+     * run a Korg OS update or the cleaner safely (midi_inject's OA .text hooks
+     * otherwise freeze the system when OA is torn down at "Preparing to Install"),
+     * and to recover a wedged unit.  Checked here because this daemon is what loads
+     * the modules (init_module(2) from embedded buffers); a kernel-side FS check is
+     * unreliable in init_module context on the RTAI kernel. */
+    int load_mods = 1;
+    {
+        struct stat _ns;
+        if (stat("/korg/rw/HD/_nomod", &_ns) == 0 && S_ISDIR(_ns.st_mode)) {
+            load_mods = 0;
+            fprintf(stderr, "screenremote: kill-switch /korg/rw/HD/_nomod present — "
+                    "not loading any kernel modules (vkbd, midi_inject)\n");
+        }
+    }
+
     /* Extract and load virtual keyboard early so Eva discovers it before any client connects.
      * Use init_module(2) directly — system() needs /bin/sh which does not exist on non-rooted
      * Kronos units. Loading from the embedded buffer avoids any shell or external binary. */
-    extract_ko(VKBD_KO, vkbd_ko, vkbd_ko_len);
-    syscall(SYS_init_module, (void *)vkbd_ko, (unsigned long)vkbd_ko_len, "");
+    if (load_mods) {
+        extract_ko(VKBD_KO, vkbd_ko, vkbd_ko_len);
+        syscall(SYS_init_module, (void *)vkbd_ko, (unsigned long)vkbd_ko_len, "");
 
-    for (int _vi = 0; _vi < 20 && vkbd_fd < 0; _vi++) {
-        usleep(100000);
-        vkbd_fd = open("/proc/.vkbd", O_WRONLY);
+        for (int _vi = 0; _vi < 20 && vkbd_fd < 0; _vi++) {
+            usleep(100000);
+            vkbd_fd = open("/proc/.vkbd", O_WRONLY);
+        }
     }
 
     /* Load MIDI injection module */
-    {
+    if (load_mods) {
         unsigned long recv_fn = 0, reg_fn = 0;
         unsigned long dispatch_fn = 0, can_send_fn = 0;
         resolve_kallsyms(&recv_fn, &reg_fn, &dispatch_fn, &can_send_fn);

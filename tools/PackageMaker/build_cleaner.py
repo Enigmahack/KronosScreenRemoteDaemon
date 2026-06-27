@@ -42,14 +42,14 @@ sys.path.insert(0, str(Path(__file__).parent))
 from build_package import (
     _make_pretar, _sha1_signature, _md5_file,
     _MD5SUM_PAYLOAD_REL, _DISPLAY_MSG_PAYLOAD_REL,
-    GRUB_ENTRY_TITLE,
+    GRUB_ENTRY_TITLE, GRUB_DROP_ROOTHACK_ENTRY,
 )
 
 PKG_NAME = "Kronos-Cleaner"
 _DUM = "/mnt/updaterSource/DisplayUpdaterMessage"
 
 
-def _make_cleaner_posttar() -> str:
+def _make_cleaner_posttar(debug: bool = False) -> str:
     diag_dir = "/korg/rw/HD/KronosCleaner"
 
     lines = [
@@ -73,6 +73,10 @@ def _make_cleaner_posttar() -> str:
         "# -- Stop non-factory processes and unload modules --",
         "kill $(pidof screenremote) 2>/dev/null || true",
         "kill $(pidof dropbear) 2>/dev/null || true",
+        "# Let screenremote die so it releases the modules' /proc fds (THIS_MODULE",
+        "# refs) -- otherwise rmmod returns EBUSY and the modules stay resident.",
+        "sleep 1",
+        "rmmod midi_inject 2>/dev/null || true",
         "rmmod vkbd 2>/dev/null || true",
         "rmmod kronos_extract 2>/dev/null || true",
         "",
@@ -101,7 +105,12 @@ def _make_cleaner_posttar() -> str:
         f"    echo \"cleaner: grub before patch:\" >> {diag_dir}/cleaner_diag.txt",
         f"    cat /boot/grub/grub.conf >> {diag_dir}/cleaner_diag.txt 2>/dev/null || true",
         "",
-        "    # Strip all init= parameters our scripts may have added",
+        "    # Remove the whole root-hack menu entry (kernel line with init=/bin/init)",
+        "    # FIRST, while the marker is still present, so a rooted 2-entry grub.conf",
+        "    # collapses back to the single factory entry.",
+        f"    {GRUB_DROP_ROOTHACK_ENTRY}",
+        "",
+        "    # Strip any remaining init= parameters our scripts may have added.",
         "    sed -i 's| init=/bin/init||g' /boot/grub/grub.conf 2>/dev/null || true",
         "    sed -i 's| init=/korg/kronos_init||g' /boot/grub/grub.conf 2>/dev/null || true",
         "    sed -i 's| init=/korg/rw/kronos_init||g' /boot/grub/grub.conf 2>/dev/null || true",
@@ -125,6 +134,12 @@ def _make_cleaner_posttar() -> str:
         "    # Ensure default=0 so the factory entry boots",
         "    sed -i 's/^default.*/default=0/' /boot/grub/grub.conf 2>/dev/null || true",
         "",
+        *([
+            "    # Debug build: make the GRUB menu visible for diagnosis.",
+            "    sed -i 's/^timeout=.*/timeout=5/' /boot/grub/grub.conf 2>/dev/null || true",
+            "    sed -i '/^hiddenmenu/d' /boot/grub/grub.conf 2>/dev/null || true",
+            "",
+        ] if debug else []),
         "    sync",
         f"    cp /boot/grub/grub.conf {diag_dir}/grub_after_clean.txt 2>/dev/null || true",
         f"    echo \"cleaner: grub after patch:\" >> {diag_dir}/cleaner_diag.txt",
@@ -244,9 +259,9 @@ def _make_cleaner_posttar() -> str:
     return "\n".join(lines)
 
 
-def build(version: str = "1.0.0") -> None:
+def build(version: str = "1.0.2", debug: bool = False) -> None:
     print("=" * 52)
-    print(f"  {PKG_NAME} Package Builder")
+    print(f"  {PKG_NAME} Package Builder{'  [DEBUG]' if debug else ''}")
     print("=" * 52)
     print()
 
@@ -261,7 +276,7 @@ def build(version: str = "1.0.0") -> None:
     tarball_md5 = _md5_file(tarball_path)
 
     pretar_text  = _make_pretar(tarball_name, tarball_md5, PKG_NAME)
-    posttar_text = _make_cleaner_posttar()
+    posttar_text = _make_cleaner_posttar(debug)
     sig          = _sha1_signature(pretar_text.encode(), posttar_text.encode())
 
     install_info = (
@@ -328,8 +343,10 @@ def build(version: str = "1.0.0") -> None:
 
 
 def main() -> None:
-    version = sys.argv[1] if len(sys.argv) > 1 else "1.0.0"
-    build(version)
+    args = [a for a in sys.argv[1:] if a != "--debug"]
+    debug = "--debug" in sys.argv[1:]
+    version = args[0] if args else "1.0.0"
+    build(version, debug)
 
 
 if __name__ == "__main__":

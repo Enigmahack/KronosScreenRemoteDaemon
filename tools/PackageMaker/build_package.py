@@ -25,45 +25,38 @@ Tarball internal paths use the "mnt/" prefix which maps to the Kronos FS root:
 /korg/rw/ is NOT in the official Korg update checksum list, so files installed
 there survive future Korg OS updates.
 
-Boot hook (three scenarios, detected automatically at install time)
--------------------------------------------------------------------
-Scenario 1 -- Factory (non-rooted) Kronos, standard grub.conf:
-    posttar.sh appends  init=/korg/kronos_init  to the kernel line in
-    grub.conf.  On boot, kronos_init mounts /korg/rw, runs kronosmods_init
-    (insmod / start services), then exec-chains to /sbin/init.
+Boot hook (single in-place GRUB patch -- no scenario detection)
+---------------------------------------------------------------
+posttar.sh applies ONE rule to grub.conf: append  init=/korg/kronos_init  to
+every kernel line that does not already carry an init= parameter.  It never adds
+menu entries and never changes the 'default' line.  Consequences:
 
-    NOTE: Korg OS updates reset grub.conf.  Re-run this USB package after
-    any official firmware update to restore the grub hook.
+  * The set of bootable entries and the entry that boots by default are exactly
+    what they were before the install.  There is no code path that can repoint
+    'default' at an entry whose boot depends on our script -- the historical
+    cause of bricks after cleaner/unroot -> install.
+  * It is idempotent: a kernel line that already has an init= (a re-run of this
+    installer, or a root-hack init=/bin/init entry) is left untouched.
 
-Scenario 2 -- Root-hacked Kronos (OA.clonos.rc present):
-    posttar.sh injects a call to /korg/rw/kronosmods_init into OA.clonos.rc
-    after the STATUS=$? line (i.e. after loadoa returns).  The injection is
-    attempted whenever OA.clonos.rc exists -- even if it is a ghost file on a
-    non-rooted Kronos, the injected line is harmless (never executed unless
-    the root-hack boot chain calls the script).
+On boot, kronos_init (sda2) mounts /korg/rw, launches kronosmods_init in the
+BACKGROUND, then immediately exec-chains to the real init (/bin/init on a rooted
+unit, else /sbin/init, else /bin/sh).  Nothing in the hook can stall the PID-1
+handoff or repoint the default boot entry.
 
-    Additionally, posttar.sh patches any factory grub.conf kernel lines
-    that lack an init= parameter, adding  init=/korg/kronos_init  to them.
-    This provides a fallback boot path: if the user boots the factory GRUB
-    entry (instead of the root-hack entry), the screenremote still starts
-    via kronos_init.  The root-hack entry (init=/bin/init) is left unchanged.
+Rooted Kronos: the active entry boots init=/bin/init, so the GRUB hook never runs
+at boot there.  posttar.sh therefore also injects a kronosmods_init call into
+OA.clonos.rc after the STATUS=$? line (after loadoa).  Harmless on a non-rooted
+unit (the line only runs if the root-hack boot chain calls the script).
 
-Scenario 3 -- Non-rooted Kronos with customised grub.conf:
-    grub.conf exists but isn't factory-state (more than one entry, non-zero
-    default, or already has an init= parameter).  posttar.sh copies the
-    current default boot entry, adds  init=/korg/kronos_init  to the
-    kernel line of the copy, appends it as a new "KronosMods Boot" entry,
-    and updates 'default' to point to the new entry.  The original default
-    is saved to /korg/rw/.grub_orig_default for the uninstaller.
-
-Diagnostic: posttar.sh writes /korg/rw/HD/ScreenRemote/install_diag.txt immediately on
-    start, then appends scenario and exit-code lines throughout.  Visible
-    via FTP on the non-rooted Kronos.  If this file is absent after install,
-    UpdateOS killed posttar before it ran (likely pretar.sh md5 failure).
+Debug vs release: a debug build additionally makes the GRUB menu visible
+(timeout=5, hiddenmenu removed) and writes diagnostics to
+/korg/rw/HD/ScreenRemote/ (install_diag.txt, grub_pre/postinstall.txt,
+kronos_boot.log, kronosmods_boot.log).  A release build changes neither the
+timeout nor hiddenmenu and writes no diagnostics.
 
 All /korg/rw/ files (kronosmods_init, kronos_init, modules, binaries) survive
 Korg OS updates.  grub.conf does not -- it is reset on every Korg firmware
-update (scenarios 1 and 3 require re-running the USB package after updates).
+update, so the package must be re-run after an official update.
 
 Legal note on grub.conf edits
 ------------------------------
@@ -109,8 +102,24 @@ _DUM = "/mnt/updaterSource/DisplayUpdaterMessage"
 # does not compare it against the running firmware.  Kept here for reference only;
 # install.info uses "{pkg_name} {version}" so the Kronos display shows the actual
 # package identity rather than the firmware version number.
-# Title used for the new grub entry in scenario 3.
+# Legacy title used by old (scenario-3) installer builds for the appended entry.
+# The current installer never adds entries; cleaner/unroot still strip this title
+# so machines updated from an old build are normalised.
 GRUB_ENTRY_TITLE = "KronosMods Boot"
+
+# Shell one-liner: delete the entire GRUB menu entry whose kernel line carries
+# init=/bin/init (the root-hack entry), preserving the header (default=, timeout=,
+# comments before the first 'title') and every other entry verbatim.  Idempotent:
+# if no such entry exists the file is unchanged.  Used by the cleaner and unroot
+# packages to normalise a rooted 2-entry grub.conf back toward factory shape.
+GRUB_DROP_ROOTHACK_ENTRY = (
+    "awk '"
+    "/^title /{if(intitle&&!drop)printf \"%s\",buf; buf=$0\"\\n\"; drop=0; intitle=1; next} "
+    "{if(intitle){buf=buf $0\"\\n\"; if(/init=\\/bin\\/init/)drop=1} else print} "
+    "END{if(intitle&&!drop)printf \"%s\",buf}' "
+    "/boot/grub/grub.conf > /tmp/_grub_norm 2>/dev/null "
+    "&& mv /tmp/_grub_norm /boot/grub/grub.conf"
+)
 
 # Known Korg proprietary kernel module filenames (case-insensitive).
 _KORG_PROPRIETARY = {
@@ -128,57 +137,91 @@ def _make_kronosmods_init(boot_cmds: list, debug_log: str = "") -> str:
     """
     Shell script installed at /korg/rw/kronosmods_init.
 
-    Called by /korg/kronos_init (GRUB path, scenarios 1 & 3) after
-    /korg/rw is mounted, or injected directly into OA.clonos.rc (scenario 2).
-    /korg/rw is already mounted when this runs in both cases.
+    Called (backgrounded) from /korg/kronos_init on the GRUB boot path after
+    /korg/rw is mounted, or injected into OA.clonos.rc on a rooted Kronos.
+    /korg/rw is already mounted in both cases.
+
+    All real work (insmod, daemon launch) is deferred into a single background
+    block that first waits for OA to come up (/proc/.oacmd appears once OA.ko is
+    loaded).  Two reasons:
+      * Nothing here can ever stall the caller -- the script returns immediately,
+        so on the GRUB path the PID-1 handoff in kronos_init is never delayed and
+        a hanging insmod cannot freeze boot.
+      * Modules that need OA symbols (midi_inject.ko) and the screenremote daemon
+        load *after* OA, not racing factory module loading during early boot.
+    On a rooted Kronos OA is already up when this runs (loadoa completes before
+    OA.clonos.rc executes), so the wait exits on the first iteration.
     """
+    import posixpath
+    log_dir = posixpath.dirname(debug_log) if debug_log else ""
+
     lines = [
         "#!/bin/sh",
-        "# kronosmods_init -- KronosMods boot commands",
-        "# Called from /korg/kronos_init (GRUB) or OA.clonos.rc (rooted).",
-        "# /korg/rw is already mounted when this script runs.",
+        "# kronosmods_init -- KronosMods deferred boot commands (modules + daemons).",
+        "# Returns immediately; all work runs in a background block (see below).",
+        "",
+        "# Kill-switch: if this folder exists, load nothing.  FTP only reaches",
+        "# /korg/rw/HD, so make the folder there over FTP (mkdir _nomod) and reboot",
+        "# to bring the unit up with NO ScreenRemote modules/daemon -- needed to run a",
+        "# Korg OS update or the cleaner safely, and to recover a unit whose modules",
+        "# are wedging OA teardown.  Remove the folder and reboot to re-enable.",
+        "if [ -d /korg/rw/HD/_nomod ]; then",
+        "    exit 0",
+        "fi",
         "",
     ]
     if debug_log:
-        import posixpath
-        log_dir = posixpath.dirname(debug_log)
-        lines += [
-            f"mkdir -p {log_dir} 2>/dev/null || true",
-            f"exec >> {debug_log} 2>&1",
-            "echo 'kronosmods_init: starting'",
-            "",
-        ]
-    if boot_cmds:
-        for cmd in boot_cmds:
-            lines.append(cmd)
-            if debug_log:
-                label = cmd.strip().split()[0] if cmd.strip() else "cmd"
-                lines.append(f"echo \"kronosmods_init: {label} exited $?\"")
-        lines.append("")
+        lines += [f"mkdir -p {log_dir} 2>/dev/null || true", ""]
+
+    if not boot_cmds:
+        if debug_log:
+            lines += [f"echo 'kronosmods_init: no boot commands' >> {debug_log} 2>&1", ""]
+        return "\n".join(lines)
+
+    lines.append("(")
     if debug_log:
         lines += [
-            "echo 'kronosmods_init: done'",
-            f"chown -R 500:500 {log_dir} 2>/dev/null || true",
-            "",
+            f"    exec >> {debug_log} 2>&1",
+            "    echo \"kronosmods_init: waiting for OA ($(date))\"",
         ]
+    lines += [
+        "    # Wait (up to 90s) for OA to load before touching modules/daemon.",
+        "    _w=0",
+        "    while [ ! -e /proc/.oacmd ] && [ \"$_w\" -lt 90 ]; do",
+        "        sleep 1; _w=$(( _w + 1 ))",
+        "    done",
+    ]
+    for cmd in boot_cmds:
+        lines.append(f"    {cmd}")
+        if debug_log:
+            label = cmd.strip().split()[0] if cmd.strip() else "cmd"
+            lines.append(f"    echo \"kronosmods_init: {label} exited $?\"")
+    if debug_log:
+        lines += [
+            "    echo 'kronosmods_init: done'",
+            f"    chown -R 500:500 {log_dir} 2>/dev/null || true",
+        ]
+    lines += [") &", ""]
     return "\n".join(lines)
 
 
-def _make_kronos_init(debug_log: str = "") -> str:
+def _make_kronos_init(debug: bool = False) -> str:
     """
     Shell script installed at /korg/kronos_init (root filesystem, sda2).
 
-    Used as the GRUB init= target for all scenarios (rooted and non-rooted).
-    MUST live on sda2 (the root fs) -- /korg/rw (sda6) is not yet mounted when
-    the kernel execs the init= target, so pointing init= at /korg/rw/... would
-    produce ENOENT and silently fall back to /sbin/init with no error.
+    Used as the GRUB init= target on the non-rooted boot path (and as a fallback
+    factory entry on a rooted Kronos).  MUST live on sda2 (the root fs) -- /korg/rw
+    (sda6) is not yet mounted when the kernel execs the init= target, so pointing
+    init= at /korg/rw/... would ENOENT.
 
-    Mounts /korg/rw, delegates to kronosmods_init, then exec-chains to the
-    appropriate init: /bin/init (busybox) on a rooted Kronos to preserve the
-    root-hack boot chain, or /sbin/init on a factory system.
-    Boot-diagnostic log (grub.conf snapshot) is written only when debug_log is set.
+    This process becomes PID 1, so the cardinal rule is: it MUST always exec a real
+    init, and nothing before that exec may block or fail in a way that prevents it.
+    Therefore kronosmods_init is run in the BACKGROUND (a hang or module oops there
+    can never stall the handoff), and the final exec falls through /bin/init ->
+    /sbin/init -> /bin/sh so the device can never end up with a dead PID 1.
+
+    Boot diagnostics are written to the FTP-readable log only in debug builds.
     """
-    import posixpath
     lines = [
         "#!/bin/sh",
         "# kronos_init -- KronosMods GRUB init= wrapper",
@@ -189,24 +232,26 @@ def _make_kronos_init(debug_log: str = "") -> str:
         "mount -t ext3 -o commit=1,noatime /dev/sda6 /korg/rw 2>/dev/null || true",
         "",
     ]
-    if debug_log:
-        diag_dir = posixpath.dirname(debug_log)
+    if debug:
+        diag_dir = "/korg/rw/HD/ScreenRemote"
         lines += [
-            "# Write boot-diagnostic log to FTP path (readable after reboot via FTP).",
+            "# Boot diagnostic.  /boot (sda1) is NOT mounted here, so log the kernel",
+            "# command line (proves which GRUB entry booted) rather than grub.conf.",
             f"mkdir -p {diag_dir} 2>/dev/null || true",
-            f"{{ echo 'kronos_init: started'; cat /boot/grub/grub.conf; }} >> {diag_dir}/kronos_boot.log 2>/dev/null",
+            "{ echo \"kronos_init: started $(date)\"; cat /proc/cmdline; } \\",
+            f"    >> {diag_dir}/kronos_boot.log 2>/dev/null || true",
             "",
         ]
     lines += [
-        "# Run boot setup (insmod modules, start daemons, etc.).",
-        "[ -x /korg/rw/kronosmods_init ] && /korg/rw/kronosmods_init",
+        "# Run boot setup in the BACKGROUND so it can never stall the PID-1 handoff.",
+        "[ -x /korg/rw/kronosmods_init ] && /korg/rw/kronosmods_init &",
         "",
-        "# Hand off to the real init (this process becomes PID 1).",
-        "# On a rooted Kronos, /bin/init is the root-hack's busybox init.",
-        "if [ -x /bin/init ]; then",
-        "    exec /bin/init \"$@\"",
-        "fi",
-        "exec /sbin/init \"$@\"",
+        "# Hand off to the real init immediately (this process becomes PID 1).",
+        "# /bin/init = root-hack busybox; /sbin/init = factory sysvinit; /bin/sh is",
+        "# a last resort so a missing init drops to a shell instead of panicking.",
+        "[ -x /bin/init ]  && exec /bin/init  \"$@\"",
+        "[ -x /sbin/init ] && exec /sbin/init \"$@\"",
+        "exec /bin/sh",
         "",
     ]
     return "\n".join(lines)
@@ -252,7 +297,7 @@ def _make_pretar(tarball_name: str, tarball_md5: str, pkg_name: str) -> str:
 
 
 def _make_posttar(pkg_name: str, install_cmds: list, boot_hook: bool,
-                  debug_log: str = "") -> str:
+                  debug: bool = False) -> str:
     lines = [
         "#!/bin/sh",
         f"# posttar.sh -- {pkg_name}",
@@ -263,11 +308,11 @@ def _make_posttar(pkg_name: str, install_cmds: list, boot_hook: bool,
     diag_dir = "/korg/rw/HD/ScreenRemote"
 
     def _diag(msg):
-        """Echo a diagnostic line to install_diag.txt — omitted when not logging."""
-        return [f"echo \"{msg}\" >> {diag_dir}/install_diag.txt 2>/dev/null"] if debug_log else []
+        """Echo a diagnostic line to install_diag.txt — omitted in release builds."""
+        return [f"echo \"{msg}\" >> {diag_dir}/install_diag.txt 2>/dev/null"] if debug else []
 
     if boot_hook:
-        if debug_log:
+        if debug:
             lines += [
                 f"mkdir -p {diag_dir} 2>/dev/null || true",
                 f"echo \"posttar: started $(date)\" >> {diag_dir}/install_diag.txt 2>/dev/null",
@@ -278,13 +323,11 @@ def _make_posttar(pkg_name: str, install_cmds: list, boot_hook: bool,
         lines += [
             "chmod 755 /korg/rw/kronosmods_init /korg/kronos_init 2>/dev/null || true",
             "",
-            "# -- Scenario 2: inject into OA.clonos.rc if present --------------------------",
-            "# OA.clonos.rc may exist as a ghost file on a non-rooted Kronos after a firmware",
-            "# reinstall -- injecting into it is harmless (the line never runs unless the",
-            "# root-hack boot chain calls it).  We inject unconditionally so that all",
-            "# root-hack variants are covered regardless of /bin/busybox location.",
-            "# NOTE: we still check grub.conf below, because a Korg firmware update resets",
-            "# grub.conf to factory state, leaving root-hack files present but inactive.",
+            "# -- Rooted Kronos: also start via OA.clonos.rc -------------------------------",
+            "# On a rooted Kronos the active GRUB entry boots init=/bin/init, so the GRUB",
+            "# hook below never runs at boot -- OA.clonos.rc is what starts our daemon.",
+            "# Injecting is harmless on a non-rooted unit (the line only runs if the",
+            "# root-hack boot chain calls the script).  Idempotent via the grep guard.",
             "if [ -f /etc/OA.clonos.rc ]; then",
             *_diag("posttar: OA.clonos.rc found - injecting kronosmods_init"),
             "    if ! grep -q 'kronosmods' /etc/OA.clonos.rc; then",
@@ -296,12 +339,15 @@ def _make_posttar(pkg_name: str, install_cmds: list, boot_hook: bool,
             "    fi",
             "fi",
             "",
-            "# -- Scenarios 1, 2, 3: mount sda1 and check/patch grub.conf --------------------",
+            "# -- GRUB hook: in-place, idempotent, never destabilising --------------------",
             "# /boot (sda1) is never mounted when UpdateOS runs -- always mount it.",
-            "# If the active default entry uses the root-hack init (init=/bin/init),",
-            "# patch only the factory kernel lines (those without init=) as a fallback.",
-            "# Otherwise (factory GRUB, ghost-rooted after Korg update) patch normally",
-            "# via scenario 1 or 3.",
+            "# Rule: append  init=/korg/kronos_init  to every kernel line that does NOT",
+            "# already carry an init=.  We never add menu entries and never touch the",
+            "# 'default' line, so the set of bootable entries and which one boots by",
+            "# default are exactly what they were before -- there is no way to repoint",
+            "# 'default' at a broken entry.  Lines that already have an init= (a root-hack",
+            "# init=/bin/init entry, or a previous run of this installer) are left as-is,",
+            "# which makes re-running the package a no-op.",
             "_boot_mounted=0",
             "if mount -t vfat /dev/sda1 /boot 2>/dev/null; then",
             "    _boot_mounted=1",
@@ -310,101 +356,45 @@ def _make_posttar(pkg_name: str, install_cmds: list, boot_hook: bool,
             "    _boot_mounted=1",
             *_diag("posttar: mounted sda1 (auto-type)"),
             "else",
-            *_diag("posttar: WARNING: failed to mount /dev/sda1 at /boot"),
+            # ':' keeps the else non-empty in release builds (where _diag is empty),
+            # otherwise 'else' immediately followed by 'fi' is a shell syntax error.
+            *(_diag("posttar: WARNING: failed to mount /dev/sda1 at /boot") or ["    :"]),
             "fi",
             "",
             "if [ -f /boot/grub/grub.conf ]; then",
-            "    _DF=$(awk '/^default[[:space:]=]/{v=$0;sub(/^default[[:space:]=]*/,\"\",v);print v;exit}' /boot/grub/grub.conf)",
-            "    : ${_DF:=0}",
-            "    _KL=$(awk -v d=\"$_DF\" 'BEGIN{e=-1}/^title/{e++}e==d&&/^[[:space:]]*kernel /{print;exit}' /boot/grub/grub.conf)",
-            *_diag("posttar: grub default=$_DF kernel_line=$_KL"),
-            "",
-            "    if echo \"$_KL\" | grep -q 'init=/bin/init'; then",
-            "        # Root-hack GRUB entry is active -- OA.clonos.rc handles boot.",
-            "        # Patch only factory kernel lines (those without any init=) as fallback.",
-            *_diag("posttar: root-hack GRUB active (init=/bin/init) - patching factory entries only"),
             *(
                 [
-                    f"        cp /boot/grub/grub.conf {diag_dir}/grub_preinstall.txt 2>/dev/null || true",
-                    "        sync 2>/dev/null",
-                ] if debug_log else []
+                    f"    cp /boot/grub/grub.conf {diag_dir}/grub_preinstall.txt 2>/dev/null || true",
+                    "    sync 2>/dev/null",
+                ] if debug else []
             ),
-            "        sed -i 's| init=/korg/rw/kronos_init||g' /boot/grub/grub.conf 2>/dev/null || true",
-            "        if ! grep -q 'init=/korg/kronos_init' /boot/grub/grub.conf; then",
-            "            awk '/^[[:space:]]*kernel /{if(!/init=/)print $0 \" init=/korg/kronos_init\"; else print; next}{print}' \\",
-            "                /boot/grub/grub.conf > /tmp/_grub_new \\",
-            "                && mv /tmp/_grub_new /boot/grub/grub.conf",
-            *_diag("posttar: factory entry patch exit=$?"),
-            "        else",
-            *_diag("posttar: init=/korg/kronos_init already present"),
-            "        fi",
-            *(
-                [
-                    f"        cp /boot/grub/grub.conf {diag_dir}/grub_postinstall.txt 2>/dev/null || true",
-                    "        sync 2>/dev/null",
-                ] if debug_log else []
-            ),
-            "",
-            "    else",
-            "        # Factory GRUB (or ghost-rooted after Korg update) -- patch grub.conf.",
-            *(
-                [
-                    f"        cp /boot/grub/grub.conf {diag_dir}/grub_preinstall.txt 2>/dev/null || true",
-                    "        sync 2>/dev/null",
-                ] if debug_log else []
-            ),
-            "        # Remove stale init= from any old package build that used the wrong path.",
-            "        sed -i 's| init=/korg/rw/kronos_init||g' /boot/grub/grub.conf 2>/dev/null || true",
-            "        if ! grep -q 'init=/korg/kronos_init' /boot/grub/grub.conf; then",
-            "            _TC=$(awk '/^title /{n++} END{print n+0}' /boot/grub/grub.conf)",
-            "            _HI=$(awk '/init=/{n++} END{print n+0}' /boot/grub/grub.conf)",
-            *_diag("posttar: grub entries=$_TC init_lines=$_HI default=$_DF"),
-            "",
-            "            if [ \"$_TC\" -le 1 ] && [ \"$_HI\" = '0' ] && [ \"$_DF\" = '0' ]; then",
-            "                # -- Scenario 1: Factory grub (single entry, default=0, no init=) ---",
-            *_diag("posttar: scenario 1 (factory grub - patching kernel line)"),
-            "                awk '/^[[:space:]]*kernel \\/bzImage /{print $0 \" init=/korg/kronos_init\"; next} {print}' \\",
-            "                    /boot/grub/grub.conf > /tmp/_grub_new \\",
-            "                    && mv /tmp/_grub_new /boot/grub/grub.conf",
-            *_diag("posttar: scenario 1 patch exit=$?"),
-            "",
-            "            else",
-            "                # -- Scenario 3: Custom grub (multiple entries / non-zero default) ---",
-            *_diag("posttar: scenario 3 (custom grub - adding new entry)"),
-            "                echo \"$_DF\" > /korg/rw/.grub_orig_default",
-            "                _NI=$(awk '/^title /{n++} END{print n+0}' /boot/grub/grub.conf)",
-            "                _RL=$(awk -v d=\"$_DF\" \\",
-            "                    'BEGIN{e=-1}/^title/{e++}e==d&&/^[[:space:]]*root /{print;exit}' \\",
-            "                    /boot/grub/grub.conf)",
-            "                {",
-            "                    awk -v nd=\"$_NI\" \\",
-            "                        '/^default[[:space:]=]/{print \"default \" nd; next} {print}' \\",
-            "                        /boot/grub/grub.conf",
-            f"                    printf '\\ntitle {GRUB_ENTRY_TITLE}\\n'",
-            "                    printf '%s\\n' \"$_RL\"",
-            "                    printf '%s init=/korg/kronos_init\\n' \"$_KL\"",
-            "                } > /tmp/_grub_new && mv /tmp/_grub_new /boot/grub/grub.conf",
-            *_diag("posttar: scenario 3 patch exit=$?"),
-            "            fi",
-            "        else",
-            *_diag("posttar: init=/korg/kronos_init already present"),
-            "        fi",
-            *(
-                [
-                    f"        cp /boot/grub/grub.conf {diag_dir}/grub_postinstall.txt 2>/dev/null || true",
-                    "        sync 2>/dev/null",
-                ] if debug_log else []
-            ),
-            "    fi",
+            "    # Drop any stale wrong-path init= left by older package builds.",
+            "    sed -i 's| init=/korg/rw/kronos_init||g' /boot/grub/grub.conf 2>/dev/null || true",
+            "    awk '/^[[:space:]]*kernel /{if(!/init=/)print $0 \" init=/korg/kronos_init\"; else print; next}{print}' \\",
+            "        /boot/grub/grub.conf > /tmp/_grub_new \\",
+            "        && mv /tmp/_grub_new /boot/grub/grub.conf",
+            *_diag("posttar: grub kernel-line patch exit=$?"),
+        ]
+        if debug:
+            lines += [
+                "    # Debug build only: make the GRUB menu visible (factory hides it with",
+                "    # timeout=0 + hiddenmenu) so a bad boot can be observed and a good",
+                "    # entry selected manually.  Release builds leave the menu untouched.",
+                "    sed -i 's/^timeout=.*/timeout=5/' /boot/grub/grub.conf 2>/dev/null || true",
+                "    sed -i '/^hiddenmenu/d' /boot/grub/grub.conf 2>/dev/null || true",
+                f"    cp /boot/grub/grub.conf {diag_dir}/grub_postinstall.txt 2>/dev/null || true",
+            ]
+        lines += [
+            "    sync",
             "else",
             *_diag("posttar: WARNING: /boot/grub/grub.conf not found after mount attempt"),
-            "    echo 'kronosmods: WARNING: no grub hook installed' > /dev/kmsg",
+            "    echo 'kronosmods: WARNING: no grub hook installed' > /dev/kmsg 2>/dev/null || true",
             "fi",
             "",
             "[ \"$_boot_mounted\" = '1' ] && umount /boot 2>/dev/null || true",
             "",
         ]
-        if debug_log:
+        if debug:
             lines += [
                 f"echo \"posttar: done $(date)\" >> {diag_dir}/install_diag.txt 2>/dev/null",
                 f"chown -R 500:500 {diag_dir} 2>/dev/null || true",
@@ -453,17 +443,20 @@ def _make_uninstall_posttar(pkg_name: str, installed_files: list,
 
     if boot_hook:
         lines += [
-            "# -- Remove boot hook (mirrors the three install scenarios) -------------------",
+            "# -- Remove boot hook (matches the in-place installer) ------------------------",
             "",
             "if [ -f /etc/OA.clonos.rc ]; then",
-            "    # Scenario 2: remove injection from OA.clonos.rc",
+            "    # Remove the kronosmods_init injection from OA.clonos.rc (rooted Kronos).",
             "    awk '!/kronosmods/' /etc/OA.clonos.rc > /tmp/_rc_new \\",
             "        && mv /tmp/_rc_new /etc/OA.clonos.rc",
             "    chmod 755 /etc/OA.clonos.rc",
             "    sync",
             "fi",
             "",
-            "# Always mount sda1 to undo grub.conf changes (sda1 is never pre-mounted).",
+            "# Mount sda1 (never pre-mounted) and strip our init= from every kernel line.",
+            "# The installer only ever added init=/korg/kronos_init in place and never",
+            "# touched 'default' or added entries, so removing the parameter fully undoes",
+            "# the hook.  A root-hack init=/bin/init entry is left untouched.",
             "_boot_mounted=0",
             "if mount -t vfat /dev/sda1 /boot 2>/dev/null; then",
             "    _boot_mounted=1",
@@ -471,23 +464,14 @@ def _make_uninstall_posttar(pkg_name: str, installed_files: list,
             "    _boot_mounted=1",
             "fi",
             "if [ -f /boot/grub/grub.conf ]; then",
-            "    if [ -f /korg/rw/.grub_orig_default ]; then",
-            "        # Scenario 3: remove the KronosMods Boot entry and restore default",
-            "        _ORIG=$(cat /korg/rw/.grub_orig_default)",
-            "        awk -v o=\"$_ORIG\" \\",
-            f"        'BEGIN{{skip=0}}/^default[[:space:]=]/{{print \"default \" o; next}}/^title {GRUB_ENTRY_TITLE}$/{{skip=1;next}}skip&&/^title /{{skip=0;print;next}}!skip{{print}}' \\",
-            "            /boot/grub/grub.conf > /tmp/_grub_new \\",
-            "            && mv /tmp/_grub_new /boot/grub/grub.conf",
-            "        rm -f /korg/rw/.grub_orig_default",
-            "    else",
-            "        # Scenario 1: remove init= from the kernel line",
-            "        sed -i 's| init=/korg/kronos_init||g' /boot/grub/grub.conf",
-            "    fi",
+            "    sed -i 's| init=/korg/kronos_init||g' /boot/grub/grub.conf 2>/dev/null || true",
+            "    sed -i 's| init=/korg/rw/kronos_init||g' /boot/grub/grub.conf 2>/dev/null || true",
             "    sync",
             "fi",
             "[ \"$_boot_mounted\" = '1' ] && umount /boot 2>/dev/null || true",
             "",
-            "# Remove FTP log directory.",
+            "# Remove stale marker from older (scenario-3) builds, and the FTP log dir.",
+            "rm -f /korg/rw/.grub_orig_default 2>/dev/null || true",
             "rm -rf /korg/rw/HD/ScreenRemote 2>/dev/null || true",
             "",
         ]
@@ -776,15 +760,20 @@ def _build_deployment() -> None:
     out_dir      = Path(__file__).parent / "dist" / pkg_id
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    debug = False
     debug_log = ""
     if boot_hook:
-        if _prompt_yn("Enable FTP boot logging? (writes daemon output to /korg/rw/HD/)", default=False):
-            debug_log = _prompt("FTP log path for daemon output", "/korg/rw/HD/ScreenRemote/kronosmods_boot.log")
+        debug = _prompt_yn(
+            "Debug build? (visible GRUB timeout=5 + install/boot diagnostics to /korg/rw/HD/)",
+            default=False,
+        )
+        if debug:
+            debug_log = "/korg/rw/HD/ScreenRemote/kronosmods_boot.log"
 
     extra_files: dict = {}
     if boot_hook:
         extra_files["mnt/korg/rw/kronosmods_init"] = (_make_kronosmods_init(boot_cmds, debug_log), 0o755)
-        extra_files["mnt/korg/kronos_init"]         = (_make_kronos_init(debug_log),                0o755)
+        extra_files["mnt/korg/kronos_init"]         = (_make_kronos_init(debug),                   0o755)
 
     tarball_path = out_dir / tarball_name
     print(f"\nBuilding {tarball_name} ...")
@@ -793,7 +782,7 @@ def _build_deployment() -> None:
     print(f"  MD5: {tarball_md5}")
 
     pretar_text  = _make_pretar(tarball_name, tarball_md5, pkg_name)
-    posttar_text = _make_posttar(pkg_name, install_cmds, boot_hook, debug_log)
+    posttar_text = _make_posttar(pkg_name, install_cmds, boot_hook, debug)
     sig          = _sha1_signature(pretar_text.encode(), posttar_text.encode())
 
     install_info = (
@@ -854,27 +843,30 @@ def _build_deployment() -> None:
 
     if boot_hook:
         print()
-        print("Boot hook (auto-detected at install time on the Kronos):")
-        print("  Scenario 1 -- factory grub.conf (1 entry, default=0, no init=)")
-        print("    -> appends  init=/korg/kronos_init  to the kernel line")
-        print("  Scenario 2 -- root-hacked Kronos (/bin/busybox + OA.clonos.rc + clontab)")
-        print("    -> injects kronosmods_init call into OA.clonos.rc after loadoa")
-        print("  Scenario 3 -- non-rooted Kronos with custom grub.conf")
-        print(f"    -> adds new '{GRUB_ENTRY_TITLE}' entry (copy of default + init=)")
+        print("Boot hook (in-place GRUB patch, applied at install time on the Kronos):")
+        print("  GRUB  -- appends  init=/korg/kronos_init  to every kernel line that has")
+        print("           no init= yet.  Never adds entries, never changes 'default'.")
+        print("           Idempotent: re-running is a no-op.  A root-hack init=/bin/init")
+        print("           entry is left untouched.")
+        print("  Rooted -- also injects kronosmods_init into OA.clonos.rc after loadoa,")
+        print("           since a rooted unit boots init=/bin/init (the GRUB hook never")
+        print("           runs at boot there).")
         print()
         print("  /korg/kronos_init lives on sda2 (root fs) -- accessible at init= time.")
         print("  /korg/rw/ files (kronosmods_init, daemon) survive Korg OS updates.")
-        print("  grub.conf is reset by Korg OS updates (scenarios 1 & 3).")
-        print("  Re-run this USB package after any Korg firmware update.")
-        print()
-        print("  Diagnostics (always written at install and boot time):")
-        print("  All logs written to /korg/rw/HD/ScreenRemote/ (FTP-accessible):")
-        print("    install_diag.txt    -- install-time scenario + exit codes")
-        print("    grub_preinstall.txt -- grub.conf before posttar.sh (install-time)")
-        print("    grub_postinstall.txt-- grub.conf after posttar.sh  (install-time)")
-        print("    kronos_boot.log     -- appended on every boot if GRUB hook ran")
-        if debug_log:
-            print(f"    kronosmods_boot.log -- daemon stdout/stderr, appended on every boot")
+        print("  grub.conf is reset by Korg OS updates -- re-run this package afterwards.")
+        if debug:
+            print()
+            print("  DEBUG build: GRUB menu made visible (timeout=5, hiddenmenu removed).")
+            print("  Diagnostics in /korg/rw/HD/ScreenRemote/ (FTP-accessible):")
+            print("    install_diag.txt    -- install-time steps + exit codes")
+            print("    grub_preinstall.txt -- grub.conf before posttar.sh")
+            print("    grub_postinstall.txt-- grub.conf after posttar.sh")
+            print("    kronos_boot.log     -- /proc/cmdline, appended on every boot")
+            print("    kronosmods_boot.log -- daemon/module output, appended on every boot")
+        else:
+            print()
+            print("  RELEASE build: GRUB menu left as-is (no timeout change), no diagnostics.")
 
 
 def _build_uninstaller_only() -> None:
@@ -958,9 +950,10 @@ def main() -> None:
 
     if choice == "1":
         version = _prompt("Version", "1.0.0")
+        debug = _prompt_yn("Debug build? (visible GRUB timeout=5 for recovery)", default=False)
         print()
         from build_cleaner import build as build_cleaner
-        build_cleaner(version)
+        build_cleaner(version, debug)
 
     elif choice == "2":
         print()
@@ -968,9 +961,10 @@ def main() -> None:
 
     elif choice == "3":
         version = _prompt("Version", "1.0.0")
+        debug = _prompt_yn("Debug build? (visible GRUB timeout=5 for recovery)", default=False)
         print()
         from build_unroot import build as build_unroot
-        build_unroot(version)
+        build_unroot(version, debug)
 
     elif choice == "4":
         print()

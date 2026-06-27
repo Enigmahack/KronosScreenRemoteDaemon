@@ -257,26 +257,41 @@ static int install_hook(unsigned long fn_addr, void *hook_fn,
     return 0;
 }
 
-static void remove_hook(unsigned long fn_addr, uint8_t *orig, uint8_t **tramp_ptr)
+/* 1 while our 5-byte JMPs are live in the target .text.  Guards against
+ * restoring OA's bytes twice (once from the OA-unload notifier, once from
+ * module_exit) and against writing into OA .text after OA is already gone. */
+static int hooks_patched = 0;
+
+/* Restore the 5 patched bytes in the target .text.  LOCAL-ONLY: IRQ-disabled
+ * byte copy + CR0.WP toggle.  No IPI, no allocation, no sleep — therefore SAFE
+ * to call from the module notifier, which runs under module_mutex during another
+ * module's teardown. */
+static void restore_hook_bytes(unsigned long fn_addr, uint8_t *orig)
 {
+    unsigned long flags;
     if (!fn_addr) return;
-    {
-        unsigned long flags;
-        local_irq_save(flags);
-        wp_disable();
-        memcpy((uint8_t *)fn_addr, orig, 5);  /* restore only the 5 bytes we patched */
-        wp_enable();
-        local_irq_restore(flags);
-    }
+    local_irq_save(flags);
+    wp_disable();
+    memcpy((uint8_t *)fn_addr, orig, 5);  /* restore only the 5 bytes we patched */
+    wp_enable();
+    local_irq_restore(flags);
     /* x86 has coherent instruction cache — no explicit flush needed after
      * patching .text.  Compiler barrier prevents reordering around the patch. */
     asm volatile("" ::: "memory");
+    printk(KERN_INFO "midi_inject: unhooked 0x%lx\n", fn_addr);
+}
+
+/* Free a trampoline page.  set_memory_nx() issues a cross-CPU TLB-flush IPI and
+ * waits for every CPU to ACK — on the RTAI kernel an RT-controlled core may never
+ * service it, so on_each_cpu() spins forever and the whole system freezes.  This
+ * MUST run only in process context (module_exit), NEVER from the module notifier. */
+static void free_trampoline(uint8_t **tramp_ptr)
+{
     if (*tramp_ptr) {
         set_memory_nx((unsigned long)*tramp_ptr, 1);
         free_page((unsigned long)*tramp_ptr);
         *tramp_ptr = NULL;
     }
-    printk(KERN_INFO "midi_inject: unhooked 0x%lx\n", fn_addr);
 }
 
 /* ------------------------------------------------------------------ */
@@ -290,10 +305,23 @@ static int midi_module_notify(struct notifier_block *nb,
     if (action == MODULE_STATE_GOING &&
         (strcmp(mod->name, "OA") == 0 ||
          strcmp(mod->name, "loadmod") == 0)) {
+        /* OA is being torn down.  This is exactly what the Kronos does at
+         * "Preparing to Install" before an OS update.  Do the MINIMUM that is
+         * safe under module_mutex on the RTAI kernel: disable the ring and
+         * restore OA's patched bytes via the local-only path.  Do NOT free
+         * trampolines here — free_trampoline()/set_memory_nx() issues an IPI
+         * that can hang the RT kernel and freeze the whole system (this was the
+         * cause of installs/cleaners freezing at "Preparing to Install").  The
+         * trampoline pages are reclaimed later at rmmod, in process context. */
         ring_disable();
-        remove_hook(can_send_fn,      orig_can_send, &tramp_can_send);
-        remove_hook(midi_dispatch_fn, orig_dispatch, &tramp_dispatch);
-        printk(KERN_INFO "midi_inject: %s unloading, disabled\n", mod->name);
+        /* Serialized against module_exit by module_mutex; hook fns never read this. */
+        if (hooks_patched) {
+            hooks_patched = 0;
+            restore_hook_bytes(can_send_fn,      orig_can_send);
+            restore_hook_bytes(midi_dispatch_fn, orig_dispatch);
+        }
+        printk(KERN_INFO "midi_inject: %s unloading, hooks removed (free deferred)\n",
+               mod->name);
     }
     return NOTIFY_OK;
 }
@@ -533,6 +561,9 @@ static int __init midi_inject_init(void)
             proc_midi_ring->proc_fops = &ring_fops;
     }
 
+    if (tramp_can_send || tramp_dispatch)
+        hooks_patched = 1;
+
     register_module_notifier(&midi_nb);
 
     printk(KERN_INFO "midi_inject: ready — port=%p blk5=%s can_send=%s dispatch=%s\n",
@@ -547,13 +578,22 @@ static void __exit midi_inject_exit(void)
 {
     unregister_module_notifier(&midi_nb);
 
-    /* Remove hooks before any in-flight calls can use freed trampoline memory.
-     * synchronize_rcu() ensures all CPUs have left the hook paths. */
-    remove_hook(can_send_fn,      orig_can_send, &tramp_can_send);
-    remove_hook(midi_dispatch_fn, orig_dispatch, &tramp_dispatch);
-    synchronize_rcu();
+    /* If the OA-unload notifier already ran, OA is gone and hooks_patched is 0 —
+     * do NOT write into the freed OA .text.  Otherwise (normal rmmod with OA
+     * still loaded) restore the bytes and let in-flight hook calls drain. */
+    if (hooks_patched) {
+        hooks_patched = 0;
+        restore_hook_bytes(can_send_fn,      orig_can_send);
+        restore_hook_bytes(midi_dispatch_fn, orig_dispatch);
+        synchronize_rcu();  /* wait for all CPUs to leave the hook paths */
+    }
 
     ring_disable();
+
+    /* Free trampoline pages here, in process context, where set_memory_nx()'s
+     * IPI is safe (this is why the notifier deferred the free to us). */
+    free_trampoline(&tramp_can_send);
+    free_trampoline(&tramp_dispatch);
 
     if (proc_midi_ring)
         remove_proc_entry(".midi_ring", NULL);

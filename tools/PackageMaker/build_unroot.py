@@ -42,13 +42,14 @@ sys.path.insert(0, str(Path(__file__).parent))
 from build_package import (
     _make_pretar, _sha1_signature, _md5_file,
     _MD5SUM_PAYLOAD_REL, _DISPLAY_MSG_PAYLOAD_REL,
+    GRUB_DROP_ROOTHACK_ENTRY,
 )
 
 PKG_NAME = "Kronos-Unroot"
 _DUM = "/mnt/updaterSource/DisplayUpdaterMessage"
 
 
-def _make_unroot_posttar() -> str:
+def _make_unroot_posttar(debug: bool = False) -> str:
     diag_dir = "/korg/rw/HD/Unroot"
 
     lines = [
@@ -90,12 +91,26 @@ def _make_unroot_posttar() -> str:
         "if [ -f /boot/grub/grub.conf ]; then",
         f"    cp /boot/grub/grub.conf {diag_dir}/grub_before_unroot.txt 2>/dev/null || true",
         "",
-        "    # Strip root-hack init from kernel lines (keep init=/korg/kronos_init for ScreenRemote)",
+        "    # Remove the whole root-hack menu entry (the one with init=/bin/init), so a",
+        "    # rooted 2-entry grub.conf collapses back to the single factory entry.  This",
+        "    # is what makes a later ScreenRemote install see a clean factory-shaped file.",
+        "    # ScreenRemote's own entry (init=/korg/kronos_init) is preserved.",
+        f"    {GRUB_DROP_ROOTHACK_ENTRY}",
+        "",
+        "    # Belt-and-suspenders: strip any stray init=/bin/init left on a kept line.",
         "    sed -i 's| init=/bin/init||g' /boot/grub/grub.conf 2>/dev/null || true",
         "",
         "    # Set default=0 (factory entry)",
         "    sed -i 's/^default.*/default=0/' /boot/grub/grub.conf 2>/dev/null || true",
         "",
+    ]
+    if debug:
+        lines += [
+            "    # Debug build: make the GRUB menu visible for diagnosis.",
+            "    sed -i 's/^timeout=.*/timeout=5/' /boot/grub/grub.conf 2>/dev/null || true",
+            "    sed -i '/^hiddenmenu/d' /boot/grub/grub.conf 2>/dev/null || true",
+        ]
+    lines += [
         "    sync",
         f"    cp /boot/grub/grub.conf {diag_dir}/grub_after_unroot.txt 2>/dev/null || true",
         "",
@@ -176,9 +191,9 @@ def _make_unroot_posttar() -> str:
     return "\n".join(lines)
 
 
-def build(version: str = "1.0.0") -> None:
+def build(version: str = "1.0.2", debug: bool = False) -> None:
     print("=" * 52)
-    print(f"  {PKG_NAME} Package Builder")
+    print(f"  {PKG_NAME} Package Builder{'  [DEBUG]' if debug else ''}")
     print("=" * 52)
     print()
 
@@ -193,7 +208,7 @@ def build(version: str = "1.0.0") -> None:
     tarball_md5 = _md5_file(tarball_path)
 
     pretar_text  = _make_pretar(tarball_name, tarball_md5, PKG_NAME)
-    posttar_text = _make_unroot_posttar()
+    posttar_text = _make_unroot_posttar(debug)
     sig          = _sha1_signature(pretar_text.encode(), posttar_text.encode())
 
     install_info = (
@@ -238,7 +253,8 @@ def build(version: str = "1.0.0") -> None:
     print(f"Signature: {sig}")
     print()
     print("Actions:")
-    print("  1. Patches grub.conf: strips init=/bin/init, sets default=0")
+    print("  1. Patches grub.conf: removes the root-hack entry (init=/bin/init),")
+    print("     sets default=0" + ("; sets timeout=5 + shows menu (DEBUG)" if debug else " (menu/timeout left as-is)"))
     print("  2. Removes dropbear SSH + tools (ssh, scp, nano, dbclient)")
     print("  3. Removes root-hack boot chain (/bin/init, OA.clonos.rc, OA.clonos.si,")
     print("               clontab, inittab.busybox)")
@@ -257,8 +273,10 @@ def build(version: str = "1.0.0") -> None:
 
 
 def main() -> None:
-    version = sys.argv[1] if len(sys.argv) > 1 else "1.0.0"
-    build(version)
+    args = [a for a in sys.argv[1:] if a != "--debug"]
+    debug = "--debug" in sys.argv[1:]
+    version = args[0] if args else "1.0.0"
+    build(version, debug)
 
 
 if __name__ == "__main__":
