@@ -69,6 +69,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
+#include <net/if.h>
 #include <ifaddrs.h>
 #include <sys/wait.h>
 #include <linux/fb.h>
@@ -1239,6 +1240,31 @@ static struct timespec sysex_t0;                /* capture start time           
 #define SYSEX_INITIAL_TIMEOUT_MS  5000
 #define SYSEX_TAIL_TIMEOUT_MS     1000
 
+/* Bring up the loopback interface via ioctl.  midi_tcp listens on 127.0.0.1,
+ * which the Kronos does not configure by default.  Done with ioctl rather than
+ * system("ifconfig ...") because non-rooted units have no /bin/sh — the same
+ * reason module loading uses init_module(2) directly. */
+static void bring_up_loopback(void)
+{
+    struct ifreq ifr;
+    struct sockaddr_in *sin = (struct sockaddr_in *)&ifr.ifr_addr;
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0) return;
+
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, "lo", IFNAMSIZ - 1);
+
+    sin->sin_family      = AF_INET;
+    sin->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    ioctl(s, SIOCSIFADDR, &ifr);
+
+    if (ioctl(s, SIOCGIFFLAGS, &ifr) == 0) {
+        ifr.ifr_flags |= IFF_UP | IFF_RUNNING;
+        ioctl(s, SIOCSIFFLAGS, &ifr);
+    }
+    close(s);
+}
+
 static void start_midi_capture(void)
 {
     pid_t pid;
@@ -1248,7 +1274,7 @@ static void start_midi_capture(void)
     chmod(MIDI_TCP_BIN, 0755);
 
     /* Ensure loopback is up - Kronos doesn't configure it by default */
-    system("ifconfig lo 127.0.0.1 up 2>/dev/null");
+    bring_up_loopback();
 
     pid = fork();
     if (pid < 0) return;
@@ -1338,37 +1364,45 @@ static void sysex_poll(int readable)
 {
     if (readable && midi_cap_fd >= 0) {
         uint8_t tmp[4096];
-        int n = recv(midi_cap_fd, tmp, sizeof(tmp), MSG_DONTWAIT);
-        if (n > 0 && sysex_pending) {
-            int j;
-            for (j = 0; j < n; j++) {
-                uint8_t b = tmp[j];
-                /* Real-time bytes may appear anywhere; skip without
-                 * affecting the SysEx parse state. */
-                if (b >= 0xF8) continue;
-                /* SysEx start: begin capturing; discard any partial
-                 * previous attempt if responses were back-to-back. */
-                if (b == 0xF0) {
-                    sysex_in_f0      = 1;
-                    sysex_cap_offset = 0;
-                }
-                if (sysex_in_f0 && sysex_cap_offset < SYSEX_CAP_SIZE) {
-                    sysex_capbuf[sysex_cap_offset++] = b;
-                    if (!sysex_got_first) {
-                        sysex_got_first = 1;
-                        clock_gettime(CLOCK_MONOTONIC, &sysex_t0);
+        int n;
+        /* Drain the whole socket buffer each call: midi_tcp forwards all MIDI
+         * out, so a burst could exceed one 4 KB read and stall midi_tcp if we
+         * consumed only one chunk per iteration. */
+        while ((n = recv(midi_cap_fd, tmp, sizeof(tmp), MSG_DONTWAIT)) > 0) {
+            if (sysex_pending) {
+                int j;
+                for (j = 0; j < n; j++) {
+                    uint8_t b = tmp[j];
+                    /* Real-time bytes may appear anywhere; skip without
+                     * affecting the SysEx parse state. */
+                    if (b >= 0xF8) continue;
+                    /* SysEx start: begin capturing; discard any partial
+                     * previous attempt if responses were back-to-back. */
+                    if (b == 0xF0) {
+                        sysex_in_f0      = 1;
+                        sysex_cap_offset = 0;
                     }
+                    if (sysex_in_f0 && sysex_cap_offset < SYSEX_CAP_SIZE) {
+                        sysex_capbuf[sysex_cap_offset++] = b;
+                        if (!sysex_got_first) {
+                            sysex_got_first = 1;
+                            clock_gettime(CLOCK_MONOTONIC, &sysex_t0);
+                        }
+                    }
+                    /* SysEx end: deliver the captured response, then keep
+                     * draining the rest of the buffer (now discarded). */
+                    if (b == 0xF7 && sysex_in_f0) {
+                        sysex_finish();
+                        break;
+                    }
+                    /* Any other status byte that isn't a real-time or SysEx
+                     * byte resets SysEx tracking (stray non-SysEx MIDI). */
+                    if ((b & 0x80) && b != 0xF0)
+                        sysex_in_f0 = 0;
                 }
-                /* SysEx end: deliver the captured response. */
-                if (b == 0xF7 && sysex_in_f0) {
-                    sysex_finish();
-                    return;
-                }
-                /* Any other status byte that isn't a real-time or SysEx
-                 * byte resets SysEx tracking (stray non-SysEx MIDI). */
-                if ((b & 0x80) && b != 0xF0)
-                    sysex_in_f0 = 0;
             }
+            if (n < (int)sizeof(tmp))
+                break;   /* socket buffer drained */
         }
     }
 
