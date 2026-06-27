@@ -16,10 +16,10 @@ if [ -z "$VERSION" ]; then
     echo "ERROR: could not extract SCREENREMOTE_VERSION from screenremote.c" >&2
     exit 1
 fi
-echo "=== ScreenRemoteDaemon debug v${VERSION} ==="
+echo "=== ScreenRemote debug v${VERSION} ==="
 
-PKG_ID="ScreenRemoteDaemon_${VERSION//_debug./_}"
-UNINST_ID="${PKG_ID}Daemon_Uninstall"
+PKG_ID="ScreenRemote_${VERSION//./_}"
+UNINST_ID="${PKG_ID}_Uninstall"
 ZIP_NAME="ScreenRemoteDaemon_${VERSION}_debug.zip"
 
 # --------------------------------------------------------------------------
@@ -36,7 +36,7 @@ file "$BUILD_DIR/screenremote"
 echo "  Build complete: $BUILD_DIR/screenremote"
 
 # --------------------------------------------------------------------------
-# 2. Copy built binary into PackageMaker payload and run build_auto.py
+# 2. Copy built binary into PackageMaker payload and run build_auto_debug.py
 # --------------------------------------------------------------------------
 echo ""
 echo "--- Step 2: Building deployment package ---"
@@ -46,7 +46,7 @@ cp "$BUILD_DIR/screenremote" "$PAYLOAD_BIN"
 echo "  Payload updated"
 
 rm -rf "${DIST_DIR:?}/${PKG_ID}" "${DIST_DIR:?}/${UNINST_ID}"
-python3 "$PACKAGER_DIR/build_auto.py" "$VERSION"
+python3 "$PACKAGER_DIR/build_auto_debug.py" "$VERSION"
 
 if [ ! -d "$DIST_DIR/$PKG_ID" ] || [ ! -d "$DIST_DIR/$UNINST_ID" ]; then
     echo "ERROR: PackageMaker did not produce expected output" >&2

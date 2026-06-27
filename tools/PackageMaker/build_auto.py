@@ -15,11 +15,31 @@ version     = sys.argv[1] if len(sys.argv) > 1 else "1.5.4"
 debug_log   = "/korg/rw/HD/ScreenRemote/kronosmods_boot.log"
 payload_dir = Path(__file__).parent / "payload"
 
-boot_cmds, uninstall_cmds, daemon_paths = _auto_detect_commands(payload_dir)
+boot_cmds_raw, uninstall_cmds, daemon_paths = _auto_detect_commands(payload_dir)
 install_cmds = [
     "chmod 755 {} 2>/dev/null || true".format(path)
     for path in daemon_paths
 ]
+
+# Wrap daemon starts in a background sentinel wait so screenremote doesn't
+# compete with factory module loading in Scenario 1 (GRUB hook, non-rooted).
+# /proc/.oacmd is created by OA.ko — once it exists, OA is loaded and its MIDI
+# symbols (MidiInPortGeneric7Receive, KorgUsbMidiOutputCanSend, etc.) are in
+# /proc/kallsyms, enabling midi_inject.ko to load.  OA.ko loads after the
+# ethernet driver and OmapNKS4Module, so this sentinel covers all three concerns.
+# In Scenario 2 (rooted / OA.clonos.rc), OA.ko is already loaded when
+# kronosmods_init runs (loadoa completes before OA.clonos.rc executes), so the
+# wait exits immediately (0 iterations).
+boot_cmds = []
+for _cmd in boot_cmds_raw:
+    if "screenremote" in _cmd:
+        boot_cmds.append(
+            "( _w=0; while [ ! -e /proc/.oacmd ]"
+            " && [ \"$_w\" -lt 90 ]; do sleep 1; _w=$(( _w + 1 )); done;"
+            " {} ) &".format(_cmd)
+        )
+    else:
+        boot_cmds.append(_cmd)
 
 pkg_id       = "{}_{}".format(pkg_name_id, version.replace(".", "_"))
 tarball_name = "{}.tar.gz".format(pkg_id)

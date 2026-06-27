@@ -84,7 +84,7 @@
 #define KBD_EV_KEY  1
 
 /* �Version */
-#define SCREENREMOTE_VERSION "1.7.7"
+#define SCREENREMOTE_VERSION "1.7.7a"
 #ifndef BUILD_ID
 #define BUILD_ID "dev"
 #endif
@@ -610,8 +610,11 @@ static int make_listen(int port, uint32_t bind_ip)
     a.sin_family      = AF_INET;
     a.sin_port        = htons((uint16_t)port);
     a.sin_addr.s_addr = bind_ip;
+    /* Backlog >1: a burst of one-shot ctrl connections (the client opens a fresh
+     * connection per MIDI_SEND) must not be refused while the loop services the
+     * previous one. */
     if (bind(fd, (struct sockaddr *)&a, sizeof(a)) < 0 ||
-        listen(fd, 1) < 0) {
+        listen(fd, 16) < 0) {
         close(fd); return -1;
     }
     return fd;
@@ -1128,6 +1131,96 @@ static int hex_decode(const char *hex, uint8_t *out, int maxlen)
     return len;
 }
 
+/* ---- CC injection throttle ----------------------------------------------
+ * Continuous controllers can be moved fast enough to flood OA.ko's MIDI-in
+ * queue.  Mod (CC#1) and breath (CC#2) are typically routed as AMS sources to
+ * many engine parameters, so OA spends real CPU per change and its *in-order*
+ * queue backs up — delaying other MIDI (e.g. pitch bend) stuck behind it.
+ *
+ * For a continuous controller only the latest value matters, so we rate-limit
+ * per (status,controller): inject at most once per CC_MIN_INTERVAL_MS, keep
+ * only the most recent value, and always deliver the final position via the
+ * flush in the main loop.  Notes, pitch bend and SysEx are never throttled. */
+#define CC_SLOTS            32
+#define CC_MIN_INTERVAL_MS  7
+
+struct cc_slot {
+    int             key;        /* (status<<8)|controller; 0 = free slot      */
+    uint8_t         val;        /* latest value seen                          */
+    int             pending;    /* 1 = val not yet injected                   */
+    struct timespec last;       /* time of last actual injection              */
+};
+static struct cc_slot cc_tab[CC_SLOTS];   /* zero-init: all slots free (key 0)*/
+
+static long ts_ms_diff(const struct timespec *a, const struct timespec *b)
+{
+    return (a->tv_sec - b->tv_sec) * 1000L + (a->tv_nsec - b->tv_nsec) / 1000000L;
+}
+
+static void cc_inject(int status, int ctrl, uint8_t val)
+{
+    uint8_t mb[3] = { (uint8_t)status, (uint8_t)ctrl, val };
+    if (midi_in_fd >= 0) (void)write(midi_in_fd, mb, 3);
+}
+
+/* If `mb` is a 3-byte Control Change, rate-limit it and return 1 (handled,
+ * possibly deferred).  Returns 0 for anything else so the caller injects it
+ * normally and immediately. */
+static int cc_throttle(const uint8_t *mb, int mlen)
+{
+    int key, i, slot = -1, free_i = -1;
+    struct timespec now;
+
+    if (mlen != 3 || (mb[0] & 0xF0) != 0xB0) return 0;
+    key = ((int)mb[0] << 8) | mb[1];          /* always >= 0xB000, never 0 */
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    for (i = 0; i < CC_SLOTS; i++) {
+        if (cc_tab[i].key == key) { slot = i; break; }
+        if (cc_tab[i].key == 0 && free_i < 0) free_i = i;
+    }
+    if (slot < 0) {
+        if (free_i < 0) return 0;             /* table full: inject normally */
+        slot = free_i;
+        cc_tab[slot].key  = key;
+        cc_tab[slot].last = now;
+        cc_tab[slot].last.tv_sec -= 1;        /* force first message to inject */
+        cc_tab[slot].pending = 0;
+    }
+
+    cc_tab[slot].val = mb[2];
+    if (ts_ms_diff(&now, &cc_tab[slot].last) >= CC_MIN_INTERVAL_MS) {
+        cc_inject(mb[0], mb[1], mb[2]);
+        cc_tab[slot].last    = now;
+        cc_tab[slot].pending = 0;
+    } else {
+        cc_tab[slot].pending = 1;             /* hold; landed by cc_flush() */
+    }
+    return 1;
+}
+
+/* Inject any held CC whose hold interval has elapsed.  Called once per main
+ * loop iteration.  Returns 1 if a value is still being held (so the caller can
+ * shorten its select() timeout and land the final position promptly). */
+static int cc_flush(void)
+{
+    struct timespec now;
+    int i, still_pending = 0;
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    for (i = 0; i < CC_SLOTS; i++) {
+        if (cc_tab[i].key == 0 || !cc_tab[i].pending) continue;
+        if (ts_ms_diff(&now, &cc_tab[i].last) >= CC_MIN_INTERVAL_MS) {
+            cc_inject(cc_tab[i].key >> 8, cc_tab[i].key & 0xFF, cc_tab[i].val);
+            cc_tab[i].last    = now;
+            cc_tab[i].pending = 0;
+        } else {
+            still_pending = 1;
+        }
+    }
+    return still_pending;
+}
+
 #define SYSEX_CAP_SIZE 65536
 static uint8_t sysex_capbuf[SYSEX_CAP_SIZE];
 static char    sysex_hexbuf[SYSEX_CAP_SIZE * 2 + 32];
@@ -1478,7 +1571,11 @@ static void process_ctrl_cmd(const char *line, int fd)
             uint8_t mb[4096];
             int mlen = hex_decode(line + 10, mb, sizeof(mb));
             if (mlen > 0) {
-                write(midi_in_fd, mb, mlen);
+                /* Continuous CC is rate-limited/coalesced so a fast controller
+                 * sweep can't flood OA's MIDI queue and stall other messages.
+                 * Everything else (notes, bend, multi-byte) injects as-is. */
+                if (!cc_throttle(mb, mlen))
+                    (void)write(midi_in_fd, mb, mlen);
                 REPLY("OK\n", 3);
             } else {
                 REPLY("ERR BAD_HEX\n", 12);
@@ -1519,20 +1616,35 @@ static void process_ctrl_cmd(const char *line, int fd)
  * complete lines.  Returns -1 if the connection closed. */
 static int handle_ctrl_persistent_data(void)
 {
-    char buf[128];
-    ssize_t n = recv(ctrl_fd, buf, sizeof(buf), 0);
-    if (n <= 0) return -1;
+    char buf[2048];
+    ssize_t n;
 
-    int i;
-    for (i = 0; i < (int)n; i++) {
-        char c = buf[i];
-        if (ctrl_lb_n < (int)sizeof(ctrl_lb) - 1)
-            ctrl_lb[ctrl_lb_n++] = c;
-        if (c == '\n') {
-            ctrl_lb[ctrl_lb_n - 1] = '\0';
-            if (ctrl_lb_n > 1)
-                process_ctrl_cmd(ctrl_lb, ctrl_fd);
-            ctrl_lb_n = 0;
+    /* Drain everything currently buffered.  ctrl_fd is O_NONBLOCK, so a burst of
+     * commands (e.g. rapid MIDI_SEND) is consumed in one iteration instead of
+     * 128 bytes at a time — otherwise latency accumulates across select loops. */
+    for (;;) {
+        n = recv(ctrl_fd, buf, sizeof(buf), 0);
+        if (n > 0) {
+            int i;
+            for (i = 0; i < (int)n; i++) {
+                char c = buf[i];
+                if (ctrl_lb_n < (int)sizeof(ctrl_lb) - 1)
+                    ctrl_lb[ctrl_lb_n++] = c;
+                if (c == '\n') {
+                    ctrl_lb[ctrl_lb_n - 1] = '\0';
+                    if (ctrl_lb_n > 1)
+                        process_ctrl_cmd(ctrl_lb, ctrl_fd);
+                    ctrl_lb_n = 0;
+                }
+            }
+            if (n < (ssize_t)sizeof(buf))
+                break;                      /* socket buffer drained */
+        } else if (n == 0) {
+            return -1;                      /* peer closed */
+        } else {
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                break;                      /* nothing left to read */
+            return -1;                      /* real error */
         }
     }
     return 0;
@@ -1782,6 +1894,11 @@ int main(void)
 
         if (g_exit) break;
 
+        /* Land any rate-limited CC whose hold interval elapsed.  cc_pending stays
+         * set while a controller's final value is still held, so we shorten the
+         * select() timeout below to deliver it promptly. */
+        int cc_pending = cc_flush();
+
         /* Periodic mirror flag check */
         if (now - last_mirror_chk >= 1) {
             check_mirror_flag();
@@ -1935,6 +2052,16 @@ int main(void)
         } else {
             tv.tv_sec  = 1;
             tv.tv_usec = 0;
+        }
+
+        /* A held CC must land within the throttle interval even when the screen
+         * is idle (MODE_PULL parks select() for up to 1 s). */
+        if (cc_pending) {
+            long max_us = CC_MIN_INTERVAL_MS * 1000L;
+            if (tv.tv_sec > 0 || tv.tv_usec > max_us) {
+                tv.tv_sec  = 0;
+                tv.tv_usec = max_us;
+            }
         }
 
         if (maxfd < 0) { usleep(500000); continue; }
