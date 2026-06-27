@@ -95,8 +95,21 @@ static DEFINE_SPINLOCK(uni_lock);
 static void uni_ring_push_buf(const uint8_t *buf, uint32_t len)
 {
     unsigned long flags;
-    uint32_t i;
-    spin_lock_irqsave(&uni_lock, flags);
+    uint32_t i, used, space;
+
+    /* Use trylock so this path never blocks.  Called potentially from the
+     * kOAMidiOutput thread (Linux) or an RTAI RT context via the
+     * ReadNextMessage hook.  Blocking here causes priority inversion against
+     * ring_fops_read (held by midi_tcp) which stalls the RT domain and makes
+     * joystick / CC inputs lag.  Drop data rather than interfere. */
+    if (!spin_trylock_irqsave(&uni_lock, flags))
+        return;
+
+    used  = uni_wpos - uni_rpos;
+    space = (used < UNI_RING_SIZE) ? (UNI_RING_SIZE - used) : 0;
+    if (len > space)
+        len = space;   /* ring full: drop new data, never overwrite unread */
+
     for (i = 0; i < len; i++) {
         uni_ring[uni_wpos & UNI_RING_MASK] = buf[i];
         uni_wpos++;

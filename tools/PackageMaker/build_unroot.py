@@ -8,14 +8,15 @@ restoring the factory boot chain.
 What it does:
   - Patches grub.conf to remove init=/bin/init and set default=0
   - Removes SSH server (dropbear) and related tools
-  - Removes root-hack init scripts (OA.clonos.*, clontab, inittab.busybox)
+  - Removes root-hack init scripts (/bin/init, OA.clonos.rc, OA.clonos.si,
+    clontab, inittab.busybox) — 'clonos' files are root-hack artifacts only;
+    factory boot uses OA.rc / OA.si which are never touched
   - Kills running dropbear process
 
 Preserves PackageMaker / ScreenRemote hooks:
   - /korg/kronos_init, /korg/rw/kronosmods_init left intact
   - init=/korg/kronos_init kept in grub.conf kernel lines
   - KronosMods Boot grub entry kept if present
-  - OA.clonos.rc kronosmods injection left (moot after unroot but harmless)
 
 What it does NOT do:
   - Replace /sbin/busybox (may differ from factory; harmless to leave)
@@ -129,6 +130,9 @@ def _make_unroot_posttar() -> str:
         "# -- Remove boot-critical files ONLY if GRUB is confirmed safe --",
         "# If GRUB still points to init=/bin/init, these files are the only",
         "# thing keeping the device bootable.  Leave them to avoid a brick.",
+        "# OA.clonos.rc / OA.clonos.si are root-hack artifacts (the 'clonos'",
+        "# namespace is for rooted machines only).  Factory uses OA.rc / OA.si",
+        "# which we never touch.  Safe to delete once GRUB is verified.",
         "if [ \"$GRUB_OK\" = '1' ]; then",
         f"    {_DUM} 'Removing root-hack boot files...' 2>/dev/null",
         "    rm -f /bin/init",
@@ -236,7 +240,8 @@ def build(version: str = "1.0.0") -> None:
     print("Actions:")
     print("  1. Patches grub.conf: strips init=/bin/init, sets default=0")
     print("  2. Removes dropbear SSH + tools (ssh, scp, nano, dbclient)")
-    print("  3. Removes root-hack boot chain (OA.clonos.*, clontab, /bin/init)")
+    print("  3. Removes root-hack boot chain (/bin/init, OA.clonos.rc, OA.clonos.si,")
+    print("               clontab, inittab.busybox)")
     print("     ^ only after GRUB is verified safe (no brick risk)")
     print()
     print("Preserved (ScreenRemote / PackageMaker hooks):")
