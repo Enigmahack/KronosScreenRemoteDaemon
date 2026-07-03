@@ -14,10 +14,10 @@ all: $(OUTDIR) $(TARGETS)
 $(OUTDIR):
 	mkdir -p $(OUTDIR)
 
-vkbd_ko.h:
+vkbd_ko.h: ../vkbd_module/vkbd.c ../vkbd_module/Kbuild
 	$(MAKE) -C ../vkbd_module -f Makefile.module
 
-midi_inject_ko.h:
+midi_inject_ko.h: ../midi_module/midi_inject.c ../midi_module/Kbuild
 	$(MAKE) -C ../midi_module -f Makefile.module
 
 midi_tcp_bin.h: midi_tcp.c
@@ -30,3 +30,13 @@ $(OUTDIR)/screenremote: screenremote.c vkbd_ko.h midi_inject_ko.h midi_tcp_bin.h
 
 clean:
 	rm -f $(TARGETS) vkbd_ko.h midi_inject_ko.h midi_tcp_bin.h midi_tcp_bin
+	# Recurse into the kernel-module build dirs.  Without this, `make clean`
+	# leaves the old .ko/.o in place; kbuild then skips recompiling when the
+	# module source mtime isn't newer than the artifact (common right after a
+	# git checkout/pull), silently re-embedding a STALE module.  That is how a
+	# fix to midi_inject.c can fail to ship and a non-rooted unit keeps
+	# freezing at boot on the old, unfixed hook.
+	$(MAKE) -C ../vkbd_module -f Makefile.module clean
+	$(MAKE) -C ../midi_module -f Makefile.module clean
+
+.PHONY: all clean

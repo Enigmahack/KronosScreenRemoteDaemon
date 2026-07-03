@@ -145,13 +145,15 @@ If the kernel symbols cannot be resolved (e.g. the Kronos OS version is too old 
 
 ### Prerequisites
 
-- `i686-linux-gnu-gcc` - cross-compiler targeting the Kronos CPU (32-bit x86)
+- `i686-linux-gnu-gcc`, or plain `gcc` with 32-bit multilib support (`gcc-multilib`) - the daemon and `midi_tcp` build with `-m32` when no dedicated i686 cross-compiler is found
 - `make`
 - `xxd` - used to convert `vkbd.ko` into the `vkbd_ko.h` C array
 
-**To rebuild `vkbd.ko` from source** (not required if you use the pre-built module):
+**To rebuild `vkbd.ko` / `midi_inject.ko` from source** (not required if you use the pre-built modules):
 
-- Linux **2.6.32.11** kernel source tree, placed at `../linux-2.6.32.11` relative to the repo root (i.e. one level above this directory). The Kronos runs a patched 2.6.32.11 kernel; modules must be built against that exact tree to match the in-kernel ABI and symbol versions.
+- **[`cgudrian/linux-kronos`](https://github.com/cgudrian/linux-kronos)** (branch `v2.6.32.11-kronos`), built with Korg's own `arch/x86/configs/korg_kronos_defconfig` and prepared for out-of-tree module builds (`make ARCH=i386 oldconfig && make ARCH=i386 prepare scripts modules_prepare`). This is Korg's actual kernel source, not a vanilla 2.6.32.11 tree — modules must be built against it to match the real kernel's `struct module` ABI (see `patch_init_offset.py` below for what goes wrong otherwise, and `../project_linux_kronos_kernel_tree.md` for how this tree was found/validated and exactly how to (re)prepare it).
+  - `Makefile.module` in each module dir defaults `KDIR` to `/home/build/linux-kronos`; override with `make KDIR=/path/to/linux-kronos` if yours lives elsewhere. **Build it on a filesystem that supports real symlinks** — `modules_prepare` creates `include/asm -> include/asm-x86`, which fails on CIFS/SMB mounts even with `symlink=native` set.
+  - A plain vanilla `linux-2.6.32.11` tree can still be used in a pinch (`make KDIR=/path/to/linux-2.6.32.11`) — `patch_init_offset.py` will patch the one offset it knows about, but the rest of `struct module`'s layout (e.g. the percpu `refptr` field) will still be wrong relative to the real kernel. Prefer `linux-kronos`.
 - **Python 3** - required to run `patch_init_offset.py` during the module build (see below).
 
 ### Step 1 - build the kernel modules
@@ -177,9 +179,9 @@ Output: `build/screenremote` - a statically linked i686 ELF binary.
 
 ## patch_init_offset.py
 
-The Kronos kernel's `struct module` places the `init` function pointer at offset `0xd4`. Vanilla Linux 2.6.32 headers and GCC 13 place it at `0xbc`. If the module is loaded unpatched, the kernel writes the `init_module` address to the wrong offset and the module's init function is never called.
+The Kronos kernel's `struct module` places the `init` function pointer at offset `0xd4`. A module built against a vanilla Linux 2.6.32 tree (mismatched CONFIG options relative to Korg's real kernel) places it at `0xbc` instead. If such a module is loaded unpatched, the kernel writes the `init_module` address to the wrong offset and the module's init function is never called — and, worse, if that module's init ever needs to signal failure, the kernel's stock error-cleanup path (`module_put()` on the misshapen module) reads other kernel-populated fields like the percpu `refptr` from the wrong offset too, which oopses the kernel rather than just failing the load.
 
-`patch_init_offset.py` fixes this by editing the ELF relocation table of the `.ko` file - it finds the `.rel.gnu.linkonce.this_module` section, locates the `init_module` relocation entry, and changes its `r_offset` from `0xbc` to `0xd4`. This is done automatically by each module's `Makefile.module` immediately after the kernel build step. It applies to both `vkbd.ko` and `midi_inject.ko`.
+Building against `linux-kronos` (see Prerequisites above) avoids this at the source: `init` naturally lands at `0xd4` with no patching, verified byte-for-byte against real Korg-shipped `.ko` files (not just that one field — the whole `.gnu.linkonce.this_module` section matches in size). `patch_init_offset.py` still runs automatically after every module build as a cheap defensive check — it detects the offset is already correct and no-ops — so it also still fixes the one symptom it knows about if someone builds against a mismatched tree. It finds the `.rel.gnu.linkonce.this_module` section, locates the `init_module` relocation entry, and changes its `r_offset` from `0xbc` to `0xd4`. It applies to both `vkbd.ko` and `midi_inject.ko`.
 
 **Requirements:** Python 3 (standard library only - `struct`, `sys`, `os`).
 

@@ -36,6 +36,52 @@ file "$BUILD_DIR/screenremote"
 echo "  Build complete: $BUILD_DIR/screenremote"
 
 # --------------------------------------------------------------------------
+# 1b. Boot-safety gate: the kernel modules ship EMBEDDED in the daemon, so a
+#     stale or mis-patched .ko silently bricks a non-rooted unit at boot (the
+#     kernel calls a wrong pointer at init_module time and the RTAI box
+#     freezes).  `make clean` above now force-rebuilds the modules; verify the
+#     freshly built .ko relocations land init_module at 0xd4 (the Kronos
+#     2.6.32.11-korg struct module layout) and abort the release if not.
+# --------------------------------------------------------------------------
+echo ""
+echo "--- Step 1b: Verifying embedded kernel modules ---"
+python3 - "$REPO_ROOT/vkbd_module/vkbd.ko" "$REPO_ROOT/midi_module/midi_inject.ko" <<'PYEOF'
+import struct, sys
+REQUIRED = 0xd4
+def init_offset(path):
+    d = open(path, "rb").read()
+    e_shoff = struct.unpack_from("<I", d, 0x20)[0]
+    ess     = struct.unpack_from("<H", d, 0x2e)[0]
+    n       = struct.unpack_from("<H", d, 0x30)[0]
+    sx      = struct.unpack_from("<H", d, 0x32)[0]
+    secs = [list(struct.unpack_from("<IIIIIIIIII", d, e_shoff + i*ess)) for i in range(n)]
+    shstr = secs[sx][4]
+    name = lambda i: d[shstr+i:d.index(0, shstr+i)].decode()
+    rel = next((s for s in secs if name(s[0]) == ".rel.gnu.linkonce.this_module"), None)
+    if not rel:
+        raise SystemExit("  FAIL: %s has no .rel.gnu.linkonce.this_module" % path)
+    st = secs[rel[6]]; so = st[4]; se = st[9]; strt = secs[st[6]][4]
+    def sname(i):
+        ni = struct.unpack_from("<I", d, so + i*se)[0]
+        return d[strt+ni:d.index(0, strt+ni)].decode()
+    for j in range(rel[5] // 8):
+        r_off, r_info = struct.unpack_from("<II", d, rel[4] + j*8)
+        if sname(r_info >> 8) == "init_module":
+            return r_off
+    raise SystemExit("  FAIL: %s has no init_module relocation" % path)
+
+ok = True
+for path in sys.argv[1:]:
+    off = init_offset(path)
+    print("  %-42s init_module @ 0x%x  [%s]" % (path, off, "ok" if off == REQUIRED else "WRONG"))
+    ok = ok and (off == REQUIRED)
+if not ok:
+    raise SystemExit("ERROR: a shipped module is not patched to init offset 0x%x "
+                     "— would freeze a non-rooted Kronos at boot" % REQUIRED)
+print("  All embedded modules verified.")
+PYEOF
+
+# --------------------------------------------------------------------------
 # 2. Copy built binary into PackageMaker payload and run build_auto.py
 # --------------------------------------------------------------------------
 echo ""

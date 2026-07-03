@@ -112,13 +112,20 @@ GRUB_ENTRY_TITLE = "KronosMods Boot"
 # comments before the first 'title') and every other entry verbatim.  Idempotent:
 # if no such entry exists the file is unchanged.  Used by the cleaner and unroot
 # packages to normalise a rooted 2-entry grub.conf back toward factory shape.
+#
+# Temp file lives in /boot/grub/ (same directory as grub.conf itself), NOT
+# /tmp: /boot is a separately mounted vfat partition (sda1), so a temp file in
+# /tmp would make the final `mv` a cross-filesystem copy+unlink -- not atomic.
+# A power loss mid-copy would leave a truncated, unparseable grub.conf and
+# brick the boot.  Same directory guarantees `mv` is a same-filesystem
+# rename(2), atomic regardless of what /tmp itself is mounted as.
 GRUB_DROP_ROOTHACK_ENTRY = (
     "awk '"
     "/^title /{if(intitle&&!drop)printf \"%s\",buf; buf=$0\"\\n\"; drop=0; intitle=1; next} "
     "{if(intitle){buf=buf $0\"\\n\"; if(/init=\\/bin\\/init/)drop=1} else print} "
     "END{if(intitle&&!drop)printf \"%s\",buf}' "
-    "/boot/grub/grub.conf > /tmp/_grub_norm 2>/dev/null "
-    "&& mv /tmp/_grub_norm /boot/grub/grub.conf"
+    "/boot/grub/grub.conf > /boot/grub/.grub_tmp 2>/dev/null "
+    "&& mv /boot/grub/.grub_tmp /boot/grub/grub.conf"
 )
 
 # Known Korg proprietary kernel module filenames (case-insensitive).
@@ -246,11 +253,18 @@ def _make_kronos_init(debug: bool = False) -> str:
         "# Run boot setup in the BACKGROUND so it can never stall the PID-1 handoff.",
         "[ -x /korg/rw/kronosmods_init ] && /korg/rw/kronosmods_init &",
         "",
-        "# Hand off to the real init immediately (this process becomes PID 1).",
-        "# /bin/init = root-hack busybox; /sbin/init = factory sysvinit; /bin/sh is",
-        "# a last resort so a missing init drops to a shell instead of panicking.",
-        "[ -x /bin/init ]  && exec /bin/init  \"$@\"",
+        "# Hand off to the real init (this process becomes PID 1).  ALWAYS prefer",
+        "# /sbin/init (factory sysvinit): we only get here via init=/korg/kronos_init,",
+        "# which is the ScreenRemote hook on a FACTORY-shaped grub entry, so /etc/inittab",
+        "# is the factory sysvinit file.  A genuinely rooted boot uses init=/bin/init",
+        "# DIRECTLY (never through this script).  Crucially, a Korg OS update restores the",
+        "# factory /etc/inittab but leaves the root-hack /bin/init (busybox) on disk; if we",
+        "# preferred /bin/init, busybox would parse the sysvinit inittab and die with",
+        "# \"Bad inittab entry at line 1, 8, 9\", breaking boot.  /bin/init is only a",
+        "# fallback if /sbin/init is somehow absent; /bin/sh is the last resort so a",
+        "# missing init drops to a shell instead of panicking.",
         "[ -x /sbin/init ] && exec /sbin/init \"$@\"",
+        "[ -x /bin/init ]  && exec /bin/init  \"$@\"",
         "exec /bin/sh",
         "",
     ]
@@ -331,9 +345,12 @@ def _make_posttar(pkg_name: str, install_cmds: list, boot_hook: bool,
             "if [ -f /etc/OA.clonos.rc ]; then",
             *_diag("posttar: OA.clonos.rc found - injecting kronosmods_init"),
             "    if ! grep -q 'kronosmods' /etc/OA.clonos.rc; then",
+            "        # Temp file in /etc/ (same dir/filesystem as the target), not /tmp --",
+            "        # keeps the mv below a same-filesystem atomic rename(2) instead of a",
+            "        # cross-filesystem copy+unlink that a power loss could catch mid-write.",
             "        awk '/^STATUS=/{print; print \"/korg/rw/kronosmods_init\"; next}1' \\",
-            "            /etc/OA.clonos.rc > /tmp/_rc_new \\",
-            "            && mv /tmp/_rc_new /etc/OA.clonos.rc",
+            "            /etc/OA.clonos.rc > /etc/.OA.clonos.rc.tmp \\",
+            "            && mv /etc/.OA.clonos.rc.tmp /etc/OA.clonos.rc",
             "        chmod 755 /etc/OA.clonos.rc",
             "        sync",
             "    fi",
@@ -370,9 +387,13 @@ def _make_posttar(pkg_name: str, install_cmds: list, boot_hook: bool,
             ),
             "    # Drop any stale wrong-path init= left by older package builds.",
             "    sed -i 's| init=/korg/rw/kronos_init||g' /boot/grub/grub.conf 2>/dev/null || true",
+            "    # Temp file in /boot/grub/ (same dir/filesystem as grub.conf), not /tmp --",
+            "    # /boot is a separate vfat partition, so a /tmp temp file would make the",
+            "    # mv below a cross-filesystem copy+unlink instead of an atomic rename(2),",
+            "    # risking a truncated grub.conf (unbootable) if power is lost mid-write.",
             "    awk '/^[[:space:]]*kernel /{if(!/init=/)print $0 \" init=/korg/kronos_init\"; else print; next}{print}' \\",
-            "        /boot/grub/grub.conf > /tmp/_grub_new \\",
-            "        && mv /tmp/_grub_new /boot/grub/grub.conf",
+            "        /boot/grub/grub.conf > /boot/grub/.grub_tmp \\",
+            "        && mv /boot/grub/.grub_tmp /boot/grub/grub.conf",
             *_diag("posttar: grub kernel-line patch exit=$?"),
         ]
         if debug:
@@ -382,6 +403,12 @@ def _make_posttar(pkg_name: str, install_cmds: list, boot_hook: bool,
                 "    # entry selected manually.  Release builds leave the menu untouched.",
                 "    sed -i 's/^timeout=.*/timeout=5/' /boot/grub/grub.conf 2>/dev/null || true",
                 "    sed -i '/^hiddenmenu/d' /boot/grub/grub.conf 2>/dev/null || true",
+                "    # Make the boot VERBOSE on the LCD framebuffer console (factory boots",
+                "    # loglevel=0 = silent).  Bump to 7 and drop 'fastboot' so kernel/module",
+                "    # messages are visible -- lets you see exactly where a boot stalls when",
+                "    # there is no serial console.  Release builds keep the quiet boot.",
+                "    sed -i 's/loglevel=[0-9]*/loglevel=7/g' /boot/grub/grub.conf 2>/dev/null || true",
+                "    sed -i 's/ fastboot//g' /boot/grub/grub.conf 2>/dev/null || true",
                 f"    cp /boot/grub/grub.conf {diag_dir}/grub_postinstall.txt 2>/dev/null || true",
             ]
         lines += [
@@ -447,8 +474,10 @@ def _make_uninstall_posttar(pkg_name: str, installed_files: list,
             "",
             "if [ -f /etc/OA.clonos.rc ]; then",
             "    # Remove the kronosmods_init injection from OA.clonos.rc (rooted Kronos).",
-            "    awk '!/kronosmods/' /etc/OA.clonos.rc > /tmp/_rc_new \\",
-            "        && mv /tmp/_rc_new /etc/OA.clonos.rc",
+            "    # Temp file in /etc/ (same dir/filesystem as the target), not /tmp -- see",
+            "    # the matching comment in the installer's OA.clonos.rc injection above.",
+            "    awk '!/kronosmods/' /etc/OA.clonos.rc > /etc/.OA.clonos.rc.tmp \\",
+            "        && mv /etc/.OA.clonos.rc.tmp /etc/OA.clonos.rc",
             "    chmod 755 /etc/OA.clonos.rc",
             "    sync",
             "fi",
@@ -463,10 +492,22 @@ def _make_uninstall_posttar(pkg_name: str, installed_files: list,
             "elif mount /dev/sda1 /boot 2>/dev/null; then",
             "    _boot_mounted=1",
             "fi",
+            "# GRUB_OK gates removal of the init= target file below (see the",
+            "# installed_files block): that file is what grub.conf's kernel line",
+            "# execs as PID 1, so deleting it while a stale init= reference survives",
+            "# (e.g. because /boot failed to mount here) would strand the Kronos with",
+            "# an init= target that no longer exists -- unbootable.  Only delete it",
+            "# once grub.conf is confirmed clean; same conservative rule build_cleaner.py",
+            "# already uses for its own boot-critical file removal.",
+            "GRUB_OK=0",
             "if [ -f /boot/grub/grub.conf ]; then",
             "    sed -i 's| init=/korg/kronos_init||g' /boot/grub/grub.conf 2>/dev/null || true",
             "    sed -i 's| init=/korg/rw/kronos_init||g' /boot/grub/grub.conf 2>/dev/null || true",
             "    sync",
+            "    if ! grep -q 'init=/korg/kronos_init' /boot/grub/grub.conf 2>/dev/null && \\",
+            "       ! grep -q 'init=/korg/rw/kronos_init' /boot/grub/grub.conf 2>/dev/null; then",
+            "        GRUB_OK=1",
+            "    fi",
             "fi",
             "[ \"$_boot_mounted\" = '1' ] && umount /boot 2>/dev/null || true",
             "",
@@ -477,6 +518,12 @@ def _make_uninstall_posttar(pkg_name: str, installed_files: list,
         ]
 
     if installed_files:
+        # These are the literal init= targets the installer's GRUB hook can point
+        # at.  Deleting them is only safe once GRUB_OK confirms grub.conf no longer
+        # references them (see the boot_hook block above) -- everything else
+        # (daemon binary, kronosmods_init, etc.) is safe to remove unconditionally.
+        BOOT_CRITICAL = {"/korg/kronos_init", "/korg/rw/kronos_init"}
+
         dirs: set = set()
         for f in installed_files:
             parts = f.split("/")
@@ -492,12 +539,35 @@ def _make_uninstall_posttar(pkg_name: str, installed_files: list,
         # Files not covered by an rw_subdir rm -rf must be removed individually.
         lone_files = [f for f in sorted(installed_files)
                       if not any(f.startswith(d + "/") for d in rw_subdirs)]
+        safe_lone_files  = [f for f in lone_files if f not in BOOT_CRITICAL]
+        gated_lone_files = [f for f in lone_files if f in BOOT_CRITICAL]
 
-        if lone_files:
+        if safe_lone_files:
             lines += ["# Remove installed files"]
-            for f in lone_files:
+            for f in safe_lone_files:
                 lines.append(f"rm -f {f}")
             lines.append("")
+
+        if gated_lone_files:
+            if boot_hook:
+                lines += ["# Boot-critical: only remove once GRUB_OK confirms grub.conf no",
+                          "# longer references these as an init= target (see above).",
+                          "if [ \"$GRUB_OK\" = '1' ]; then"]
+                for f in gated_lone_files:
+                    lines.append(f"    rm -f {f}")
+                lines += [
+                    "else",
+                    "    echo 'Partial uninstall: grub.conf init= reference not confirmed"
+                    " removed -- left init target(s) in place to avoid an unbootable init='"
+                    " > /korg/rw/HD/ScreenRemote_UNINSTALL_INCOMPLETE.txt 2>/dev/null || true",
+                    "fi",
+                    "",
+                ]
+            else:
+                lines += ["# Remove installed files"]
+                for f in gated_lone_files:
+                    lines.append(f"rm -f {f}")
+                lines.append("")
 
         if rw_subdirs:
             lines += ["# Remove package directories (includes any runtime-created files)"]
@@ -661,8 +731,20 @@ def _auto_detect_commands(payload_dir: Path) -> tuple:
     Scan payload for files under mnt/korg/rw/ and derive boot + uninstall commands.
 
     Rules (applied only to mnt/korg/rw/ paths):
-      *.ko anywhere              -> insmod at boot (modules first); rmmod at uninstall
+      *.ko anywhere              -> insmod at boot (modules first); NOT rmmod'd at
+                                    uninstall (see below) -- cleared at reboot
       no extension, anywhere     -> ... & at boot; kill $(pidof ...) at uninstall
+
+    LANDMINE: never emit `rmmod` (or `lsmod`) in a generated uninstaller.  busybox
+    rmmod reads /proc/modules, and reading /proc/modules OOPSES this kernel
+    whenever OA is loaded: /proc/modules' m_show calls module_refcount() on every
+    module, which faults on OA's per-cpu refptr (OA is brought up by loadmod's
+    custom decrypting loader, so its refptr is not a valid standard per-cpu
+    pointer -- confirmed on hardware, both while OA is COMING and while Live).
+    An uninstall always ends in a reboot, which clears any loaded module, so we
+    simply drop the module at reboot instead of unloading it live.  A daemon that
+    owns modules should unload them itself via delete_module(2) on SIGTERM (that
+    syscall does not touch /proc/modules) -- see screenremote.
 
     Returns (boot_cmds, uninstall_cmds, daemon_paths).
     """
@@ -689,7 +771,10 @@ def _auto_detect_commands(payload_dir: Path) -> tuple:
 
     for kpath, modname in sorted(mods):
         boot_cmds.append(f"insmod {kpath} 2>/dev/null || true")
-        uninstall_cmds.append(f"rmmod {modname} 2>/dev/null || true")
+        # No rmmod: it reads /proc/modules and oopses while OA is loaded (see
+        # docstring).  The module is cleared by the post-uninstall reboot.
+        uninstall_cmds.append(
+            f"# {modname}: unloaded at reboot (rmmod unsafe: reads /proc/modules)")
 
     for kpath, name in sorted(daemons):
         boot_cmds.append(f"pidof {name} > /dev/null 2>&1 || {kpath} &")

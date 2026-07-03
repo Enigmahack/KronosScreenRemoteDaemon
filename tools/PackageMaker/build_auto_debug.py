@@ -31,13 +31,17 @@ install_cmds = [
 ]
 
 # vkbd.ko / midi_inject.ko are embedded in the screenremote binary and loaded via
-# init_module(2), so _auto_detect_commands can't see them as .ko files.  Unload
-# them explicitly on uninstall, after the daemon is killed (sleep lets it release
-# the modules' /proc fds — THIS_MODULE refs — so rmmod doesn't return EBUSY).
+# init_module(2).  Do NOT rmmod them here: busybox rmmod reads /proc/modules, and
+# reading /proc/modules OOPSES this kernel whenever OA is loaded — module_refcount
+# faults on OA's per-cpu refptr because OA is brought up by loadmod's custom
+# decrypting loader, not the standard module path (see the /proc/modules landmine
+# note).  Instead the daemon, killed above by _auto_detect_commands' uninstall
+# command, unloads both modules ITSELF via delete_module(2) on SIGTERM (which
+# restores OA's patched .text and frees the trampolines) — no /proc/modules
+# access.  Give it a moment to finish; any module still resident is cleared by the
+# reboot that completes the uninstall.
 uninstall_cmds += [
-    "sleep 1",
-    "rmmod midi_inject 2>/dev/null || true",
-    "rmmod vkbd 2>/dev/null || true",
+    "sleep 2",
 ]
 
 pkg_id       = "{}_{}".format(pkg_name_id, version.replace(".", "_"))

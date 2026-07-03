@@ -1,42 +1,42 @@
 /*
- * screenremote.c �- Kronos framebuffer streaming daemon
+ * screenremote.c  - Kronos framebuffer streaming daemon
  * Not yet tested on Nautilus, but should work with minor tweaks if needed.
  *
- * Streams /dev/fb1 (8bpp, 800×600) over TCP port 7373 (default; set by config).
+ * Streams /dev/fb1 (8bpp, 800x600) over TCP port 7373 (default; set by config).
  * Mirrors fb1 to /dev/fb0 (VGA out) when /korg/rw/screenremote/.mirror_enable exists.
  *
  * Stream handshake (TCP port 7373):
  *   Client -> Server: MAGIC[4]="KSCR" + 0x02(ver) + mode(1) + fps(1) + ulen(1) + plen(1)
  *                    + username[ulen] + password[plen]
  *     mode: 0x01=Pull (server sends at fps), 0x02=Change (server sends on fb change)
- *   Server -> Client: MAGIC[4] + status(1)  [+ width_LE16 + height_LE16 + 256×RGB8 if status=0x00]
+ *   Server -> Client: MAGIC[4] + status(1)  [+ width_LE16 + height_LE16 + 256 xRGB8 if status=0x00]
  *     status: 0x00=ok  0x01=auth_fail  0x02=user_not_found
  *   Frames: [len_LE32][pixel_data]  (full) or dirty-rect PackBits RLE
  *
  * Control port 7374 (text line commands, newline-terminated):
- *   CTRL_PERSIST           �- open a persistent session; server keeps the connection open
- *   MIRROR_ON / MIRROR_OFF �- enable / disable VGA mirror output
- *   TOUCH nx ny            �- tap at normalised float coords (press + release)
- *   TOUCH_DOWN nx ny       �- pen-down only
- *   TOUCH_MOVE nx ny       �- pen-move (client coalesces consecutive moves)
- *   TOUCH_UP nx ny         �- pen-up only
- *   BUTTON name            �- press + release a named front-panel button (see btn_table[])
- *   CHORD name1 name2      �- press name1, press name2, release name2, release name1
- *   WHEEL CW|CCW           �- one data-wheel tick clockwise or counter-clockwise
- *   SLIDER n value         �- set CC slider/knob n (1�- 8) to value (0�- 127)
+ *   CTRL_PERSIST            - open a persistent session; server keeps the connection open
+ *   MIRROR_ON / MIRROR_OFF  - enable / disable VGA mirror output
+ *   TOUCH nx ny             - tap at normalised float coords (press + release)
+ *   TOUCH_DOWN nx ny        - pen-down only
+ *   TOUCH_MOVE nx ny        - pen-move (client coalesces consecutive moves)
+ *   TOUCH_UP nx ny          - pen-up only
+ *   BUTTON name             - press + release a named front-panel button (see btn_table[])
+ *   CHORD name1 name2       - press name1, press name2, release name2, release name1
+ *   WHEEL CW|CCW            - one data-wheel tick clockwise or counter-clockwise
+ *   SLIDER n value          - set CC slider/knob n (1 - 8) to value (0 - 127)
  *                            Effect depends on active Control Assign page:
  *                            RT KNOBS/KARMA -> moves knob n; slider-active -> moves slider n
- *   VSLIDER value          �- set value slider position (0�- 127)
- *   KEY code val           �- raw key inject: code 1�- 511, val 0=release 1=press
- *   REFRESH                �- force full-frame resend (clears shadow_valid)
- *   MIDI_SEND hex          �- inject raw MIDI bytes (hex pairs, spaces allowed)
- *   SYSEX hex              �- send SysEx (must start F0), capture response (up to 5 s)
+ *   VSLIDER value           - set value slider position (0 - 127)
+ *   KEY code val            - raw key inject: code 1 - 511, val 0=release 1=press
+ *   REFRESH                 - force full-frame resend (clears shadow_valid)
+ *   MIDI_SEND hex           - inject raw MIDI bytes (hex pairs, spaces allowed)
+ *   SYSEX hex               - send SysEx (must start F0), capture response (up to 5 s)
  *                           -> SYSEX_RESP hex\n  or  ERR TIMEOUT\n
- *   MIDI_STATUS            �-> MIDI_LOADED=n\nMIDI_IN=n\nMIDI_CAPTURE=n\nOK\n
- *   SS_TIMEOUT n           �- set screensaver timeout at runtime (seconds; 0 = disable)
- *   STATE                  �-> MODE=N\n  (0=init 1=Setlist 2=Combi 3=Program 4=Sequence 5=Sampling 6=Global 7=Disk)
- *   VERSION                �-> VER=x.x.x BUILD=xxx\n
- *   SYSINFO                �-> multi-line key=value block terminated by OK\n
+ *   MIDI_STATUS             -> MIDI_LOADED=n\nMIDI_IN=n\nMIDI_CAPTURE=n\nOK\n
+ *   SS_TIMEOUT n            - set screensaver timeout at runtime (seconds; 0 = disable)
+ *   STATE                   -> MODE=N\n  (0=init 1=Setlist 2=Combi 3=Program 4=Sequence 5=Sampling 6=Global 7=Disk)
+ *   VERSION                 -> VER=x.x.x BUILD=xxx\n
+ *   SYSINFO                 -> multi-line key=value block terminated by OK\n
  *                            (UPTIME, LOAD, MEM_*, CPU_*, AUDIO_*, DISK_*, USB_*, TEMP*, FAN*, MODE)
  *
  * UDP discovery port 7372 (fixed, never configurable):
@@ -49,6 +49,10 @@
  * Startup: /korg/rw/kronosmods_init launches this via OA.clonos.rc (rooted) or inittab/clontab.
  * Config: /korg/rw/screenremote/screenremote.cfg  (stream_port, ctrl_port, screensaver_timeout)
  * All runtime files live under /korg/rw/screenremote/ (binary, extracted .ko modules, config, flag files).
+ *
+ * Boot-safety: /korg/rw/screenremote/.boot is written at startup and deleted only once the
+ * framebuffer, network, and listeners are all up.  If it exists on entry the previous boot did not
+ * complete cleanly, so midi_inject is skipped for that boot.  Delete the file over FTP to re-enable.
  */
 
 #include <stdio.h>
@@ -66,6 +70,7 @@
 #include <sys/select.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <sys/mount.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
@@ -80,12 +85,12 @@
 #include "midi_inject_ko.h"
 #include "midi_tcp_bin.h"
 
-/* �Keyboard injection (uinput fallback) */
+/*  Keyboard injection (uinput fallback) */
 #define KBD_EV_SYN  0
 #define KBD_EV_KEY  1
 
-/* �Version */
-#define SCREENREMOTE_VERSION "1.7.9"
+/*  Version */
+#define SCREENREMOTE_VERSION "1.7.14"
 #ifndef BUILD_ID
 #define BUILD_ID "dev"
 #endif
@@ -104,6 +109,18 @@
 #define CFG_PATH     SCREENREMOTE_DIR "/screenremote.cfg"
 #define MIRROR_FLAG  SCREENREMOTE_DIR "/.mirror_enable"
 
+/* FTP-visible log/diagnostic folder.  /korg/rw/HD maps to the FTP root on an
+ * unrooted Kronos, and this is the official ScreenRemote log folder (matches the
+ * install scripts' diag_dir).  Created and chowned to the Kronos user (uid/gid
+ * 500) at startup so files we drop here — notably the .boot self-recovery flag —
+ * can be deleted over FTP without shell access. */
+#define LOG_DIR      "/korg/rw/HD/ScreenRemote"
+#define BOOT_FLAG    LOG_DIR "/.boot"
+
+/* Kronos FTP/user account owns the log folder so its contents are FTP-deletable. */
+#define KRONOS_UID   500
+#define KRONOS_GID   500
+
 static int  g_stream_port = STREAM_PORT;
 static int  g_ctrl_port   = CTRL_PORT;
 #define PAL_ENTRIES  256
@@ -113,7 +130,7 @@ static int  g_ctrl_port   = CTRL_PORT;
 
 static const uint8_t MAGIC[4] = {'K','S','C','R'};
 
-/* �Framebuffer state */
+/*  Framebuffer state */
 static int       fb1_fd = -1,  fb0_fd = -1;
 static uint8_t  *fb1_map = NULL, *fb0_map = NULL;
 static uint32_t  fb1_stride, fb0_stride;
@@ -173,7 +190,7 @@ static pid_t midi_cap_pid = -1;
 static int g_midi_loaded = 0;
 #define MIDI_TCP_PORT 9875
 
-/* Button table�- pkt[2]=dev, pkt[3]=code, pkt[4]=0x7f/0x00 for press/release */
+/* Button table - pkt[2]=dev, pkt[3]=code, pkt[4]=0x7f/0x00 for press/release */
 struct btn_def { const char *name; uint32_t dev; uint32_t code; };
 static const struct btn_def btn_table[] = {
     /* Exit / Enter */
@@ -321,7 +338,7 @@ static void strip_dashes(const char *in, char *out, int outsz)
     out[o] = '\0';
 }
 
-/* Check /korg/rw/Startup/KronosNet.conf�- Korg's UI-managed credential store.
+/* Check /korg/rw/Startup/KronosNet.conf - Korg's UI-managed credential store.
  * Format: line 1 = username, line 2 = password (plain text, updated by the UI).
  * Returns 0=match, 1=username matched but wrong password, -1=not this user/unavailable. */
 static int kronosnet_auth(const char *user, const char *pass)
@@ -763,7 +780,7 @@ static int do_handshake(int fd, uint8_t *mode_out, uint8_t *fps_out,
     rsp[i++] = (uint8_t)(fb_w >> 8);
     rsp[i++] = (uint8_t)(fb_h & 0xFF);     /* height LE16 */
     rsp[i++] = (uint8_t)(fb_h >> 8);
-    for (j = 0; j < PAL_ENTRIES; j++) {    /* palette: 256 × RGB8 */
+    for (j = 0; j < PAL_ENTRIES; j++) {    /* palette: 256  x RGB8 */
         rsp[i++] = (uint8_t)(pal_r[j] >> 8);
         rsp[i++] = (uint8_t)(pal_g[j] >> 8);
         rsp[i++] = (uint8_t)(pal_b[j] >> 8);
@@ -906,7 +923,7 @@ static int sysinfo_collect(char *out, int outsz)
     if (n >= outsz) n = outsz - 1; \
 } while (0)
 
-    /* �/proc/stat - CPU delta */
+    /*  /proc/stat - CPU delta */
     memset(cur, 0, sizeof(cur));
     f = fopen("/proc/stat", "r");
     if (f) {
@@ -976,7 +993,7 @@ static int sysinfo_collect(char *out, int outsz)
             total, mem_free, mem_free + bufs + cached);
     }
 
-    /* �CPU percentages */
+    /*  CPU percentages */
     SI_APPEND("CPU_PCT=%d\n", cpu_pct[0]);
     for (i = 0; i < ncpu; i++)
         SI_APPEND("CPU%d_PCT=%d\n", i, cpu_pct[i + 1]);
@@ -1115,6 +1132,70 @@ static void resolve_kallsyms(unsigned long *recv_fn,    unsigned long *reg_fn,
         if (*recv_fn && *reg_fn && *dispatch_fn && *can_send_fn) break;
     }
     fclose(f);
+}
+
+
+/* Private mountpoint used to reach sysfs when the system /sys isn't mounted
+ * yet (GRUB-hook boot path runs screenremote concurrently with /sbin/init). */
+#define OA_SYS_PRIV  SCREENREMOTE_DIR "/.sysfs"
+
+/* Wait until OA reaches MODULE_STATE_LIVE, read via /sys/module/OA/initstate.
+ *
+ * midi_inject reads OA symbol addresses and patches OA .text (the MIDI
+ * trampolines), so it must only be loaded once OA is fully initialised.
+ * Loading it while OA is still COMING — shown as "OA(P+)" in the oops "Modules
+ * linked in" list — faults in the module loader (module_put) during
+ * init_module.  /proc/.oacmd appears while OA is still COMING, so it is NOT a
+ * sufficient gate.
+ *
+ * CRUCIAL: we must NOT probe module state via /proc/modules on this kernel.
+ * Reading it makes m_show() call module_refcount() on every module, which
+ * dereferences the per-cpu refptr of a COMING module whose per-cpu area isn't
+ * mapped yet — an instant kernel oops (troubleshooting/boot_kmsg.log:
+ * "module_refcount+0x25").  sysfs initstate is refcount-safe: the kernel's
+ * show_initstate() reads only mod->state ("live"/"coming"/"going").
+ *
+ * On the GRUB-hook path /sys may not be mounted, so fall back to mounting a
+ * private sysfs at OA_SYS_PRIV (a mountpoint we own — neither depends on nor
+ * collides with the system /sys mount).  Returns 1 once OA is live, 0 on
+ * timeout.  Polls in 100 ms steps. */
+static int wait_for_oa_live(int max_deciseconds)
+{
+    const char *path = "/sys/module/OA/initstate";
+    char privpath[256];
+    int mounted_priv = 0;
+    int i, result = 0;
+
+    /* Prefer the system /sys if already mounted; otherwise mount our own. */
+    if (access("/sys/module", F_OK) != 0) {
+        mkdir(OA_SYS_PRIV, 0700);
+        if (mount("sysfs", OA_SYS_PRIV, "sysfs", 0, NULL) == 0) {
+            mounted_priv = 1;
+            snprintf(privpath, sizeof(privpath),
+                     "%s/module/OA/initstate", OA_SYS_PRIV);
+            path = privpath;
+        }
+    }
+
+    for (i = 0; i < max_deciseconds; i++) {
+        int fd = open(path, O_RDONLY);
+        if (fd >= 0) {
+            char buf[16];
+            int n = (int)read(fd, buf, sizeof(buf) - 1);
+            close(fd);
+            if (n > 0) {
+                buf[n] = '\0';
+                if (strncmp(buf, "live", 4) == 0) { result = 1; break; }
+            }
+        }
+        usleep(100000);
+    }
+
+    if (mounted_priv) {
+        umount(OA_SYS_PRIV);
+        rmdir(OA_SYS_PRIV);
+    }
+    return result;
 }
 
 
@@ -1690,7 +1771,7 @@ static int handle_ctrl_persistent_data(void)
  *   header 0x81–0xFF → repeat next byte (257-n) times
  *   header 0x80      → NOP (never emitted here)
  * Literal scan breaks on runs of 3+ identical bytes.
- * Worst-case output: n + ceil(n/128) bytes (~1.008× input). */
+ * Worst-case output: n + ceil(n/128) bytes (~1.008 x input). */
 static uint32_t packbits_encode(const uint8_t *src, uint32_t n, uint8_t *dst)
 {
     uint32_t si = 0, di = 0;
@@ -1795,9 +1876,74 @@ static int capture_to_staging(void)
     return memcmp(staging, shadow, frame_bytes) != 0;
 }
 
+/* ---- Boot kernel-log capture (stock non-rooted diagnosis) ---------------
+ * Stock (non-rooted) Kronos units have no dmesg/klogd, so a freeze during
+ * early-boot module loading normally leaves no retrievable evidence — and
+ * rooting the unit to get logs makes the modules load late enough that the
+ * freeze no longer reproduces (it masks the very bug we're chasing).
+ *
+ * syslog(2)/klogctl action 3 (SYSLOG_ACTION_READ_ALL) reads the ENTIRE kernel
+ * ring buffer non-destructively; it works for root with no dmesg_restrict on
+ * 2.6.32 and is independent of console `loglevel` (loglevel only gates what
+ * reaches the console, never what the ring stores).  We snapshot the ring to
+ * the FTP-visible HD partition and fsync it.  A forked drainer re-snapshots
+ * every 150 ms across the risky init_module() calls: if one wedges the box,
+ * the last fsync'd snapshot still holds the printks up to the hang — e.g.
+ * whether midi_inject printed "hooked 0x…" (froze in the .text patch / IPI) or
+ * "prologue mismatch" (address drift) before the freeze. */
+#define BOOT_KMSG_DIR  LOG_DIR
+#define BOOT_KMSG_LOG  BOOT_KMSG_DIR "/boot_kmsg.log"
+
+/* Create the FTP-visible log folder and hand it to the Kronos user (uid/gid
+ * 500) so everything we write there — the .boot flag, boot_kmsg.log — can be
+ * read and deleted over FTP on an unrooted unit (no shell access).  Deleting a
+ * file needs write+exec on the containing directory, so the directory ownership
+ * is what matters; we chown it to 500:500 with mode 0775. */
+static void ensure_log_dir(void)
+{
+    mkdir("/korg/rw/HD", 0755);
+    mkdir(LOG_DIR, 0775);
+    chmod(LOG_DIR, 0775);
+    chown(LOG_DIR, KRONOS_UID, KRONOS_GID);
+}
+
+static void dump_kmsg(void)
+{
+    static char kbuf[131072];
+    long n = syscall(SYS_syslog, 3 /*READ_ALL*/, kbuf, (long)sizeof(kbuf));
+    if (n <= 0) return;
+    /* Write-then-rename so the live log is always a COMPLETE snapshot: if the box
+     * freezes mid-write, BOOT_KMSG_LOG still holds the previous full snapshot
+     * rather than a truncated one. */
+    int fd = open(BOOT_KMSG_LOG ".tmp", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return;
+    if (write_all(fd, kbuf, (size_t)n) == 0) {
+        fsync(fd);
+        close(fd);
+        rename(BOOT_KMSG_LOG ".tmp", BOOT_KMSG_LOG);
+    } else {
+        close(fd);
+    }
+}
+
+/* Fork a child that keeps BOOT_KMSG_LOG current until the parent kills it.
+ * Returns the child pid, or -1 on error. */
+static pid_t start_kmsg_drainer(void)
+{
+    pid_t pid;
+    ensure_log_dir();
+    dump_kmsg();                 /* one snapshot up front in case fork fails */
+    pid = fork();
+    if (pid != 0) return pid;    /* parent (pid>0) or error (-1) */
+    signal(SIGTERM, SIG_DFL);    /* parent's handler would not exit our loop */
+    for (;;) { dump_kmsg(); usleep(150000); }
+    _exit(0);                    /* unreachable */
+}
+
 /*  Main */
 int main(void)
 {
+    pid_t kmsg_pid = -1;
     int stream_listen, ctrl_listen, disc_fd = -1, client_fd = -1;
     /* ctrl_fd and ctrl_lb* are file-scope globals (see top of file) */
     uint8_t client_mode = MODE_CHANGE, client_fps = FPS_MAX;
@@ -1815,8 +1961,43 @@ int main(void)
     /* Ensure runtime directory exists (binary lives here, so it always should) */
     mkdir(SCREENREMOTE_DIR, 0755);
 
+    /* Ensure the FTP-visible log folder exists and is owned by the Kronos user
+     * BEFORE writing the .boot flag there — on an unrooted unit this is the only
+     * way the user can delete .boot (over FTP) to re-enable MIDI after a failed
+     * boot. */
+    ensure_log_dir();
+
     /* Truncate access log on each boot to avoid filling /korg/rw over time */
     { FILE *lf = fopen(SCREENREMOTE_DIR "/access.log", "w"); if (lf) fclose(lf); }
+
+    /* Boot-safety flag: write .boot at startup; delete it only after full successful
+     * startup (listeners bound, OS confirmed operational).  If .boot already exists
+     * on entry the previous boot did not complete cleanly — skip midi_inject hooks
+     * so the unit can recover.  Lives in the FTP-visible log folder
+     * (/korg/rw/HD/ScreenRemote/.boot) so the user can remove it over FTP — no
+     * shell access needed on an unrooted Kronos — to re-enable MIDI next boot. */
+    int boot_flag_found = 0;
+    {
+        struct stat _bf;
+        if (stat(BOOT_FLAG, &_bf) == 0) {
+            boot_flag_found = 1;
+            fprintf(stderr, "screenremote: .boot flag present from failed previous boot — "
+                    "MIDI hooks disabled for safe recovery (remove %s to re-enable)\n",
+                    BOOT_FLAG);
+        }
+        int _bfd = open(BOOT_FLAG, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+        if (_bfd >= 0) {
+            fchown(_bfd, KRONOS_UID, KRONOS_GID);  /* FTP-deletable/readable */
+            fsync(_bfd);
+            close(_bfd);
+        }
+        /* The marker MUST be durable on disk BEFORE any init_module() call: if a
+         * module load freezes the RTAI box, the next boot has to see .boot to skip
+         * the dangerous loads and self-recover.  open()+close() alone leaves it in
+         * the page cache (ext3 commit interval up to seconds), so a hard freeze can
+         * lose it → permanent boot loop.  sync() forces it out now. */
+        sync();
+    }
 
     /* Kill-switch: if the folder /korg/rw/HD/_nomod exists, load NO kernel modules.
      * FTP reaches only /korg/rw/HD, so this folder can be created over FTP
@@ -1836,10 +2017,22 @@ int main(void)
         }
     }
 
+    /* Capture the kernel ring buffer across the risky init_module() window so a
+     * freeze on a stock non-rooted unit still leaves retrievable evidence at
+     * /korg/rw/HD/screenremote/boot_kmsg.log.  Started before any module load;
+     * stopped once startup succeeds (see below). */
+    if (load_mods && !boot_flag_found)
+        kmsg_pid = start_kmsg_drainer();
+
     /* Extract and load virtual keyboard early so Eva discovers it before any client connects.
      * Use init_module(2) directly — system() needs /bin/sh which does not exist on non-rooted
-     * Kronos units. Loading from the embedded buffer avoids any shell or external binary. */
-    if (load_mods) {
+     * Kronos units. Loading from the embedded buffer avoids any shell or external binary.
+     *
+     * Gated by !boot_flag_found: if the previous boot didn't complete cleanly we
+     * load NO kernel modules at all this boot (not vkbd, not midi_inject), so the
+     * unit is guaranteed to reach a usable state.  Remove /korg/rw/screenremote/.boot
+     * (or fix the cause) to re-enable module loading on the next boot. */
+    if (load_mods && !boot_flag_found) {
         extract_ko(VKBD_KO, vkbd_ko, vkbd_ko_len);
         syscall(SYS_init_module, (void *)vkbd_ko, (unsigned long)vkbd_ko_len, "");
 
@@ -1850,9 +2043,26 @@ int main(void)
     }
 
     /* Load MIDI injection module */
-    if (load_mods) {
+    if (load_mods && !boot_flag_found) {
         unsigned long recv_fn = 0, reg_fn = 0;
         unsigned long dispatch_fn = 0, can_send_fn = 0;
+
+        /* midi_inject reads OA symbol addresses and patches OA .text.  It MUST NOT
+         * be loaded while OA is still MODULE_STATE_COMING ("OA(P+)" in the oops
+         * module list): doing so races the module loader and faults in module_put
+         * during init_module, killing the daemon before its init runs (see
+         * troubleshooting/boot_kmsg.log).  On the GRUB-hook boot path screenremote
+         * starts as soon as /proc/.oacmd appears, but that entry is created while
+         * OA is still COMING — so wait here until OA is actually Live.  On the
+         * rooted path OA is already Live when this runs, so the wait returns at
+         * once.  Timeout is generous; if OA never goes Live we skip MIDI rather
+         * than load into an unsafe state. */
+        if (!wait_for_oa_live(600)) {
+            fprintf(stderr, "screenremote: OA not Live after 60s — "
+                    "skipping midi_inject to avoid init_module race\n");
+            goto midi_done;
+        }
+
         resolve_kallsyms(&recv_fn, &reg_fn, &dispatch_fn, &can_send_fn);
         if (dispatch_fn || can_send_fn) {
             char params[512];
@@ -1866,7 +2076,13 @@ int main(void)
                                (unsigned long)midi_inject_ko_len,
                                params);
             if (ret == 0 || errno == EEXIST) {
-                g_midi_loaded = 1;
+                /* midi_inject_init() always returns 0 to the kernel now (see the
+                 * comment above its final return) — a negative return here would
+                 * crash module_put() on this kernel, so the module degrades
+                 * internally instead of failing the load.  That means "the
+                 * syscall succeeded" no longer implies "MIDI actually works";
+                 * /proc/.midi_in's openability below is the real signal, so
+                 * g_midi_loaded is set from that, not from ret. */
                 fprintf(stderr, "screenremote: midi_inject %s "
                         "(recv=%s reg=%s dispatch=%s can_send=%s)\n",
                         ret == 0 ? "loaded" : "already loaded",
@@ -1874,22 +2090,22 @@ int main(void)
                         reg_fn       ? "ok" : "none",
                         dispatch_fn  ? "ok" : "none",
                         can_send_fn  ? "ok" : "none");
+
+                for (int _mi = 0; _mi < 20 && midi_in_fd < 0; _mi++) {
+                    usleep(100000);
+                    midi_in_fd = open("/proc/.midi_in", O_WRONLY);
+                }
+                g_midi_loaded = (midi_in_fd >= 0);
+                start_midi_capture();
+                fprintf(stderr, "screenremote: midi_in=%d capture=%d\n",
+                        midi_in_fd >= 0 ? 1 : 0, midi_cap_fd >= 0 ? 1 : 0);
             } else {
                 fprintf(stderr, "screenremote: midi_inject failed (%ld)\n", ret);
             }
         } else {
             fprintf(stderr, "screenremote: no usable MIDI symbols in kallsyms — MIDI disabled\n");
         }
-
-        if (g_midi_loaded) {
-            for (int _mi = 0; _mi < 20 && midi_in_fd < 0; _mi++) {
-                usleep(100000);
-                midi_in_fd = open("/proc/.midi_in", O_WRONLY);
-            }
-            start_midi_capture();
-            fprintf(stderr, "screenremote: midi_in=%d capture=%d\n",
-                    midi_in_fd >= 0 ? 1 : 0, midi_cap_fd >= 0 ? 1 : 0);
-        }
+    midi_done: ;
     }
 
     /* On the non-rooted boot path, screenremote starts before /sbin/init via the
@@ -1939,6 +2155,21 @@ int main(void)
     disc_fd = make_udp_disc();
     fprintf(stderr, "screenremote: listening on %d (stream) %d (ctrl) %d (discovery)\n",
             g_stream_port, g_ctrl_port, DISC_PORT);
+
+    /* Startup complete: framebuffer open, network up, listeners bound.
+     * OS is fully operational — clear the boot flag so the next boot
+     * knows this one succeeded and loads MIDI normally. */
+    unlink(BOOT_FLAG);
+
+    /* Startup survived the module-load window: take a final ring-buffer snapshot
+     * (captures the successful "hooked 0x…"/"ready" lines) and stop the drainer
+     * so boot_kmsg.log reflects the boot window, not runtime churn. */
+    if (kmsg_pid > 0) {
+        kill(kmsg_pid, SIGTERM);
+        waitpid(kmsg_pid, NULL, 0);
+        kmsg_pid = -1;
+        dump_kmsg();
+    }
 
     for (;;) {
         fd_set rfds;
@@ -2273,6 +2504,7 @@ int main(void)
     }
 
     /* Clean shutdown: clear fb0 so fbcon can resume, close sockets. */
+    if (kmsg_pid > 0) { kill(kmsg_pid, SIGTERM); waitpid(kmsg_pid, NULL, 0); kmsg_pid = -1; }
     if (client_fd >= 0) close(client_fd);
     if (ctrl_fd   >= 0) close(ctrl_fd);
     if (stream_listen >= 0) close(stream_listen);

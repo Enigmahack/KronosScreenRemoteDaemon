@@ -163,8 +163,8 @@ static void drain_blk5_to_uni(void)
 /*  Inline hook infrastructure                                         */
 /* ------------------------------------------------------------------ */
 
-static uint8_t *tramp_dispatch  = NULL;  static uint8_t orig_dispatch[6];
-static uint8_t *tramp_can_send  = NULL;  static uint8_t orig_can_send[6];
+static uint8_t *tramp_dispatch  = NULL;  static uint8_t orig_dispatch[16];
+static uint8_t *tramp_can_send  = NULL;  static uint8_t orig_can_send[16];
 
 /* Post-call hook for CSTGMidiOutPort::ReadNextMessage — regparm(3): self→EAX, buf→EDX, maxlen→ECX.
  * Calls original first (fills buf), then captures the returned bytes into the unified ring. */
@@ -203,30 +203,310 @@ static void write_jmp(uint8_t *dst, uint8_t *tgt)
     *(int32_t *)(dst + 1) = (int32_t)(tgt - (dst + 5));
 }
 
+/* ------------------------------------------------------------------ */
+/*  Minimal 32-bit x86 instruction-length decoder                      */
+/* ------------------------------------------------------------------ */
+/*
+ * install_hook must overwrite the first 5 bytes of the target with a JMP, then
+ * relocate every ORIGINAL instruction that those 5 bytes touch into the
+ * trampoline.  That requires knowing the total length of the whole instructions
+ * spanning offset 0..4 — the "save length".  Hard-coding it (was 6) is correct
+ * only for the one OA build the prologue was reversed on; a different OS version
+ * with a different prologue could put an instruction boundary elsewhere, so a
+ * fixed 6 would split an instruction and corrupt live .text.  This decoder
+ * computes the length of a single instruction so save_len adapts to whatever
+ * prologue the resolved function actually has.
+ *
+ * Scope: 32-bit protected mode, default operand/address size 32 (the Kronos is
+ * i386, no long mode / no REX).  It returns LENGTH only — not operands — and
+ * returns 0 for any encoding it does not model so the caller refuses to patch
+ * rather than guess a wrong length.  Verified against a table of known i386
+ * encodings on the host (see tools test harness).
+ */
+
+/* One-byte opcode attribute flags. */
+#define _M  0x01   /* has ModR/M (+ possible SIB/displacement)        */
+#define _1  0x02   /* trailing imm8                                   */
+#define _Z  0x04   /* trailing imm, operand-size (4, or 2 with 0x66)  */
+#define _2  0x08   /* trailing imm16 (fixed)                          */
+#define _A  0x10   /* moffs: address-size immediate (4, or 2 w/ 0x67) */
+#define _F  0x20   /* far pointer ptr16:32 (imm-z + 2)                */
+#define _E  0x40   /* ENTER: imm16 + imm8 (3 bytes)                   */
+
+static const uint8_t onebyte_flags[256] = {
+    /*        0    1    2    3    4    5    6    7    8    9    A    B    C    D    E    F */
+    /*0x*/  _M,  _M,  _M,  _M,  _1,  _Z,   0,   0,  _M,  _M,  _M,  _M,  _1,  _Z,   0,   0,
+    /*1x*/  _M,  _M,  _M,  _M,  _1,  _Z,   0,   0,  _M,  _M,  _M,  _M,  _1,  _Z,   0,   0,
+    /*2x*/  _M,  _M,  _M,  _M,  _1,  _Z,   0,   0,  _M,  _M,  _M,  _M,  _1,  _Z,   0,   0,
+    /*3x*/  _M,  _M,  _M,  _M,  _1,  _Z,   0,   0,  _M,  _M,  _M,  _M,  _1,  _Z,   0,   0,
+    /*4x*/   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+    /*5x*/   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+    /*6x*/   0,   0,  _M,  _M,   0,   0,   0,   0,  _Z, (_M|_Z), _1, (_M|_1), 0, 0, 0, 0,
+    /*7x*/  _1,  _1,  _1,  _1,  _1,  _1,  _1,  _1,  _1,  _1,  _1,  _1,  _1,  _1,  _1,  _1,
+    /*8x*/ (_M|_1),(_M|_Z),(_M|_1),(_M|_1),_M,_M,_M,_M, _M,_M,_M,_M,_M,_M,_M,_M,
+    /*9x*/   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,  _F,   0,   0,   0,   0,   0,
+    /*Ax*/  _A,  _A,  _A,  _A,   0,   0,   0,   0,  _1,  _Z,   0,   0,   0,   0,   0,   0,
+    /*Bx*/  _1,  _1,  _1,  _1,  _1,  _1,  _1,  _1,  _Z,  _Z,  _Z,  _Z,  _Z,  _Z,  _Z,  _Z,
+    /*Cx*/ (_M|_1),(_M|_1),_2,0,_M,_M,(_M|_1),(_M|_Z), _E,0,_2,0,0,_1,0,0,
+    /*Dx*/  _M,  _M,  _M,  _M,  _1,  _1,   0,   0,  _M,  _M,  _M,  _M,  _M,  _M,  _M,  _M,
+    /*Ex*/  _1,  _1,  _1,  _1,  _1,  _1,  _1,  _1,  _Z,  _Z,  _F,  _1,   0,   0,   0,   0,
+    /*Fx*/   0,   0,   0,   0,   0,   0,  _M,  _M,   0,   0,   0,   0,   0,   0,  _M,  _M,
+};
+
+/* Bytes consumed by a ModR/M byte at p (plus SIB and displacement).
+ * addr16 selects 16-bit addressing rules.  Returns -1 on buffer overrun. */
+static int modrm_len(const uint8_t *p, int max, int addr16)
+{
+    uint8_t modrm, sib;
+    int mod, rm, len = 1;
+
+    if (max < 1) return -1;
+    modrm = p[0];
+    mod = modrm >> 6;
+    rm  = modrm & 7;
+
+    if (mod == 3) return len;               /* register direct: no SIB/disp */
+
+    if (addr16) {                           /* 16-bit addressing: no SIB */
+        if (mod == 0) { if (rm == 6) len += 2; }
+        else if (mod == 1) len += 1;
+        else               len += 2;        /* mod == 2 */
+        return len;
+    }
+
+    if (rm == 4) {                          /* SIB byte present */
+        if (max < 2) return -1;
+        sib = p[1];
+        len += 1;
+        if (mod == 0 && (sib & 7) == 5)     /* base==101, mod==00 → disp32 */
+            len += 4;
+    } else if (mod == 0 && rm == 5) {       /* [disp32] absolute */
+        len += 4;
+    }
+
+    if (mod == 1)      len += 1;            /* disp8  */
+    else if (mod == 2) len += 4;            /* disp32 */
+
+    return len;
+}
+
+/* Length in bytes of the single instruction at code (reads at most max bytes).
+ * Returns 0 if the encoding is not modelled. */
+static int x86_insn_len(const uint8_t *code, int max)
+{
+    int i = 0, opsize16 = 0, addr16 = 0;
+    uint8_t op, flags;
+
+    /* Legacy prefixes (any order, repeatable). */
+    while (i < max) {
+        uint8_t b = code[i];
+        if (b == 0x66) { opsize16 = 1; i++; continue; }
+        if (b == 0x67) { addr16   = 1; i++; continue; }
+        if (b == 0xF0 || b == 0xF2 || b == 0xF3 ||
+            b == 0x2E || b == 0x36 || b == 0x3E ||
+            b == 0x26 || b == 0x64 || b == 0x65) { i++; continue; }
+        break;
+    }
+    if (i >= max) return 0;
+
+    op = code[i++];
+
+    if (op == 0x0F) {                       /* two/three-byte opcode */
+        uint8_t op2;
+        int ml;
+        if (i >= max) return 0;
+        op2 = code[i++];
+
+        if (op2 == 0x38 || op2 == 0x3A) {   /* 0F 38 / 0F 3A three-byte */
+            int imm8 = (op2 == 0x3A);
+            if (i >= max) return 0;
+            i++;                            /* third opcode byte */
+            ml = modrm_len(code + i, max - i, addr16);
+            if (ml < 0) return 0;
+            i += ml + (imm8 ? 1 : 0);
+            return (i <= max) ? i : 0;
+        }
+        if (op2 >= 0x80 && op2 <= 0x8F) {   /* Jcc near rel16/32 */
+            i += opsize16 ? 2 : 4;
+            return (i <= max) ? i : 0;
+        }
+        switch (op2) {                      /* two-byte, NO ModR/M */
+        case 0x05: case 0x06: case 0x07: case 0x08: case 0x09: case 0x0B: case 0x0E:
+        case 0x30: case 0x31: case 0x32: case 0x33: case 0x34: case 0x35: case 0x77:
+        case 0xA0: case 0xA1: case 0xA2: case 0xA8: case 0xA9:
+        case 0xC8: case 0xC9: case 0xCA: case 0xCB:
+        case 0xCC: case 0xCD: case 0xCE: case 0xCF:
+            return (i <= max) ? i : 0;
+        default: break;
+        }
+        ml = modrm_len(code + i, max - i, addr16);   /* two-byte, ModR/M */
+        if (ml < 0) return 0;
+        i += ml;
+        switch (op2) {                      /* some two-byte carry imm8 */
+        case 0x70: case 0x71: case 0x72: case 0x73:
+        case 0xA4: case 0xAC: case 0xBA:
+        case 0xC2: case 0xC4: case 0xC5: case 0xC6:
+            i += 1;
+            break;
+        default: break;
+        }
+        return (i <= max) ? i : 0;
+    }
+
+    flags = onebyte_flags[op];
+
+    if (flags & _M) {
+        int reg, ml;
+        if (i >= max) return 0;
+        reg = (code[i] >> 3) & 7;
+        ml = modrm_len(code + i, max - i, addr16);
+        if (ml < 0) return 0;
+        i += ml;
+        /* grp3 F6/F7: only the /0 and /1 (TEST) forms carry an immediate. */
+        if      (op == 0xF6 && reg <= 1) i += 1;
+        else if (op == 0xF7 && reg <= 1) i += opsize16 ? 2 : 4;
+    }
+
+    if (flags & _1) i += 1;
+    if (flags & _Z) i += opsize16 ? 2 : 4;
+    if (flags & _2) i += 2;
+    if (flags & _A) i += addr16 ? 2 : 4;
+    if (flags & _F) i += (opsize16 ? 2 : 4) + 2;
+    if (flags & _E) i += 3;
+
+    return (i <= max) ? i : 0;
+}
+
+/* Bytes to save/relocate so a 5-byte JMP patch lands on instruction boundaries:
+ * sum whole instruction lengths from fn until the total covers >= 5.  Reads up
+ * to `window` bytes of .text.  Returns the save length, or 0 if an instruction
+ * could not be decoded. */
+static int compute_save_len(const uint8_t *fn, int window)
+{
+    int save = 0;
+    while (save < 5) {
+        int l = x86_insn_len(fn + save, window - save);
+        if (l <= 0) return 0;
+        save += l;
+    }
+    return save;
+}
+
+#undef _M
+#undef _1
+#undef _Z
+#undef _2
+#undef _A
+#undef _F
+#undef _E
+
 /* Install inline hook:
- *   - allocates 16-byte executable trampoline
- *   - saves save_len original bytes into orig[] (must be ≥ 5, padded to instruction boundary)
+ *   - computes save_len = whole instructions spanning the 5-byte patch, via the
+ *     x86 length decoder above (adapts to the prologue this OA build actually
+ *     has — no hard-coded length)
+ *   - saves save_len original bytes into orig[] (capacity orig_cap)
  *   - builds trampoline: orig[save_len] + JMP back to fn+save_len
  *   - patches fn[0..4] with JMP to hook_fn (always a 5-byte E9 rel32)
  *
- * save_len must be ≥ 5.  Use 6 for standard i386 cdecl/regparm prologues where
- * the third instruction (and/sub esp) spans bytes 3–5 of the function.
+ * orig_cap is the size of the caller's orig[] buffer; the hook is refused if the
+ * decoded prologue needs more than that.
+ *
+ * expect/explen: an optional KNOWN-GOOD prologue for the target.  The hook
+ * targets come from /proc/kallsyms substring matches resolved in userspace, so a
+ * renamed/duplicate symbol on an untested OS build can resolve to the WRONG (but
+ * valid) address, and writing a 5-byte JMP over the wrong .text corrupts a live
+ * RTAI module and freezes the unit during init_module.  Because the OA prologue
+ * varies by OS version and we resolve addresses dynamically, this is diagnostic,
+ * not a hard gate: install_hook LOGS every target's prologue (for boot_kmsg.log),
+ * hard-refuses an obviously-invalid entry (padding/ret/int3) OR a prologue it
+ * cannot decode, and merely WARNS on a known-table mismatch before proceeding.
+ * The length decoder now removes the "split instruction" freeze risk that a
+ * fixed save_len carried; .boot self-recovery remains the backstop.
  *
  * Returns 0 on success, negative on failure (hook NOT installed). */
 static int install_hook(unsigned long fn_addr, void *hook_fn,
-                        uint8_t **tramp_ptr, uint8_t *orig, int save_len)
+                        uint8_t **tramp_ptr, uint8_t *orig, int orig_cap,
+                        const uint8_t *expect, int explen)
 {
     uint8_t *fn = (uint8_t *)fn_addr;
     uint8_t *tramp;
     unsigned long flags;
+    int i, save_len;
 
-    if (!fn_addr || save_len < 5) return -EINVAL;
+    if (!fn_addr) return -EINVAL;
+
+    /* Always log the prologue we are about to patch so it lands in boot_kmsg.log.
+     * The OA build — and therefore the prologue bytes and where save_len lands on
+     * an instruction boundary — tracks the OS version (3.1.x vs 3.2.x), not the
+     * model (K1/K2/K3/Nautilus share the OS), so this is how we build a real
+     * per-version prologue table from hardware. */
+    printk(KERN_INFO "midi_inject: target 0x%lx prologue "
+           "%02x %02x %02x %02x %02x %02x\n",
+           fn_addr, fn[0], fn[1], fn[2], fn[3], fn[4], fn[5]);
+
+    /* Hard refuse only an obviously bogus target (symbol resolved to padding /
+     * a bare ret / an int3 slide) — patching that is a guaranteed brick. */
+    if (fn[0] == 0x00 || fn[0] == 0xC3 || fn[0] == 0xCC) {
+        printk(KERN_ERR "midi_inject: refusing hook at 0x%lx — not a function entry "
+               "(first byte 0x%02x)\n", fn_addr, fn[0]);
+        return -EINVAL;
+    }
+
+    /* Known-prologue check: WARN but PROCEED on mismatch.  Addresses are resolved
+     * dynamically via kallsyms, so on an OS version we haven't catalogued the
+     * prologue (and possibly the correct save_len) will differ — refusing here
+     * would silently disable MIDI on a unit where it might work fine.  A wrong
+     * save_len could still freeze, but .boot self-recovery makes that a one-boot
+     * event and the prologue was just logged above for adding to the table. */
+    if (expect && explen > 0) {
+        for (i = 0; i < explen; i++) {
+            if (fn[i] != expect[i]) {
+                printk(KERN_WARNING "midi_inject: prologue at 0x%lx differs from the "
+                       "known table (byte %d: 0x%02x vs 0x%02x) — proceeding; add this "
+                       "prologue if this OS version works\n",
+                       fn_addr, i, fn[i], expect[i]);
+                break;
+            }
+        }
+    }
+
+    /* Decode the prologue to find how many whole-instruction bytes the 5-byte
+     * JMP patch spans.  This replaces the old hard-coded length: it is correct
+     * for whatever prologue the resolved OA build actually has.  If any of those
+     * instructions can't be decoded, refuse — a wrong length would split an
+     * instruction and corrupt live .text. */
+    save_len = compute_save_len(fn, 16);
+    if (save_len == 0 || save_len > orig_cap) {
+        printk(KERN_ERR "midi_inject: refusing hook at 0x%lx — "
+               "prologue undecodable or too long (save_len=%d, cap=%d)\n",
+               fn_addr, save_len, orig_cap);
+        return -EINVAL;
+    }
+    printk(KERN_INFO "midi_inject: prologue at 0x%lx spans %d bytes\n",
+           fn_addr, save_len);
 
     /* Allocate trampoline from the direct-mapped region (get_free_page) so it is
      * always present in kernel page tables — no lazy vmalloc fault.  This is
      * required for hooks called from RTAI real-time tasks, whose trap handler
      * does not recover vmalloc #PF.  set_memory_x makes the page executable
-     * (needed on PAE kernels with NX support). */
+     * (needed on PAE kernels with NX support).
+     *
+     * ┌─ BOOT-FREEZE HAZARD (suspected non-rooted brick) ───────────────────────┐
+     * │ On a PAE/NX kernel set_memory_x() clears the page's NX bit, which sets   │
+     * │ CPA_FLUSHTLB and forces cpa_flush_range()->on_each_cpu(...,1): a         │
+     * │ SYNCHRONOUS cross-CPU TLB-flush IPI that WAITS for every core to ACK.    │
+     * │ This is the SAME on_each_cpu mechanism free_trampoline() documents as    │
+     * │ freezing the RTAI box (set_memory_nx) — and it runs here during          │
+     * │ init_module.  On the non-rooted path the module auto-loads EARLY (right  │
+     * │ when /proc/.oacmd appears) while the RT domain is spinning up and may     │
+     * │ never service the IPI → on_each_cpu spins forever → whole unit freezes.  │
+     * │ On the rooted path the module loads post-boot from OA.clonos.rc (steady  │
+     * │ state), which is why that path doesn't reproduce it.  If the page is      │
+     * │ already executable (no NX / already-X large-page direct map) this is a    │
+     * │ harmless no-op (CPA_FLUSHTLB unset, no IPI).  A proper fix needs hardware │
+     * │ confirmation (capture a release_debug.sh loglevel=7 boot log: freeze     │
+     * │ with the "hooked 0x…" printk ABSENT confirms the flush is the culprit).  │
+     * └──────────────────────────────────────────────────────────────────────────┘ */
     tramp = (uint8_t *)__get_free_page(GFP_KERNEL);
     if (!tramp) {
         printk(KERN_ERR "midi_inject: get_free_page trampoline failed\n");
@@ -534,26 +814,62 @@ static int __init midi_inject_init(void)
      * when no host is present, which is normal operation for the Kronos.
      * Symbol is in KorgUsbAudioDriver.ko; if not found on this model the hook
      * is simply skipped and ReadNextMessage only fires when USB host is connected. */
-    if (can_send_fn)
-        install_hook(can_send_fn, hook_can_send, &tramp_can_send, orig_can_send, 6);
+    if (can_send_fn) {
+        /* No hardcoded prologue for KorgUsbMidiOutputCanSend (varies by driver
+         * build); rely on the generic not-a-function-entry guard in install_hook.
+         * This hook runs from Linux context, so a bad target is less catastrophic
+         * than the RT-context dispatch hook below. */
+        install_hook(can_send_fn, hook_can_send, &tramp_can_send,
+                     orig_can_send, sizeof(orig_can_send), NULL, 0);
+    }
 
     if (midi_dispatch_fn) {
-        /* save_len=6: ReadNextMessage prologue crosses byte 5 (and esp,0xfffffff0 = 83 E4 F0) */
+        /* install_hook now decodes the prologue and computes the save length
+         * itself, so any i386 prologue is handled — not just this one.
+         * Known OA.ko prologue (the OS version this was reversed on):
+         *   push ebp; mov ebp,esp; and esp,0xfffffff0  =  55 89 E5 83 E4 F0
+         * Still passed as the known-table entry so install_hook logs the actual
+         * prologue and warns (not refuses) if a different OS version differs.
+         * This hook fires from an RTAI real-time task, so if boot_kmsg.log shows
+         * this prologue then a freeze, suspect the set_memory_x IPI, not address
+         * drift or a split instruction. */
+        static const uint8_t rnm_prologue[6] = { 0x55, 0x89, 0xE5, 0x83, 0xE4, 0xF0 };
         if (install_hook(midi_dispatch_fn, hook_read_next_msg,
-                         &tramp_dispatch, orig_dispatch, 6) == 0)
+                         &tramp_dispatch, orig_dispatch, sizeof(orig_dispatch),
+                         rnm_prologue, sizeof(rnm_prologue)) == 0)
             have_ring = 1;
         else
             printk(KERN_WARNING "midi_inject: ReadNextMessage hook failed\n");
     }
 
-    if (!have_ring && !tramp_can_send) {
-        printk(KERN_ERR "midi_inject: no output path active — aborting\n");
-        return -ENODEV;
-    }
+    /* From here on this function must NEVER return a negative value, no matter
+     * what failed above.  Confirmed against kernel/module.c: when a directly
+     * init_module(2)-loaded module's init() returns < 0, sys_init_module()'s
+     * error path runs unconditionally —
+     *   mod->state = MODULE_STATE_GOING; synchronize_sched(); module_put(mod);
+     * — and module_put(mod) is called on THIS module.  Because this .ko is
+     * cross-compiled against headers that don't match the real Korg/RTAI
+     * struct-module ABI (patch_init_offset.py only corrects the `init`
+     * function-pointer relocation, not the rest of the struct/section layout),
+     * mod->refptr does not live where module_put() expects, so the percpu
+     * dereference faults on a garbage pointer — an instant oops in
+     * module_put+0x24 that kills the calling process (screenremote) before it
+     * can clear its .boot recovery flag, forcing a full extra reboot with every
+     * kernel module disabled.  There is no safe negative return from an
+     * embedded-buffer init_module() load on this kernel, so — exactly like
+     * vkbd_init(), which always returns 0 and pushes all real setup into
+     * schedule_work() — every failure below degrades instead of aborting.
+     * screenremote.c already treats /proc/.midi_in's openability as the real
+     * success signal rather than the init_module(2) return code. */
+    if (!have_ring && !tramp_can_send)
+        printk(KERN_WARNING "midi_inject: no output path active — "
+               "MIDI OUT unavailable, IN injection unaffected\n");
 
     proc_midi_in = create_proc_entry(".midi_in", 0666, NULL);
-    if (!proc_midi_in) return -ENOMEM;
-    proc_midi_in->write_proc = midi_write;
+    if (proc_midi_in)
+        proc_midi_in->write_proc = midi_write;
+    else
+        printk(KERN_ERR "midi_inject: create_proc_entry(.midi_in) failed\n");
 
     if (have_ring) {
         proc_midi_ring = create_proc_entry(".midi_ring", 0666, NULL);
@@ -566,11 +882,13 @@ static int __init midi_inject_init(void)
 
     register_module_notifier(&midi_nb);
 
-    printk(KERN_INFO "midi_inject: ready — port=%p blk5=%s can_send=%s dispatch=%s\n",
+    printk(KERN_INFO "midi_inject: ready — port=%p blk5=%s can_send=%s dispatch=%s "
+           "midi_in=%s\n",
            port_obj,
            hw_data        ? "ok" : "none",
            tramp_can_send ? "ok" : "none",
-           tramp_dispatch ? "ok" : "none");
+           tramp_dispatch ? "ok" : "none",
+           proc_midi_in   ? "ok" : "none");
     return 0;
 }
 

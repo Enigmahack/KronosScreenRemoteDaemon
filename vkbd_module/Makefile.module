@@ -1,4 +1,10 @@
-KDIR   ?= ../../linux-2.6.32.11
+# /home/build/linux-kronos is Korg's actual kernel source (cgudrian/linux-kronos,
+# built with korg_kronos_defconfig) — verified to produce byte-accurate struct
+# module layouts against real Korg .ko files. See ../../project_linux_kronos_kernel_tree.md.
+# The vanilla ../../linux-2.6.32.11 tree does NOT match the real kernel's struct
+# layout beyond the one field patch_init_offset.py hand-patches; that script stays
+# below as a cheap defensive check (no-ops when the offset is already correct).
+KDIR   ?= /home/build/linux-kronos
 PWD    := $(shell pwd)
 PATCH  := ../patch_init_offset.py
 KO_HDR := ../source/vkbd_ko.h
