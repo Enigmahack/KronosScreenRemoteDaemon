@@ -44,3 +44,8 @@ desktop.ini
 
 # Troubleshooting Files
 .rawGrab/
+
+# Unnecessary files/documentation
+docs/vm_environment.md
+tools/__pycache__/
+tools/*.py
