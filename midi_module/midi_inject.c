@@ -1,9 +1,16 @@
 /*
  * midi_inject.ko — MIDI injection + output capture for Korg Kronos
  *
- * /proc/.midi_in   — write raw MIDI bytes to inject into OA.ko MIDI IN
- * /proc/.midi_ring — read MIDI output: unified ring fed by ReadNextMessage hook
- *                    and Block 5 SysEx drain
+ * /proc/.midi_in    — write raw MIDI bytes to inject into OA.ko MIDI IN
+ * /proc/.midi_ring  — read the Kronos MIDI OUT stream (notes, CC, bend, SysEx)
+ * /proc/.midi_ports — diagnostic: out-port topology / which port is captured
+ *
+ * MIDI OUT is captured by hooking CSTGMidiOutPort::ReadNextMessage (the per-port
+ * output drain, already driven by the always-transmitting DIN path — no USB host
+ * or can_send force needed).  ReadNextMessage runs once per active output port and
+ * every port mirrors the same performance stream, so we lock onto ONE port and
+ * capture only it — otherwise every event is duplicated per port.  See
+ * hook_read_next_msg.
  *
  * Module params:
  *   receive_fn=0x...        MidiInPortGeneric7Receive (required for MIDI IN injection)
@@ -11,19 +18,19 @@
  *   midi_dispatch_fn=0x...  CSTGMidiOutPort::ReadNextMessage VA (all MIDI out)
  *                           Mangled: _ZN15CSTGMidiOutPort15ReadNextMessageEPhj
  *                           Kronos 1 (D510, OA@0x59d17000): 0x59E054A0
- *   can_send_fn=0x...       KorgUsbMidiOutputCanSend — hooked to always return 1
- *                           so the USB output thread calls ReadNextMessage even
- *                           without a USB host connected. Linux-context safe.
- *                           Kronos 1: 0x58f70390
+ *   capture_port_idx=-1     -1 = auto-lock to the right out-port (default).  >=0 =
+ *                           force capture of that port index (see /proc/.midi_ports).
+ *                           Runtime-writable for field diagnosis.
  */
 
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/proc_fs.h>
+#include <linux/slab.h>
 #include <linux/uaccess.h>
-#include <linux/vmalloc.h>
 #include <linux/spinlock.h>
 #include <linux/notifier.h>
+#include <linux/workqueue.h>
 #include <asm/cacheflush.h>
 
 MODULE_LICENSE("GPL");
@@ -41,9 +48,6 @@ module_param(register_fn, ulong, 0444);
 static unsigned long midi_dispatch_fn = 0;
 module_param(midi_dispatch_fn, ulong, 0444);
 
-static unsigned long can_send_fn = 0;
-module_param(can_send_fn, ulong, 0444);
-
 /* ------------------------------------------------------------------ */
 /*  MIDI IN injection state                                            */
 /* ------------------------------------------------------------------ */
@@ -55,17 +59,13 @@ static void *port_obj;
 static uint32_t *ports_array;
 static struct proc_dir_entry *proc_midi_in;
 static struct proc_dir_entry *proc_midi_ring;
-static uint8_t midi_buf[4096];
+static struct proc_dir_entry *proc_midi_ports;
+/* MIDI injection uses a per-call kmalloc buffer (see midi_write), not a shared
+ * static one — /proc/.midi_in is world-writable and can have concurrent writers. */
 
-/* ------------------------------------------------------------------ */
-/*  Block 5 ring state (SysEx responses via Korg internal path)       */
-/* ------------------------------------------------------------------ */
-
-static uint32_t *hw_queue;
-static uint8_t  *hw_data;
-static uint32_t  hw_mask;
-static uint32_t  ring_cursor;
-
+/* Guards the MIDI-IN injection target (port_obj/receive_fn).  ring_dead is set by
+ * the OA-unload notifier so an in-flight /proc/.midi_in write can't call into
+ * freed OA .text. */
 static DEFINE_SPINLOCK(ring_lock);
 static int ring_dead;
 
@@ -73,14 +73,12 @@ static void ring_disable(void)
 {
     spin_lock(&ring_lock);
     ring_dead = 1;
-    hw_data   = NULL;
-    hw_queue  = NULL;
     port_obj  = NULL;
     spin_unlock(&ring_lock);
 }
 
 /* ------------------------------------------------------------------ */
-/*  Unified MIDI OUT ring (dispatcher hook + Block 5 drain)           */
+/*  Unified MIDI OUT ring (fed by the ReadNextMessage dispatch hook)  */
 /* ------------------------------------------------------------------ */
 
 #define UNI_RING_BITS  14               /* 16384 bytes */
@@ -117,72 +115,91 @@ static void uni_ring_push_buf(const uint8_t *buf, uint32_t len)
     spin_unlock_irqrestore(&uni_lock, flags);
 }
 
-/* Drain any new Block 5 bytes into uni_ring.  Called from ring_fops_read. */
-static void drain_blk5_to_uni(void)
-{
-    uint8_t  tmp[128];
-    uint8_t  *data;
-    uint32_t *queue;
-    uint32_t  mask, wpos, avail, take, first;
-
-    spin_lock(&ring_lock);
-    if (ring_dead || !hw_data || !hw_queue) { spin_unlock(&ring_lock); return; }
-    data  = hw_data;
-    queue = hw_queue;
-    mask  = hw_mask;
-    spin_unlock(&ring_lock);
-
-    if (probe_kernel_read(&wpos, &queue[3], sizeof(wpos))) {
-        ring_disable();
-        return;
-    }
-    avail = wpos - ring_cursor;
-    if (!avail) return;
-    if (avail > mask + 1) avail = mask + 1;
-
-    while (avail > 0) {
-        take  = avail < (uint32_t)sizeof(tmp) ? avail : (uint32_t)sizeof(tmp);
-        first = (mask + 1) - (ring_cursor & mask);
-        if (first > take) first = take;
-
-        if (probe_kernel_read(tmp, &data[ring_cursor & mask], first)) {
-            ring_disable(); return;
-        }
-        if (first < take) {
-            if (probe_kernel_read(tmp + first, &data[0], take - first)) {
-                ring_disable(); return;
-            }
-        }
-        uni_ring_push_buf(tmp, take);
-        ring_cursor += take;
-        avail       -= take;
-    }
-}
-
 /* ------------------------------------------------------------------ */
 /*  Inline hook infrastructure                                         */
 /* ------------------------------------------------------------------ */
 
 static uint8_t *tramp_dispatch  = NULL;  static uint8_t orig_dispatch[16];
-static uint8_t *tramp_can_send  = NULL;  static uint8_t orig_can_send[16];
+
+/* The ONE CSTGMidiOutPort we capture from (see hook_read_next_msg).  ReadNextMessage
+ * is called once per active output port (USB, DIN, …) and every port emits the SAME
+ * performance stream, so capturing all of them duplicates every event (N ports ->
+ * N copies).  Locking to one port gives a single clean stream matching what one
+ * physical MIDI port transmits.  capture_port_has_note tracks whether the locked
+ * port has ever carried a note, so we can UPGRADE off a first-seen control-only
+ * port to a note-carrying one (see the lock logic below).  NULL while unlocked. */
+static void *capture_port;
+static int   capture_port_has_note;
+
+/* DIAGNOSTIC (feeds /proc/.midi_ports): per-port message counts, immune to dmesg
+ * rotation.  Cheap — a few increments per hooked call. */
+#define MAXP 8
+static void     *seen_ports[MAXP];
+static int       nseen_ports;
+static uint32_t  port_calls[MAXP];    /* # of ReadNextMessage returns with data   */
+static uint32_t  port_notes[MAXP];    /* # note-on (0x9x) messages seen           */
+static uint32_t  port_ccs[MAXP];      /* # control-change (0xBx) messages seen     */
+static uint8_t   port_first[MAXP][3]; /* first 3 bytes this port emitted           */
+
+/* Optional override: force capture of the port at this 0-based index (see
+ * /proc/.midi_ports).  -1 = auto-lock (default). */
+static int capture_port_idx = -1;
+module_param(capture_port_idx, int, 0644);
 
 /* Post-call hook for CSTGMidiOutPort::ReadNextMessage — regparm(3): self→EAX, buf→EDX, maxlen→ECX.
- * Calls original first (fills buf), then captures the returned bytes into the unified ring. */
+ * Calls original first (fills buf), then captures the returned bytes into the unified
+ * ring for exactly ONE port, so multi-port output is not duplicated. */
 static int __attribute__((regparm(3)))
 hook_read_next_msg(void *self, uint8_t *buf, uint32_t maxlen)
 {
     typedef int (*orig_t)(void *, uint8_t *, uint32_t)
         __attribute__((regparm(3)));
     int n = ((orig_t)tramp_dispatch)(self, buf, maxlen);
-    if (n > 0 && (uint32_t)n <= maxlen)
-        uni_ring_push_buf(buf, (uint32_t)n);
+    if (n > 0 && (uint32_t)n <= maxlen) {
+        int i, idx = -1;
+        uint8_t st = buf[0] & 0xf0;
+
+        /* Topology map (diagnostic). */
+        for (i = 0; i < nseen_ports; i++)
+            if (seen_ports[i] == self) { idx = i; break; }
+        if (idx < 0 && nseen_ports < MAXP) {
+            idx = nseen_ports++;
+            seen_ports[idx] = self;
+            port_first[idx][0] = buf[0];
+            port_first[idx][1] = buf[1];
+            port_first[idx][2] = buf[2];
+        }
+        if (idx >= 0) {
+            port_calls[idx]++;
+            if (st == 0x90) port_notes[idx]++;
+            if (st == 0xb0) port_ccs[idx]++;
+        }
+
+        if (capture_port_idx >= 0) {
+            /* Manual override: capture exactly the requested index. */
+            if (idx == capture_port_idx)
+                uni_ring_push_buf(buf, (uint32_t)n);
+        } else {
+            /* Auto-lock: grab the first port that emits, but UPGRADE to a
+             * note-carrying port if our locked one has never carried a note.
+             * This is correct whether the player uses the keyboard (locks/upgrades
+             * to the performance port) or only moves controllers (locks to that
+             * port; a later note upgrades if it lands elsewhere). */
+            if (!capture_port) {
+                capture_port = self;
+                capture_port_has_note = (st == 0x90);
+            } else if (st == 0x90 && self != capture_port && !capture_port_has_note) {
+                capture_port = self;             /* upgrade to the note port */
+                capture_port_has_note = 1;
+            } else if (st == 0x90 && self == capture_port) {
+                capture_port_has_note = 1;
+            }
+            if (self == capture_port)
+                uni_ring_push_buf(buf, (uint32_t)n);
+        }
+    }
     return n;
 }
-
-/* Hook KorgUsbMidiOutputCanSend to always return 1 so the USB MIDI output
- * thread unconditionally calls ReadNextMessage even without a USB host.
- * Called from Linux context (kOAMidiOutput thread) — vmalloc-safe. */
-static int hook_can_send(void) { return 1; }
 
 /* Temporarily disable CR0.WP so kernel .text is writable. */
 static unsigned long saved_cr0;
@@ -196,7 +213,16 @@ static void wp_enable(void)
     asm volatile("mov %0, %%cr0" :: "r"(saved_cr0));
 }
 
-/* Write a 5-byte relative JMP at dst jumping to tgt. */
+/* Write a 5-byte relative JMP at dst jumping to tgt.
+ *
+ * No reach check is needed on this platform: the Kronos is i386 (32-bit), so all
+ * pointers and the E9 rel32 displacement are 32 bits, and the CPU computes the
+ * near-JMP target as (dst+5)+rel32 modulo 2^32.  rel32 = tgt-(dst+5) is therefore
+ * exactly representable for ANY pair of 32-bit addresses (the arithmetic wraps),
+ * so an E9 near JMP reaches every address in the space regardless of distance
+ * between OA .text, this module's .text, and the direct-mapped trampoline page.
+ * The ±2 GB / INT32-overflow-into-garbage concern is an x86-64 consideration
+ * only; if this is ever ported to a 64-bit kernel, add a range check here. */
 static void write_jmp(uint8_t *dst, uint8_t *tgt)
 {
     dst[0] = 0xE9;
@@ -495,8 +521,8 @@ static int install_hook(unsigned long fn_addr, void *hook_fn,
      * │ On a PAE/NX kernel set_memory_x() clears the page's NX bit, which sets   │
      * │ CPA_FLUSHTLB and forces cpa_flush_range()->on_each_cpu(...,1): a         │
      * │ SYNCHRONOUS cross-CPU TLB-flush IPI that WAITS for every core to ACK.    │
-     * │ This is the SAME on_each_cpu mechanism free_trampoline() documents as    │
-     * │ freezing the RTAI box (set_memory_nx) — and it runs here during          │
+     * │ This is the SAME on_each_cpu IPI mechanism that makes freeing the        │
+     * │ trampolines unsafe (now leaked, not freed) — and it runs here during     │
      * │ init_module.  On the non-rooted path the module auto-loads EARLY (right  │
      * │ when /proc/.oacmd appears) while the RT domain is spinning up and may     │
      * │ never service the IPI → on_each_cpu spins forever → whole unit freezes.  │
@@ -561,18 +587,19 @@ static void restore_hook_bytes(unsigned long fn_addr, uint8_t *orig)
     printk(KERN_INFO "midi_inject: unhooked 0x%lx\n", fn_addr);
 }
 
-/* Free a trampoline page.  set_memory_nx() issues a cross-CPU TLB-flush IPI and
- * waits for every CPU to ACK — on the RTAI kernel an RT-controlled core may never
- * service it, so on_each_cpu() spins forever and the whole system freezes.  This
- * MUST run only in process context (module_exit), NEVER from the module notifier. */
-static void free_trampoline(uint8_t **tramp_ptr)
-{
-    if (*tramp_ptr) {
-        set_memory_nx((unsigned long)*tramp_ptr, 1);
-        free_page((unsigned long)*tramp_ptr);
-        *tramp_ptr = NULL;
-    }
-}
+/* NOTE: there is intentionally NO trampoline-free routine — the pages are leaked
+ * at unload rather than freed.  A trampoline is a single executable page that a
+ * hook caller JMPs into and runs the relocated OA prologue from, and the
+ * ReadNextMessage hook can be entered from an RTAI real-time task (ipipe RT
+ * domain).  No Linux primitive can prove such an RT task has left the page:
+ * synchronize_rcu()/synchronize_sched() only wait on LINUX quiescent states,
+ * which RT-domain tasks never report — so freeing the page would be an
+ * un-guardable use-after-free (the old code's synchronize_rcu() only *appeared*
+ * to cover this).  Freeing via set_memory_nx()+free_page() would also fire the
+ * very cross-CPU TLB-flush IPI that freezes this RTAI box.  Leaking ≤2 pages
+ * until the next reboot is trivial on this appliance (the module loads once at
+ * boot; teardown happens at an OS-update "Preparing to Install", after which the
+ * unit reboots).  See midi_inject_exit. */
 
 /* ------------------------------------------------------------------ */
 /*  Module notifier — disable on OA/loadmod unload                    */
@@ -588,19 +615,19 @@ static int midi_module_notify(struct notifier_block *nb,
         /* OA is being torn down.  This is exactly what the Kronos does at
          * "Preparing to Install" before an OS update.  Do the MINIMUM that is
          * safe under module_mutex on the RTAI kernel: disable the ring and
-         * restore OA's patched bytes via the local-only path.  Do NOT free
-         * trampolines here — free_trampoline()/set_memory_nx() issues an IPI
-         * that can hang the RT kernel and freeze the whole system (this was the
-         * cause of installs/cleaners freezing at "Preparing to Install").  The
-         * trampoline pages are reclaimed later at rmmod, in process context. */
+         * restore OA's patched bytes via the local-only path.  Do NOT touch the
+         * trampoline pages here — set_memory_nx() would issue an IPI that can hang
+         * the RT kernel and freeze the whole system (this was the cause of
+         * installs/cleaners freezing at "Preparing to Install").  The trampoline
+         * pages are intentionally leaked, never freed at all (see the
+         * trampoline-leak note and midi_inject_exit). */
         ring_disable();
         /* Serialized against module_exit by module_mutex; hook fns never read this. */
         if (hooks_patched) {
             hooks_patched = 0;
-            restore_hook_bytes(can_send_fn,      orig_can_send);
             restore_hook_bytes(midi_dispatch_fn, orig_dispatch);
         }
-        printk(KERN_INFO "midi_inject: %s unloading, hooks removed (free deferred)\n",
+        printk(KERN_INFO "midi_inject: %s unloading, hook removed (free deferred)\n",
                mod->name);
     }
     return NOTIFY_OK;
@@ -652,45 +679,7 @@ static void *find_port_object(void)
 }
 
 /* ------------------------------------------------------------------ */
-/*  Block 5 ring setup (SysEx responses)                              */
-/* ------------------------------------------------------------------ */
-
-static int setup_ring(void)
-{
-    uint32_t port0_q100, container_kva, blk4_data_kva;
-    uint32_t *q;
-
-    if (ports_array[0] < 0x40000000) return -ENODEV;
-
-    port0_q100 = *(uint32_t *)((uint8_t *)(unsigned long)ports_array[0] + 0x100);
-    if (port0_q100 < 0x80000000) return -ENODEV;
-
-    container_kva = port0_q100;
-    q = (uint32_t *)(unsigned long)(container_kva + 0x190);
-
-    printk(KERN_INFO "midi_inject: container=0x%08x queue@%p blk=%u mask=0x%x wpos=%u\n",
-           container_kva, q, q[0], q[2], q[3]);
-
-    if (q[0] != 5 || q[2] != 0x7F) {
-        printk(KERN_ERR "midi_inject: unexpected Block 5 queue (blk=%u mask=0x%x)\n",
-               q[0], q[2]);
-        return -EINVAL;
-    }
-
-    hw_queue = q;
-    hw_mask  = q[2];
-
-    blk4_data_kva = *(uint32_t *)((uint8_t *)(unsigned long)ports_array[0] + 0x104);
-    hw_data = (uint8_t *)(unsigned long)(blk4_data_kva - 0x80);
-
-    ring_cursor = q[3];
-
-    printk(KERN_INFO "midi_inject: blk5 data=%p mask=0x%x\n", hw_data, hw_mask);
-    return 0;
-}
-
-/* ------------------------------------------------------------------ */
-/*  /proc/.midi_ring — unified MIDI out (dispatcher hook + Block 5)   */
+/*  /proc/.midi_ring — MIDI out captured via the ReadNextMessage hook  */
 /* ------------------------------------------------------------------ */
 
 static ssize_t ring_fops_read(struct file *file, char __user *buf,
@@ -702,10 +691,8 @@ static ssize_t ring_fops_read(struct file *file, char __user *buf,
     uint32_t wpos, avail;
     size_t take, i;
 
-    /* Drain Block 5 (Korg internal SysEx) into unified ring */
-    drain_blk5_to_uni();
-
-    /* Read from unified ring */
+    /* The dispatch hook (hook_read_next_msg) fills uni_ring asynchronously; here we
+     * just hand the reader whatever is buffered. */
     spin_lock_irqsave(&uni_lock, flags);
     wpos  = uni_wpos;
     avail = wpos - uni_rpos;
@@ -729,16 +716,9 @@ static ssize_t ring_fops_write(struct file *file, const char __user *buf,
                                size_t count, loff_t *ppos)
 {
     unsigned long flags;
-    uint32_t wpos;
 
-    /* Reset Block 5 cursor to current write position */
-    spin_lock(&ring_lock);
-    if (!ring_dead && hw_queue &&
-        !probe_kernel_read(&wpos, &hw_queue[3], sizeof(wpos)))
-        ring_cursor = wpos;
-    spin_unlock(&ring_lock);
-
-    /* Reset unified ring read cursor */
+    /* A write to /proc/.midi_ring means "reset my read cursor" — midi_tcp does this
+     * on a new client connection so it starts from live output, not a backlog. */
     spin_lock_irqsave(&uni_lock, flags);
     uni_rpos = uni_wpos;
     spin_unlock_irqrestore(&uni_lock, flags);
@@ -753,15 +733,46 @@ static const struct file_operations ring_fops = {
 };
 
 /* ------------------------------------------------------------------ */
+/*  /proc/.midi_ports — diagnostic out-port topology (read-only)       */
+/* ------------------------------------------------------------------ */
+/* cat /proc/.midi_ports after playing keys / moving controls to see which
+ * CSTGMidiOutPort carries what.  Immune to dmesg rotation.  The '*' marks the
+ * port currently being captured (auto-locked or capture_port_idx). */
+static int ports_read_proc(char *page, char **start, off_t off,
+                           int count, int *eof, void *data)
+{
+    int len = 0, i;
+    len += sprintf(page + len,
+                   "capture_port_idx=%d  auto_locked=%p  ports_seen=%d\n",
+                   capture_port_idx, capture_port, nseen_ports);
+    for (i = 0; i < nseen_ports; i++) {
+        int captured = (capture_port_idx >= 0) ? (i == capture_port_idx)
+                                               : (seen_ports[i] == capture_port);
+        len += sprintf(page + len,
+                       "%c port[%d]=%p calls=%u notes=%u cc=%u first=%02x %02x %02x\n",
+                       captured ? '*' : ' ', i, seen_ports[i],
+                       port_calls[i], port_notes[i], port_ccs[i],
+                       port_first[i][0], port_first[i][1], port_first[i][2]);
+    }
+    if (nseen_ports == 0)
+        len += sprintf(page + len, "(no out-ports seen yet — play keys / move controls)\n");
+    *eof = 1;
+    return len;
+}
+
+/* ------------------------------------------------------------------ */
 /*  /proc/.midi_in — MIDI injection                                    */
 /* ------------------------------------------------------------------ */
+
+#define MIDI_INJECT_MAX 4096
 
 static int midi_write(struct file *f, const char __user *buf,
                       unsigned long count, void *data)
 {
     receive_fn_t fn;
     void *obj;
-    int len = count > sizeof(midi_buf) ? sizeof(midi_buf) : count;
+    uint8_t *kbuf;
+    int len = count > MIDI_INJECT_MAX ? MIDI_INJECT_MAX : count;
 
     spin_lock(&ring_lock);
     if (ring_dead || !port_obj || !receive_fn) {
@@ -772,9 +783,24 @@ static int midi_write(struct file *f, const char __user *buf,
     obj = port_obj;
     spin_unlock(&ring_lock);
 
-    if (copy_from_user(midi_buf, buf, len)) return -EFAULT;
+    /* Per-call buffer, NOT a shared static one.  /proc/.midi_in is mode 0666, so
+     * two processes can write concurrently; a single shared buffer would let one
+     * writer's copy_from_user overwrite another's mid-message and hand OA a torn
+     * multi-byte MIDI/SysEx frame.  This is process context, so a GFP_KERNEL
+     * kmalloc is safe and each call gets its own isolated buffer. */
+    if (len <= 0)
+        return count;
+    kbuf = kmalloc(len, GFP_KERNEL);
+    if (!kbuf)
+        return -ENOMEM;
 
-    fn(obj, midi_buf, len);
+    if (copy_from_user(kbuf, buf, len)) {
+        kfree(kbuf);
+        return -EFAULT;
+    }
+
+    fn(obj, kbuf, len);
+    kfree(kbuf);
     return count;
 }
 
@@ -782,45 +808,40 @@ static int midi_write(struct file *f, const char __user *buf,
 /*  Module init / exit                                                 */
 /* ------------------------------------------------------------------ */
 
-static int __init midi_inject_init(void)
-{
-    int ret;
-    int have_ring = 0;
+/* ------------------------------------------------------------------ */
+/*  Deferred setup worker                                              */
+/* ------------------------------------------------------------------ */
+/*
+ * Everything below runs in a workqueue worker, NOT in init_module context.
+ * This mirrors vkbd.c and obeys the project's RTAI rule: on the Kronos kernel
+ * both the GFP_KERNEL page allocation that install_hook()->__get_free_page()
+ * needs AND create_proc_entry() fail when called directly from init_module,
+ * and set_memory_x()'s synchronous cross-CPU TLB-flush IPI (cpa_flush_range ->
+ * on_each_cpu(...,1)) can spin forever while the RT domain is still coming up on
+ * the early non-rooted boot path — the documented freeze at midi_inject.c's
+ * BOOT-FREEZE HAZARD box.  A workqueue worker runs in process context after RT
+ * has settled, which gives it (a) full GFP_KERNEL, (b) a safe IPI (the very same
+ * reasoning free_trampoline() relies on to defer set_memory_nx to module_exit),
+ * and (c) removes the last init_module-context IPI on the box.  screenremote.c
+ * already treats /proc/.midi_in openability — not the init_module return — as
+ * the success signal, so this deferral needs no daemon-side change.
+ */
+static struct work_struct midi_work;
 
-    printk(KERN_INFO "midi_inject: receive=0x%lx register=0x%lx dispatch=0x%lx can_send=0x%lx\n",
-           receive_fn, register_fn, midi_dispatch_fn, can_send_fn);
+static void midi_setup(struct work_struct *work)
+{
+    int have_out = 0;
 
     /* MIDI IN injection — port discovery uses a bytecode pattern in RegisterMidiInPort
      * that is specific to the compiled OA.ko.  If it fails (different OS or model),
-     * degrade gracefully: output capture hooks still load. */
+     * degrade gracefully: output capture still loads. */
     if (receive_fn && register_fn) {
         port_obj = find_port_object();
-        if (!port_obj) {
+        if (!port_obj)
             printk(KERN_WARNING "midi_inject: port discovery failed (pattern mismatch?) "
                    "— MIDI IN injection unavailable, output capture unaffected\n");
-        } else {
-            ret = setup_ring();
-            if (ret < 0)
-                printk(KERN_WARNING "midi_inject: Block 5 ring setup failed (%d)\n", ret);
-            else
-                have_ring = 1;
-        }
     } else {
         printk(KERN_WARNING "midi_inject: receive_fn/register_fn not set — MIDI IN unavailable\n");
-    }
-
-    /* CanSend hook: forces USB MIDI output thread to always call ReadNextMessage,
-     * even without a USB host.  Falls back gracefully — USB submission fails silently
-     * when no host is present, which is normal operation for the Kronos.
-     * Symbol is in KorgUsbAudioDriver.ko; if not found on this model the hook
-     * is simply skipped and ReadNextMessage only fires when USB host is connected. */
-    if (can_send_fn) {
-        /* No hardcoded prologue for KorgUsbMidiOutputCanSend (varies by driver
-         * build); rely on the generic not-a-function-entry guard in install_hook.
-         * This hook runs from Linux context, so a bad target is less catastrophic
-         * than the RT-context dispatch hook below. */
-        install_hook(can_send_fn, hook_can_send, &tramp_can_send,
-                     orig_can_send, sizeof(orig_can_send), NULL, 0);
     }
 
     if (midi_dispatch_fn) {
@@ -837,31 +858,31 @@ static int __init midi_inject_init(void)
         if (install_hook(midi_dispatch_fn, hook_read_next_msg,
                          &tramp_dispatch, orig_dispatch, sizeof(orig_dispatch),
                          rnm_prologue, sizeof(rnm_prologue)) == 0)
-            have_ring = 1;
+            have_out = 1;
         else
             printk(KERN_WARNING "midi_inject: ReadNextMessage hook failed\n");
+    } else {
+        printk(KERN_WARNING "midi_inject: midi_dispatch_fn not set — MIDI OUT capture unavailable\n");
     }
 
-    /* From here on this function must NEVER return a negative value, no matter
-     * what failed above.  Confirmed against kernel/module.c: when a directly
-     * init_module(2)-loaded module's init() returns < 0, sys_init_module()'s
-     * error path runs unconditionally —
-     *   mod->state = MODULE_STATE_GOING; synchronize_sched(); module_put(mod);
-     * — and module_put(mod) is called on THIS module.  Because this .ko is
-     * cross-compiled against headers that don't match the real Korg/RTAI
-     * struct-module ABI (patch_init_offset.py only corrects the `init`
-     * function-pointer relocation, not the rest of the struct/section layout),
-     * mod->refptr does not live where module_put() expects, so the percpu
-     * dereference faults on a garbage pointer — an instant oops in
-     * module_put+0x24 that kills the calling process (screenremote) before it
-     * can clear its .boot recovery flag, forcing a full extra reboot with every
-     * kernel module disabled.  There is no safe negative return from an
-     * embedded-buffer init_module() load on this kernel, so — exactly like
-     * vkbd_init(), which always returns 0 and pushes all real setup into
-     * schedule_work() — every failure below degrades instead of aborting.
-     * screenremote.c already treats /proc/.midi_in's openability as the real
-     * success signal rather than the init_module(2) return code. */
-    if (!have_ring && !tramp_can_send)
+    /* Every failure above degrades instead of aborting — this worker is void and
+     * cannot fail the module load.  Deferring all setup here also makes init
+     * trivially return 0 (see midi_inject_init), and screenremote.c keys off
+     * /proc/.midi_in openability as the real success signal, not the init_module(2)
+     * return code.
+     *
+     * Historical note on why never-return-negative is treated as load-bearing: a
+     * negative init_module(2) return triggers module_put() on THIS .ko, and when
+     * this module was built against vanilla 2.6.32 headers whose struct-module
+     * layout didn't match the real Korg/RTAI ABI, mod->refptr sat at the wrong
+     * offset and that module_put() faulted (oops in module_put+0x24), killing
+     * screenremote before it could clear its .boot recovery flag.  The current
+     * build is against /home/build/linux-kronos, which reproduces the real layout
+     * (patch_init_offset.py no-ops — "Already at correct offset 0xd4" at build),
+     * so that specific fault no longer applies.  The void-worker/return-0 design
+     * stays regardless: it mirrors vkbd and is the right shape independent of the
+     * ABI detail. */
+    if (!have_out)
         printk(KERN_WARNING "midi_inject: no output path active — "
                "MIDI OUT unavailable, IN injection unaffected\n");
 
@@ -871,29 +892,56 @@ static int __init midi_inject_init(void)
     else
         printk(KERN_ERR "midi_inject: create_proc_entry(.midi_in) failed\n");
 
-    if (have_ring) {
+    if (have_out) {
         proc_midi_ring = create_proc_entry(".midi_ring", 0666, NULL);
         if (proc_midi_ring)
             proc_midi_ring->proc_fops = &ring_fops;
+
+        proc_midi_ports = create_proc_entry(".midi_ports", 0444, NULL);
+        if (proc_midi_ports)
+            proc_midi_ports->read_proc = ports_read_proc;
     }
 
-    if (tramp_can_send || tramp_dispatch)
+    if (tramp_dispatch)
         hooks_patched = 1;
 
+    /* Register the OA/loadmod-unload notifier ONLY now, after the hook is patched
+     * and hooks_patched is set.  Arming it earlier (e.g. from init while this
+     * worker is still pending) would leave a window where a "Preparing to Install"
+     * OA teardown finds hooks_patched==0, restores nothing, and this worker then
+     * patches already-freed OA .text. */
     register_module_notifier(&midi_nb);
 
-    printk(KERN_INFO "midi_inject: ready — port=%p blk5=%s can_send=%s dispatch=%s "
-           "midi_in=%s\n",
+    printk(KERN_INFO "midi_inject: ready — port=%p dispatch=%s midi_in=%s\n",
            port_obj,
-           hw_data        ? "ok" : "none",
-           tramp_can_send ? "ok" : "none",
            tramp_dispatch ? "ok" : "none",
            proc_midi_in   ? "ok" : "none");
+}
+
+static int __init midi_inject_init(void)
+{
+    printk(KERN_INFO "midi_inject: receive=0x%lx register=0x%lx dispatch=0x%lx\n",
+           receive_fn, register_fn, midi_dispatch_fn);
+
+    /* Defer ALL setup (allocation, .text patching, set_memory_x IPI, proc entries)
+     * to process context — see midi_setup().  init itself does the RTAI-safe
+     * minimum and always returns 0: nothing left here can fail, so there is no
+     * negative-return path at all (see midi_setup for the historical module_put
+     * hazard that made always-return-0 load-bearing). */
+    INIT_WORK(&midi_work, midi_setup);
+    schedule_work(&midi_work);
     return 0;
 }
 
 static void __exit midi_inject_exit(void)
 {
+    /* Wait for the deferred setup worker to finish before tearing anything down.
+     * Without this a fast insmod/rmmod could reach the teardown below while the
+     * worker is still mid-install — unregistering a notifier it hasn't registered
+     * yet, or racing a half-built trampoline.  flush guarantees midi_setup() ran
+     * to completion (so the notifier IS registered) or never scheduled. */
+    flush_scheduled_work();
+
     unregister_module_notifier(&midi_nb);
 
     /* If the OA-unload notifier already ran, OA is gone and hooks_patched is 0 —
@@ -901,18 +949,26 @@ static void __exit midi_inject_exit(void)
      * still loaded) restore the bytes and let in-flight hook calls drain. */
     if (hooks_patched) {
         hooks_patched = 0;
-        restore_hook_bytes(can_send_fn,      orig_can_send);
         restore_hook_bytes(midi_dispatch_fn, orig_dispatch);
-        synchronize_rcu();  /* wait for all CPUs to leave the hook paths */
+        /* Best-effort drain of LINUX-context hook callers before this module's
+         * .text is freed.  This does NOT — and cannot — drain the RT-context
+         * ReadNextMessage caller: an RTAI real-time task runs in the ipipe RT
+         * domain and never reports a Linux RCU quiescent state, so synchronize_rcu()
+         * may return while an RT task is still executing inside the hook.  That
+         * un-drainable RT caller is exactly why the trampoline page is leaked. */
+        synchronize_rcu();
     }
 
     ring_disable();
 
-    /* Free trampoline pages here, in process context, where set_memory_nx()'s
-     * IPI is safe (this is why the notifier deferred the free to us). */
-    free_trampoline(&tramp_can_send);
-    free_trampoline(&tramp_dispatch);
+    /* Trampoline pages are deliberately LEAKED, never freed — an RT-context caller
+     * may still be inside a page and no Linux primitive can prove it has left (see
+     * the trampoline-leak note above).  Freeing would be a use-after-free the RCU
+     * drain above only appears to guard, and set_memory_nx()'s IPI would risk the
+     * teardown freeze besides.  ≤2 pages, reclaimed at reboot. */
 
+    if (proc_midi_ports)
+        remove_proc_entry(".midi_ports", NULL);
     if (proc_midi_ring)
         remove_proc_entry(".midi_ring", NULL);
     if (proc_midi_in)

@@ -90,7 +90,7 @@
 #define KBD_EV_KEY  1
 
 /*  Version */
-#define SCREENREMOTE_VERSION "1.7.14"
+#define SCREENREMOTE_VERSION "1.8.0"
 #ifndef BUILD_ID
 #define BUILD_ID "dev"
 #endif
@@ -1116,11 +1116,11 @@ static int sysinfo_collect(char *out, int outsz)
 /* MIDI helpers */
 
 static void resolve_kallsyms(unsigned long *recv_fn,    unsigned long *reg_fn,
-                              unsigned long *dispatch_fn, unsigned long *can_send_fn)
+                              unsigned long *dispatch_fn)
 {
     FILE *f = fopen("/proc/kallsyms", "r");
     char line[256];
-    *recv_fn = *reg_fn = *dispatch_fn = *can_send_fn = 0;
+    *recv_fn = *reg_fn = *dispatch_fn = 0;
     if (!f) return;
     while (fgets(line, sizeof(line), f)) {
         unsigned long addr; char type, name[256];
@@ -1128,8 +1128,7 @@ static void resolve_kallsyms(unsigned long *recv_fn,    unsigned long *reg_fn,
         if      (!*recv_fn     && strstr(name, "MidiInPortGeneric7Receive"))   *recv_fn     = addr;
         else if (!*reg_fn      && strstr(name, "RegisterMidiInPort"))          *reg_fn      = addr;
         else if (!*dispatch_fn && strstr(name, "ReadNextMessageEPhj"))         *dispatch_fn = addr;
-        else if (!*can_send_fn && strstr(name, "KorgUsbMidiOutputCanSend"))    *can_send_fn = addr;
-        if (*recv_fn && *reg_fn && *dispatch_fn && *can_send_fn) break;
+        if (*recv_fn && *reg_fn && *dispatch_fn) break;
     }
     fclose(f);
 }
@@ -1940,6 +1939,28 @@ static pid_t start_kmsg_drainer(void)
     _exit(0);                    /* unreachable */
 }
 
+/* Reap the forked helper children (kmsg drainer + midi_tcp capture) before an
+ * EARLY exit from main().  The normal shutdown path at the bottom of main already
+ * does this, but the early "return 1" paths (fb1 never appears, malloc failure,
+ * bind failure) run AFTER both children are forked and would otherwise orphan
+ * them to init: the drainer rewrites boot_kmsg.log every 150 ms forever, and a
+ * stray midi_tcp keeps port 9875 and a /proc/.midi_ring reader open — and because
+ * the ring read advances a single global cursor, a second reader steals the
+ * first's MIDI bytes.  kmsg_pid is main-local so it is passed in; midi_cap_pid is
+ * a file-scope global. */
+static void stop_helper_children(pid_t kmsg_pid)
+{
+    if (kmsg_pid > 0) {
+        kill(kmsg_pid, SIGTERM);
+        waitpid(kmsg_pid, NULL, 0);
+    }
+    if (midi_cap_pid > 0) {
+        kill(midi_cap_pid, SIGTERM);
+        waitpid(midi_cap_pid, NULL, 0);
+        midi_cap_pid = -1;
+    }
+}
+
 /*  Main */
 int main(void)
 {
@@ -2045,7 +2066,7 @@ int main(void)
     /* Load MIDI injection module */
     if (load_mods && !boot_flag_found) {
         unsigned long recv_fn = 0, reg_fn = 0;
-        unsigned long dispatch_fn = 0, can_send_fn = 0;
+        unsigned long dispatch_fn = 0;
 
         /* midi_inject reads OA symbol addresses and patches OA .text.  It MUST NOT
          * be loaded while OA is still MODULE_STATE_COMING ("OA(P+)" in the oops
@@ -2063,13 +2084,12 @@ int main(void)
             goto midi_done;
         }
 
-        resolve_kallsyms(&recv_fn, &reg_fn, &dispatch_fn, &can_send_fn);
-        if (dispatch_fn || can_send_fn) {
+        resolve_kallsyms(&recv_fn, &reg_fn, &dispatch_fn);
+        if (dispatch_fn) {
             char params[512];
             snprintf(params, sizeof(params),
-                     "receive_fn=0x%lx register_fn=0x%lx "
-                     "midi_dispatch_fn=0x%lx can_send_fn=0x%lx",
-                     recv_fn, reg_fn, dispatch_fn, can_send_fn);
+                     "receive_fn=0x%lx register_fn=0x%lx midi_dispatch_fn=0x%lx",
+                     recv_fn, reg_fn, dispatch_fn);
             extract_ko(MIDI_INJECT_KO, midi_inject_ko, midi_inject_ko_len);
             long ret = syscall(SYS_init_module,
                                (void *)midi_inject_ko,
@@ -2084,12 +2104,11 @@ int main(void)
                  * /proc/.midi_in's openability below is the real signal, so
                  * g_midi_loaded is set from that, not from ret. */
                 fprintf(stderr, "screenremote: midi_inject %s "
-                        "(recv=%s reg=%s dispatch=%s can_send=%s)\n",
+                        "(recv=%s reg=%s dispatch=%s)\n",
                         ret == 0 ? "loaded" : "already loaded",
                         recv_fn      ? "ok" : "none",
                         reg_fn       ? "ok" : "none",
-                        dispatch_fn  ? "ok" : "none",
-                        can_send_fn  ? "ok" : "none");
+                        dispatch_fn  ? "ok" : "none");
 
                 for (int _mi = 0; _mi < 20 && midi_in_fd < 0; _mi++) {
                     usleep(100000);
@@ -2119,14 +2138,14 @@ int main(void)
             usleep(100000);
         }
     }
-    if (fb1_open() < 0) return 1;
+    if (fb1_open() < 0) { stop_helper_children(kmsg_pid); return 1; }
 
     shadow = malloc(frame_bytes);
-    if (!shadow) { perror("malloc shadow"); return 1; }
+    if (!shadow) { perror("malloc shadow"); stop_helper_children(kmsg_pid); return 1; }
     staging = malloc(frame_bytes);
-    if (!staging) { perror("malloc staging"); return 1; }
+    if (!staging) { perror("malloc staging"); stop_helper_children(kmsg_pid); return 1; }
     rle_buf = malloc(frame_bytes * 2);
-    if (!rle_buf) { perror("malloc rle_buf"); return 1; }
+    if (!rle_buf) { perror("malloc rle_buf"); stop_helper_children(kmsg_pid); return 1; }
 
     check_mirror_flag();
 
@@ -2144,6 +2163,7 @@ int main(void)
         if (stream_listen < 0 || ctrl_listen < 0) {
             fprintf(stderr, "screenremote: failed to bind stream=%d ctrl=%d - change ports in %s\n",
                     g_stream_port, g_ctrl_port, CFG_PATH);
+            stop_helper_children(kmsg_pid);
             return 1;
         }
         g_bound_ip = lan_ip;

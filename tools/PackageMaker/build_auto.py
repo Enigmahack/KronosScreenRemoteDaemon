@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
-"""One-shot RELEASE build -- reads version from first argument (default 1.5.4).
+"""One-shot ScreenRemote package build.
 
-Release builds leave the GRUB menu untouched (factory timeout=0 + hiddenmenu) and
-write no on-device diagnostics.  Use build_auto_debug.py for a visible menu and
-FTP-readable install/boot logs while validating a new version.
+Usage:  build_auto.py [VERSION] [--debug]
+
+  VERSION   package version (default 1.5.4).
+  --debug   Debug build: makes the GRUB menu visible (timeout=5, hiddenmenu
+            removed) so a bad boot can be observed and a good entry selected by
+            hand, and writes FTP-readable install/boot diagnostics to
+            /korg/rw/HD/ScreenRemote/.  Without --debug this is a RELEASE build:
+            the GRUB menu is left untouched (factory timeout=0 + hiddenmenu) and
+            no on-device diagnostics are written.  Ship the release build once a
+            version is validated.
 """
-import sys, shutil
+import argparse, sys, shutil
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from build_package import (
@@ -14,10 +21,19 @@ from build_package import (
     _auto_detect_commands, _MD5SUM_PAYLOAD_REL, _DISPLAY_MSG_PAYLOAD_REL,
 )
 
-DEBUG       = False
+_ap = argparse.ArgumentParser(prog="build_auto.py",
+                              description="One-shot ScreenRemote package build.")
+_ap.add_argument("version", nargs="?", default="1.5.4",
+                 help="package version (default 1.5.4)")
+_ap.add_argument("--debug", action="store_true",
+                 help="debug build: visible GRUB menu (timeout=5, hiddenmenu removed) "
+                      "+ FTP-readable diagnostics in /korg/rw/HD/ScreenRemote/")
+_args = _ap.parse_args()
+
+DEBUG       = _args.debug
 pkg_name    = "ScreenRemote"
 pkg_name_id = "ScreenRemote"
-version     = sys.argv[1] if len(sys.argv) > 1 else "1.5.4"
+version     = _args.version
 debug_log   = "/korg/rw/HD/ScreenRemote/kronosmods_boot.log" if DEBUG else ""
 payload_dir = Path(__file__).parent / "payload"
 

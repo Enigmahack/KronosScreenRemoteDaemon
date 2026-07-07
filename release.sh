@@ -9,6 +9,27 @@ PACKAGER_DIR="$REPO_ROOT/tools/PackageMaker"
 DIST_DIR="$PACKAGER_DIR/dist"
 
 # --------------------------------------------------------------------------
+# Build mode: release (default) or debug (--debug).  A debug build produces a
+# visible GRUB menu + FTP-readable on-device diagnostics (via build_auto.py
+# --debug) and labels its zip/title/output _debug so it is never mistaken for a
+# release.  release.sh takes no other arguments (VERSION comes from source).
+# --------------------------------------------------------------------------
+DEBUG=0
+for _arg in "$@"; do
+    case "$_arg" in
+        --debug)   DEBUG=1 ;;
+        -h|--help) echo "Usage: $0 [--debug]"; exit 0 ;;
+        *) echo "ERROR: unknown argument '$_arg' (expected --debug)" >&2
+           echo "Usage: $0 [--debug]" >&2; exit 1 ;;
+    esac
+done
+if [ "$DEBUG" = 1 ]; then
+    MODE_LC="debug";   MODE_TC="Debug";   ZIP_SUFFIX="_debug"; TITLE_SUFFIX="_Debug"; DEBUG_FLAG="--debug"
+else
+    MODE_LC="release"; MODE_TC="Release"; ZIP_SUFFIX="";       TITLE_SUFFIX="";       DEBUG_FLAG=""
+fi
+
+# --------------------------------------------------------------------------
 # 0. Extract version from screenremote.c
 # --------------------------------------------------------------------------
 VERSION=$(sed -n 's/.*SCREENREMOTE_VERSION "\([^"]*\)".*/\1/p' "$SOURCE_DIR/screenremote.c")
@@ -16,11 +37,11 @@ if [ -z "$VERSION" ]; then
     echo "ERROR: could not extract SCREENREMOTE_VERSION from screenremote.c" >&2
     exit 1
 fi
-echo "=== ScreenRemoteDaemon release v${VERSION} ==="
+echo "=== ScreenRemoteDaemon ${MODE_LC} v${VERSION} ==="
 
 PKG_ID="ScreenRemote_${VERSION//./_}"
 UNINST_ID="${PKG_ID}_Uninstall"
-ZIP_NAME="ScreenRemoteDaemon_${VERSION}.zip"
+ZIP_NAME="ScreenRemoteDaemon_${VERSION}${ZIP_SUFFIX}.zip"
 
 # --------------------------------------------------------------------------
 # 1. Build screenremote binary (delegates to source/Makefile which builds
@@ -83,6 +104,7 @@ PYEOF
 
 # --------------------------------------------------------------------------
 # 2. Copy built binary into PackageMaker payload and run build_auto.py
+#    (adds --debug in debug mode: visible GRUB menu + on-device diagnostics)
 # --------------------------------------------------------------------------
 echo ""
 echo "--- Step 2: Building deployment package ---"
@@ -92,7 +114,7 @@ cp "$BUILD_DIR/screenremote" "$PAYLOAD_BIN"
 echo "  Payload updated"
 
 rm -rf "${DIST_DIR:?}/${PKG_ID}" "${DIST_DIR:?}/${UNINST_ID}"
-python3 "$PACKAGER_DIR/build_auto.py" "$VERSION"
+python3 "$PACKAGER_DIR/build_auto.py" "$VERSION" ${DEBUG_FLAG}
 
 if [ ! -d "$DIST_DIR/$PKG_ID" ] || [ ! -d "$DIST_DIR/$UNINST_ID" ]; then
     echo "ERROR: PackageMaker did not produce expected output" >&2
@@ -157,7 +179,7 @@ if ! gh auth status &>/dev/null; then
     echo "  Then create the release manually:"
     echo ""
     echo "    gh release create $TAG '${DIST_DIR}/${ZIP_NAME}' \\"
-    echo "      --repo $REPO --title 'ScreenRemoteDaemon $TAG' \\"
+    echo "      --repo $REPO --title 'ScreenRemoteDaemon${TITLE_SUFFIX} $TAG' \\"
     echo "      --generate-notes --draft"
     echo ""
     echo "=== Build complete (zip ready, GitHub release skipped) ==="
@@ -170,11 +192,11 @@ if gh release view "$TAG" --repo "$REPO" &>/dev/null 2>&1; then
 else
     gh release create "$TAG" "$DIST_DIR/$ZIP_NAME" \
         --repo "$REPO" \
-        --title "ScreenRemoteDaemon ${TAG}" \
+        --title "ScreenRemoteDaemon${TITLE_SUFFIX} ${TAG}" \
         --generate-notes \
         --draft
     echo "  Draft release created: $TAG"
 fi
 
 echo ""
-echo "=== Release v${VERSION} complete ==="
+echo "=== ${MODE_TC} v${VERSION} complete ==="
