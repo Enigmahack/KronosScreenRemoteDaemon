@@ -2,7 +2,8 @@
 
 > **USE AT YOUR OWN RISK**
 
-> This software is not affiliated with Korg in any way, and while it may be stable with tested versions of the Korg Kronos OS (3.2.0 - 3.2.2), it may add additional risk to the stability of your Korg Kronos. 
+> This software is not affiliated with Korg in any way, and while we have validated it functions correctly with OS 3.2, and some testing has been done with 3.1 and 3.0, we cannot 100% guarantee it will function in every circumstance, though it should. 
+>
 > It is distributed **as-is**, without any express or implied warranty of any kind, including but not limited to warranties of merchantability, fitness for a particular purpose, or non-infringement. The authors and contributors make no guarantees regarding stability, correctness, security, or suitability for any use case.
 >
 > **No support is offered or implied.** There is no commitment to fix bugs, respond to issues, or maintain compatibility with any hardware or software version. Use of this software is entirely at your own risk. The authors accept no liability for any damage to hardware, data loss, or any other consequence - direct or indirect - arising from the use or misuse of this software.
