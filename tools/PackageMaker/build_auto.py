@@ -45,7 +45,7 @@ install_cmds = [
     for path in daemon_paths
 ]
 
-# vkbd.ko / midi_inject.ko are embedded in the screenremote binary and loaded via
+# vkbd.ko / midi_bridge.ko are embedded in the screenremote binary and loaded via
 # init_module(2).  Do NOT rmmod them here: busybox rmmod reads /proc/modules, and
 # reading /proc/modules OOPSES this kernel whenever OA is loaded — module_refcount
 # faults on OA's per-cpu refptr because OA is brought up by loadmod's custom

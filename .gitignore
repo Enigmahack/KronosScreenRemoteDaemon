@@ -29,7 +29,7 @@ midi_module/modpost_local
 
 # Generated headers (produced by Makefile / Makefile.module via xxd)
 source/vkbd_ko.h
-source/midi_inject_ko.h
+source/midi_bridge_ko.h
 source/midi_tcp_bin.h
 
 # PackageMaker generated packages and payload binaries

@@ -71,7 +71,7 @@ def _make_cleaner_posttar(debug: bool = False) -> str:
         f"echo 'cleaner: precondition OK (/sbin/init + /etc/inittab)' >> {diag_dir}/cleaner_diag.txt",
         "",
         "# -- Stop non-factory processes and unload modules --",
-        "# screenremote unloads midi_inject + vkbd ITSELF via delete_module(2) on",
+        "# screenremote unloads midi_bridge + vkbd ITSELF via delete_module(2) on",
         "# SIGTERM (restores OA's patched .text, frees trampolines).  Do NOT rmmod:",
         "# busybox rmmod reads /proc/modules, and reading /proc/modules OOPSES this",
         "# kernel whenever OA is loaded (module_refcount faults on OA's per-cpu",

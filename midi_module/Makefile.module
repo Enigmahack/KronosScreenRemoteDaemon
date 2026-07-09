@@ -1,5 +1,5 @@
 # /home/build/linux-kronos is Korg's actual kernel source (cgudrian/linux-kronos,
-# built with korg_kronos_defconfig) — verified to produce byte-accurate struct
+# built with korg_kronos_defconfig) - verified to produce byte-accurate struct
 # module layouts against real Korg .ko files. See ../../project_linux_kronos_kernel_tree.md.
 # The vanilla ../../linux-2.6.32.11 tree does NOT match the real kernel's struct
 # layout beyond the one field patch_init_offset.py hand-patches; that script stays
@@ -7,12 +7,12 @@
 KDIR   ?= /home/build/linux-kronos
 PWD    := $(shell pwd)
 PATCH  := ../patch_init_offset.py
-KO_HDR := ../source/midi_inject_ko.h
+KO_HDR := ../source/midi_bridge_ko.h
 
 all:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
-	python3 $(PATCH) midi_inject.ko
-	xxd -i midi_inject.ko $(KO_HDR)
+	python3 $(PATCH) midi_bridge.ko
+	xxd -i midi_bridge.ko $(KO_HDR)
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean

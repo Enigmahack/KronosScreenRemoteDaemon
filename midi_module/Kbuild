@@ -1,2 +1,2 @@
-obj-m += midi_inject.o
+obj-m += midi_bridge.o
 EXTRA_CFLAGS := -fno-pic -fno-PIE -fno-common -include $(src)/../source/no_tracepoints.h

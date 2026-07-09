@@ -52,7 +52,7 @@
  *
  * Boot-safety: /korg/rw/HD/ScreenRemote/.boot is written at startup and deleted only once the
  * framebuffer, network, and listeners are all up.  If it exists on entry the previous boot did not
- * complete cleanly, so midi_inject is skipped for that boot.  Delete the file over FTP to re-enable.
+ * complete cleanly, so midi_bridge is skipped for that boot.  Delete the file over FTP to re-enable.
  */
 
 #include <stdio.h>
@@ -82,7 +82,7 @@
 #include <sys/syscall.h>
 #include "palette_data.h"
 #include "vkbd_ko.h"
-#include "midi_inject_ko.h"
+#include "midi_bridge_ko.h"
 #include "midi_tcp_bin.h"
 
 /*  Keyboard injection (uinput fallback) */
@@ -90,7 +90,7 @@
 #define KBD_EV_KEY  1
 
 /*  Version */
-#define SCREENREMOTE_VERSION "1.8.1"
+#define SCREENREMOTE_VERSION "1.9.1"
 #ifndef BUILD_ID
 #define BUILD_ID "dev"
 #endif
@@ -98,7 +98,7 @@
 /* Config */
 #define SCREENREMOTE_DIR  "/korg/rw/screenremote"
 #define VKBD_KO           SCREENREMOTE_DIR "/vkbd.ko"
-#define MIDI_INJECT_KO    SCREENREMOTE_DIR "/midi_inject.ko"
+#define MIDI_BRIDGE_KO    SCREENREMOTE_DIR "/midi_bridge.ko"
 #define MIDI_TCP_BIN      SCREENREMOTE_DIR "/midi_tcp"
 
 #define FB_SRC       "/dev/fb1"
@@ -876,11 +876,11 @@ static void inject_touch(int type, int x, int y)
 /* Embedded .ko extraction */
 static void extract_ko(const char *path, const unsigned char *data, unsigned int len)
 {
-    /* Always unlink then rewrite — do NOT skip on a size match.  A size-only skip
+    /* Always unlink then rewrite - do NOT skip on a size match.  A size-only skip
      * silently shipped a STALE binary whenever a rebuild changed behaviour without
      * changing the static binary's byte count (e.g. a small logic tweak to midi_tcp
      * that the -static link rounds to the same size): the daemon kept exec'ing the
-     * old midi_tcp and the fix never ran.  unlink() first also dodges ETXTBSY — if
+     * old midi_tcp and the fix never ran.  unlink() first also dodges ETXTBSY - if
      * an orphaned midi_tcp child from a previous screenremote still has this file
      * mmap'd as its executable, open(O_TRUNC) on it would fail; unlinking drops the
      * directory entry (the running process keeps its old inode) so the new file
@@ -1123,19 +1123,19 @@ static int sysinfo_collect(char *out, int outsz)
 /* MIDI helpers */
 
 static void resolve_kallsyms(unsigned long *recv_fn,    unsigned long *reg_fn,
-                              unsigned long *dispatch_fn)
+                              unsigned long *outport_fn)
 {
     FILE *f = fopen("/proc/kallsyms", "r");
     char line[256];
-    *recv_fn = *reg_fn = *dispatch_fn = 0;
+    *recv_fn = *reg_fn = *outport_fn = 0;
     if (!f) return;
     while (fgets(line, sizeof(line), f)) {
         unsigned long addr; char type, name[256];
         if (sscanf(line, "%lx %c %255s", &addr, &type, name) != 3) continue;
         if      (!*recv_fn     && strstr(name, "MidiInPortGeneric7Receive"))   *recv_fn     = addr;
         else if (!*reg_fn      && strstr(name, "RegisterMidiInPort"))          *reg_fn      = addr;
-        else if (!*dispatch_fn && strstr(name, "ReadNextMessageEPhj"))         *dispatch_fn = addr;
-        if (*recv_fn && *reg_fn && *dispatch_fn) break;
+        else if (!*outport_fn  && strstr(name, "RegisterMidiOutPort"))         *outport_fn  = addr;
+        if (*recv_fn && *reg_fn && *outport_fn) break;
     }
     fclose(f);
 }
@@ -1147,12 +1147,12 @@ static void resolve_kallsyms(unsigned long *recv_fn,    unsigned long *reg_fn,
 
 /* Wait until OA reaches MODULE_STATE_LIVE, read via /sys/module/OA/initstate.
  *
- * midi_inject reads OA symbol addresses and patches OA .text (the MIDI
- * trampolines), so it must only be loaded once OA is fully initialised.
- * Loading it while OA is still COMING - shown as "OA(P+)" in the oops "Modules
- * linked in" list - faults in the module loader (module_put) during
- * init_module.  /proc/.oacmd appears while OA is still COMING, so it is NOT a
- * sufficient gate.
+ * midi_bridge reads OA symbol addresses and OA in-memory objects (the MIDI
+ * in-port array and the out-queue it taps).  Unlike its predecessor it does not
+ * patch OA .text, but it must still only load once OA is fully initialised, or
+ * those objects aren't built yet.  Loading while OA is still COMING - shown as
+ * "OA(P+)" in the oops "Modules linked in" list - reads half-built state.
+ * /proc/.oacmd appears while OA is still COMING, so it is NOT a sufficient gate.
  *
  * CRUCIAL: we must NOT probe module state via /proc/modules on this kernel.
  * Reading it makes m_show() call module_refcount() on every module, which
@@ -1895,8 +1895,8 @@ static int capture_to_staging(void)
  * the FTP-visible HD partition and fsync it.  A forked drainer re-snapshots
  * every 150 ms across the risky init_module() calls: if one wedges the box,
  * the last fsync'd snapshot still holds the printks up to the hang - e.g.
- * whether midi_inject printed "hooked 0x..." (froze in the .text patch / IPI) or
- * "prologue mismatch" (address drift) before the freeze. */
+ * whether midi_bridge printed "out tap ..." / "ready" or a warning before a
+ * freeze, to localise any regression during the risky module-load window. */
 #define BOOT_KMSG_DIR  LOG_DIR
 #define BOOT_KMSG_LOG  BOOT_KMSG_DIR "/boot_kmsg.log"
 
@@ -1951,7 +1951,7 @@ static pid_t start_kmsg_drainer(void)
  * does this, but the early "return 1" paths (fb1 never appears, malloc failure,
  * bind failure) run AFTER both children are forked and would otherwise orphan
  * them to init: the drainer rewrites boot_kmsg.log every 150 ms forever, and a
- * stray midi_tcp keeps port 9875 and a /proc/.midi_ring reader open — and because
+ * stray midi_tcp keeps port 9875 and a /proc/.midi_ring reader open - and because
  * the ring read advances a single global cursor, a second reader steals the
  * first's MIDI bytes.  kmsg_pid is main-local so it is passed in; midi_cap_pid is
  * a file-scope global. */
@@ -2000,7 +2000,7 @@ int main(void)
 
     /* Boot-safety flag: write .boot at startup; delete it only after full successful
      * startup (listeners bound, OS confirmed operational).  If .boot already exists
-     * on entry the previous boot did not complete cleanly - skip midi_inject hooks
+     * on entry the previous boot did not complete cleanly - skip midi_bridge
      * so the unit can recover.  Lives in the FTP-visible log folder
      * (/korg/rw/HD/ScreenRemote/.boot) so the user can remove it over FTP - no
      * shell access needed on an unrooted Kronos - to re-enable MIDI next boot. */
@@ -2030,9 +2030,11 @@ int main(void)
     /* Kill-switch: if the folder /korg/rw/HD/_nomod exists, load NO kernel modules.
      * FTP reaches only /korg/rw/HD, so this folder can be created over FTP
      * (mkdir _nomod) + reboot to bring a unit up with no kernel hooks.  Required to
-     * run a Korg OS update or the cleaner safely (midi_inject's OA .text hooks
-     * otherwise freeze the system when OA is torn down at "Preparing to Install"),
-     * and to recover a wedged unit.  Checked here because this daemon is what loads
+     * run a Korg OS update or the cleaner safely (bring the unit up with no kernel
+     * modules at all), and to recover a wedged unit.  midi_bridge no longer patches
+     * OA .text - its OA-unload notifier just releases its queue reader slot - so
+     * the old "Preparing to Install" teardown freeze is gone; this kill-switch
+     * remains as defense-in-depth.  Checked here because this daemon is what loads
      * the modules (init_module(2) from embedded buffers); a kernel-side FS check is
      * unreliable in init_module context on the RTAI kernel. */
     int load_mods = 1;
@@ -2041,7 +2043,7 @@ int main(void)
         if (stat("/korg/rw/HD/_nomod", &_ns) == 0 && S_ISDIR(_ns.st_mode)) {
             load_mods = 0;
             fprintf(stderr, "screenremote: kill-switch /korg/rw/HD/_nomod present - "
-                    "not loading any kernel modules (vkbd, midi_inject)\n");
+                    "not loading any kernel modules (vkbd, midi_bridge)\n");
         }
     }
 
@@ -2057,7 +2059,7 @@ int main(void)
      * Kronos units. Loading from the embedded buffer avoids any shell or external binary.
      *
      * Gated by !boot_flag_found: if the previous boot didn't complete cleanly we
-     * load NO kernel modules at all this boot (not vkbd, not midi_inject), so the
+     * load NO kernel modules at all this boot (not vkbd, not midi_bridge), so the
      * unit is guaranteed to reach a usable state.  Remove /korg/rw/screenremote/.boot
      * (or fix the cause) to re-enable module loading on the next boot. */
     if (load_mods && !boot_flag_found) {
@@ -2073,49 +2075,46 @@ int main(void)
     /* Load MIDI injection module */
     if (load_mods && !boot_flag_found) {
         unsigned long recv_fn = 0, reg_fn = 0;
-        unsigned long dispatch_fn = 0;
+        unsigned long outport_fn = 0;
 
-        /* midi_inject reads OA symbol addresses and patches OA .text.  It MUST NOT
-         * be loaded while OA is still MODULE_STATE_COMING ("OA(P+)" in the oops
-         * module list): doing so races the module loader and faults in module_put
-         * during init_module, killing the daemon before its init runs (see
-         * troubleshooting/boot_kmsg.log).  On the GRUB-hook boot path screenremote
-         * starts as soon as /proc/.oacmd appears, but that entry is created while
-         * OA is still COMING - so wait here until OA is actually Live.  On the
-         * rooted path OA is already Live when this runs, so the wait returns at
-         * once.  Timeout is generous; if OA never goes Live we skip MIDI rather
-         * than load into an unsafe state. */
+        /* midi_bridge reads OA symbol addresses and OA in-memory objects (the MIDI
+         * in-port array and the out-queue it taps as a reader).  Unlike its
+         * predecessor midi_inject it does NOT patch OA .text, so the old
+         * module_put/.text-patch race is gone - but it still must not run until OA
+         * is fully MODULE_STATE_COMING->Live, or those objects aren't built yet.
+         * On the GRUB-hook boot path screenremote starts as soon as /proc/.oacmd
+         * appears, but that entry is created while OA is still COMING - so wait
+         * here until OA is actually Live.  On the rooted path OA is already Live
+         * when this runs, so the wait returns at once.  Timeout is generous; if OA
+         * never goes Live we skip MIDI rather than read half-built state. */
         if (!wait_for_oa_live(600)) {
             fprintf(stderr, "screenremote: OA not Live after 60s - "
-                    "skipping midi_inject to avoid init_module race\n");
+                    "skipping midi_bridge\n");
             goto midi_done;
         }
 
-        resolve_kallsyms(&recv_fn, &reg_fn, &dispatch_fn);
-        if (dispatch_fn) {
+        resolve_kallsyms(&recv_fn, &reg_fn, &outport_fn);
+        if (outport_fn) {
             char params[512];
             snprintf(params, sizeof(params),
-                     "receive_fn=0x%lx register_fn=0x%lx midi_dispatch_fn=0x%lx",
-                     recv_fn, reg_fn, dispatch_fn);
-            extract_ko(MIDI_INJECT_KO, midi_inject_ko, midi_inject_ko_len);
+                     "receive_fn=0x%lx register_fn=0x%lx regoutport=0x%lx",
+                     recv_fn, reg_fn, outport_fn);
+            extract_ko(MIDI_BRIDGE_KO, midi_bridge_ko, midi_bridge_ko_len);
             long ret = syscall(SYS_init_module,
-                               (void *)midi_inject_ko,
-                               (unsigned long)midi_inject_ko_len,
+                               (void *)midi_bridge_ko,
+                               (unsigned long)midi_bridge_ko_len,
                                params);
             if (ret == 0 || errno == EEXIST) {
-                /* midi_inject_init() always returns 0 to the kernel now (see the
-                 * comment above its final return) - a negative return here would
-                 * crash module_put() on this kernel, so the module degrades
-                 * internally instead of failing the load.  That means "the
-                 * syscall succeeded" no longer implies "MIDI actually works";
-                 * /proc/.midi_in's openability below is the real signal, so
-                 * g_midi_loaded is set from that, not from ret. */
-                fprintf(stderr, "screenremote: midi_inject %s "
-                        "(recv=%s reg=%s dispatch=%s)\n",
+                /* midi_bridge_init() always returns 0 to the kernel (setup is
+                 * deferred to a worker), so "the syscall succeeded" does not imply
+                 * "MIDI actually works"; /proc/.midi_in's openability below is the
+                 * real signal, so g_midi_loaded is set from that, not from ret. */
+                fprintf(stderr, "screenremote: midi_bridge %s "
+                        "(recv=%s reg=%s outport=%s)\n",
                         ret == 0 ? "loaded" : "already loaded",
-                        recv_fn      ? "ok" : "none",
-                        reg_fn       ? "ok" : "none",
-                        dispatch_fn  ? "ok" : "none");
+                        recv_fn     ? "ok" : "none",
+                        reg_fn      ? "ok" : "none",
+                        outport_fn  ? "ok" : "none");
 
                 for (int _mi = 0; _mi < 20 && midi_in_fd < 0; _mi++) {
                     usleep(100000);
@@ -2126,7 +2125,7 @@ int main(void)
                 fprintf(stderr, "screenremote: midi_in=%d capture=%d\n",
                         midi_in_fd >= 0 ? 1 : 0, midi_cap_fd >= 0 ? 1 : 0);
             } else {
-                fprintf(stderr, "screenremote: midi_inject failed (%ld)\n", ret);
+                fprintf(stderr, "screenremote: midi_bridge failed (%ld)\n", ret);
             }
         } else {
             fprintf(stderr, "screenremote: no usable MIDI symbols in kallsyms - MIDI disabled\n");
@@ -2544,7 +2543,7 @@ int main(void)
     if (midi_cap_fd >= 0) { close(midi_cap_fd); midi_cap_fd = -1; }
     if (midi_cap_pid > 0) { kill(midi_cap_pid, SIGTERM); waitpid(midi_cap_pid, NULL, 0); }
     if (g_midi_loaded) {
-        syscall(__NR_delete_module, "midi_inject", O_NONBLOCK);
+        syscall(__NR_delete_module, "midi_bridge", O_NONBLOCK);
         g_midi_loaded = 0;
     }
     syscall(__NR_delete_module, "vkbd", O_NONBLOCK);

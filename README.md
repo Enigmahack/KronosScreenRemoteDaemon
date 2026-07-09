@@ -21,11 +21,11 @@ source/
   screenremote.c            - main daemon source (C99, i686, static)
   midi_tcp.c                - TCP MIDI bridge subprocess (injected into screenremote as embedded binary)
   screenremote.cfg.example  - example config file
-  Makefile                  - builds the screenremote binary (including midi_inject_ko.h and midi_tcp_bin.h)
+  Makefile                  - builds the screenremote binary (including midi_bridge_ko.h and midi_tcp_bin.h)
   palette_data.h            - Kronos display palette table
   no_tracepoints.h          - stub header for kernel tracepoint macros
   vkbd_ko.h                 - generated: embedded vkbd.ko as a C array (do not edit; not committed)
-  midi_inject_ko.h          - generated: embedded midi_inject.ko as a C array (do not edit; not committed)
+  midi_bridge_ko.h          - generated: embedded midi_bridge.ko as a C array (do not edit; not committed)
   midi_tcp_bin.h             - generated: embedded midi_tcp binary as a C array (do not edit; not committed)
 
 vkbd_module/
@@ -35,9 +35,9 @@ vkbd_module/
   vkbd.ko                   - built by Makefile.module (not committed; generated)
 
 midi_module/
-  midi_inject.c             - MIDI injection kernel module source (/proc/.midi_in write, /proc/.midi_ring read)
+  midi_bridge.c             - MIDI injection kernel module source (/proc/.midi_in write, /proc/.midi_ring read)
   Kbuild                    - kernel build descriptor
-  Makefile.module            - builds midi_inject.ko, patches it, then generates midi_inject_ko.h
+  Makefile.module            - builds midi_bridge.ko, patches it, then generates midi_bridge_ko.h
 
 tools/
   PackageMaker/
@@ -132,9 +132,9 @@ At startup the daemon extracts `vkbd.ko` from the binary (embedded as a C array 
 
 ### MIDI injection
 
-Because `midi_inject.ko` patches OA's `.text` directly, it is only loaded once OA reaches `MODULE_STATE_LIVE` (polled via `/sys/module/OA/initstate`, with a private sysfs mount as a fallback on the GRUB-hook boot path where the system `/sys` may not be mounted yet). Loading it while OA is still `COMING` races the kernel module loader and can crash the box.
+Because `midi_bridge.ko` reads OA's in-memory objects (the MIDI in-port array and the out-queue it taps as a reader), it is only loaded once OA reaches `MODULE_STATE_LIVE` (polled via `/sys/module/OA/initstate`, with a private sysfs mount as a fallback on the GRUB-hook boot path where the system `/sys` may not be mounted yet). Loading it while OA is still `COMING` would read half-built state. Unlike its predecessor `midi_inject.ko`, it does **not** patch OA `.text` - MIDI-out capture is done by claiming a spare reader slot on OA's transmit queue, so there is no trampoline, no `.text` write, and no teardown freeze when OA is unloaded.
 
-At startup the daemon also loads `midi_inject.ko` (embedded as `midi_inject_ko.h`) with `init_module(2)`, passing kernel symbol addresses for `MidiInPortGeneric7Receive` and `RegisterMidiInPort` resolved from `/proc/kallsyms`. The module creates two proc entries:
+At startup the daemon also loads `midi_bridge.ko` (embedded as `midi_bridge_ko.h`) with `init_module(2)`, passing kernel symbol addresses for `MidiInPortGeneric7Receive` and `RegisterMidiInPort` resolved from `/proc/kallsyms`. The module creates two proc entries:
 
 - `/proc/.midi_in` - write raw MIDI bytes to inject into the Kronos MIDI engine (OA.ko)
 - `/proc/.midi_ring` - read SysEx responses from the hardware ring buffer (Block 5) at kernel speed
@@ -147,10 +147,10 @@ Continuous controllers (e.g. mod wheel, breath) sent via `MIDI_SEND` are rate-li
 
 ### Boot safety and recovery
 
-Kernel module loading (`vkbd.ko`, `midi_inject.ko`) is inherently risky on the Kronos's RTAI kernel, so startup is guarded by three independent mechanisms, all living under the FTP-visible `/korg/rw/HD` folder so they are reachable even on a non-rooted unit with no shell access:
+Kernel module loading (`vkbd.ko`, `midi_bridge.ko`) is inherently risky on the Kronos's RTAI kernel, so startup is guarded by three independent mechanisms, all living under the FTP-visible `/korg/rw/HD` folder so they are reachable even on a non-rooted unit with no shell access:
 
 - **Boot flag** (`/korg/rw/HD/ScreenRemote/.boot`) - written at the start of every boot and deleted only once the framebuffer, network, and both listeners are confirmed up. If it is still present when the daemon starts, the previous boot did not finish cleanly, so no kernel modules are loaded that boot. Delete the file over FTP to re-enable module loading on the next boot.
-- **Kill switch** (`/korg/rw/HD/_nomod`) - if this folder exists, the daemon loads no kernel modules at all, regardless of the boot flag. Create it over FTP (`mkdir _nomod`) and reboot to bring the unit up with no kernel hooks - required before running a Korg OS update or the Factory State Restore cleaner (midi_inject's OA `.text` hooks otherwise freeze the system when OA is torn down), and useful for recovering a wedged unit.
+- **Kill switch** (`/korg/rw/HD/_nomod`) - if this folder exists, the daemon loads no kernel modules at all, regardless of the boot flag. Create it over FTP (`mkdir _nomod`) and reboot to bring the unit up with no kernel modules at all - useful before running a Korg OS update or the Factory State Restore cleaner, and for recovering a wedged unit. (`midi_bridge.ko` no longer patches OA `.text`, so the old teardown freeze at "Preparing to Install" is gone; this kill-switch remains as defense-in-depth.)
 - **Boot kernel-log capture** (`/korg/rw/HD/ScreenRemote/boot_kmsg.log`) - stock (non-rooted) units have no dmesg/klogd, so the daemon snapshots the entire kernel ring buffer every 150 ms across the risky module-load window and fsyncs each snapshot. If a module load freezes the box, the last fsync'd snapshot still holds the kernel messages up to the hang. Capture stops, with one final snapshot, once startup completes successfully.
 
 ---
@@ -163,7 +163,7 @@ Kernel module loading (`vkbd.ko`, `midi_inject.ko`) is inherently risky on the K
 - `make`
 - `xxd` - used to convert `vkbd.ko` into the `vkbd_ko.h` C array
 
-**To rebuild `vkbd.ko` / `midi_inject.ko` from source** (not required if you use the pre-built modules):
+**To rebuild `vkbd.ko` / `midi_bridge.ko` from source** (not required if you use the pre-built modules):
 
 - **[`cgudrian/linux-kronos`](https://github.com/cgudrian/linux-kronos)** (branch `v2.6.32.11-kronos`), built with Korg's own `arch/x86/configs/korg_kronos_defconfig` and prepared for out-of-tree module builds (`make ARCH=i386 oldconfig && make ARCH=i386 prepare scripts modules_prepare`). This is Korg's actual kernel source, not a vanilla 2.6.32.11 tree - modules must be built against it to match the real kernel's `struct module` ABI (see `patch_init_offset.py` below for what goes wrong otherwise, and `../project_linux_kronos_kernel_tree.md` for how this tree was found/validated and exactly how to (re)prepare it).
   - `Makefile.module` in each module dir defaults `KDIR` to `/home/build/linux-kronos`; override with `make KDIR=/path/to/linux-kronos` if yours lives elsewhere. **Build it on a filesystem that supports real symlinks** - `modules_prepare` creates `include/asm -> include/asm-x86`, which fails on CIFS/SMB mounts even with `symlink=native` set.
@@ -177,7 +177,7 @@ make -C vkbd_module -f Makefile.module
 make -C midi_module -f Makefile.module
 ```
 
-Each runs `make modules` against the 2.6.32.11 kernel tree, runs `patch_init_offset.py` on the resulting `.ko`, and then uses `xxd -i` to regenerate the corresponding C header (`source/vkbd_ko.h`, `source/midi_inject_ko.h`).
+Each runs `make modules` against the 2.6.32.11 kernel tree, runs `patch_init_offset.py` on the resulting `.ko`, and then uses `xxd -i` to regenerate the corresponding C header (`source/vkbd_ko.h`, `source/midi_bridge_ko.h`).
 
 Step 1 is required - the `.ko` files and their generated headers are not committed and must be built before Step 2.
 
@@ -195,7 +195,7 @@ Output: `build/screenremote` - a statically linked i686 ELF binary.
 
 The Kronos kernel's `struct module` places the `init` function pointer at offset `0xd4`. A module built against a vanilla Linux 2.6.32 tree (mismatched CONFIG options relative to Korg's real kernel) places it at `0xbc` instead. If such a module is loaded unpatched, the kernel writes the `init_module` address to the wrong offset and the module's init function is never called - and, worse, if that module's init ever needs to signal failure, the kernel's stock error-cleanup path (`module_put()` on the misshapen module) reads other kernel-populated fields like the percpu `refptr` from the wrong offset too, which oopses the kernel rather than just failing the load.
 
-Building against `linux-kronos` (see Prerequisites above) avoids this at the source: `init` naturally lands at `0xd4` with no patching, verified byte-for-byte against real Korg-shipped `.ko` files (not just that one field - the whole `.gnu.linkonce.this_module` section matches in size). `patch_init_offset.py` still runs automatically after every module build as a cheap defensive check - it detects the offset is already correct and no-ops - so it also still fixes the one symptom it knows about if someone builds against a mismatched tree. It finds the `.rel.gnu.linkonce.this_module` section, locates the `init_module` relocation entry, and changes its `r_offset` from `0xbc` to `0xd4`. It applies to both `vkbd.ko` and `midi_inject.ko`.
+Building against `linux-kronos` (see Prerequisites above) avoids this at the source: `init` naturally lands at `0xd4` with no patching, verified byte-for-byte against real Korg-shipped `.ko` files (not just that one field - the whole `.gnu.linkonce.this_module` section matches in size). `patch_init_offset.py` still runs automatically after every module build as a cheap defensive check - it detects the offset is already correct and no-ops - so it also still fixes the one symptom it knows about if someone builds against a mismatched tree. It finds the `.rel.gnu.linkonce.this_module` section, locates the `init_module` relocation entry, and changes its `r_offset` from `0xbc` to `0xd4`. It applies to both `vkbd.ko` and `midi_bridge.ko`.
 
 **Requirements:** Python 3 (standard library only - `struct`, `sys`, `os`).
 
@@ -203,14 +203,14 @@ Building against `linux-kronos` (see Prerequisites above) avoids this at the sou
 
 ```sh
 python3 patch_init_offset.py vkbd_module/vkbd.ko
-python3 patch_init_offset.py midi_module/midi_inject.ko
+python3 patch_init_offset.py midi_module/midi_bridge.ko
 ```
 
 ---
 
 ## MIDI injection history
 
-An earlier approach (`vusb_midi/`, since removed) attempted to use `dummy_hcd` to inject MIDI messages via a virtual USB gadget interface. This was abandoned because `dummy_hcd` is incompatible with the Kronos's RTAI real-time kernel - the URB completion tasklets conflict with RTAI scheduling and cause kernel panics. The current approach calls the Kronos MIDI receive function directly from a kernel module (`midi_module/midi_inject.c`) and bridges SysEx request/response via an embedded TCP subprocess.
+An earlier approach (`vusb_midi/`, since removed) attempted to use `dummy_hcd` to inject MIDI messages via a virtual USB gadget interface. This was abandoned because `dummy_hcd` is incompatible with the Kronos's RTAI real-time kernel - the URB completion tasklets conflict with RTAI scheduling and cause kernel panics. The current approach calls the Kronos MIDI receive function directly from a kernel module (`midi_module/midi_bridge.c`) and bridges SysEx request/response via an embedded TCP subprocess.
 
 ---
 
@@ -306,7 +306,7 @@ Covers every wire format, all control commands and their arguments, the button n
 
 Some online file-scanning services and cloud storage providers (including Google Drive) may flag the `screenremote` binary or `vkbd.ko` as suspicious or malicious. These are **false positives**. Nothing in this software is harmful; the detections are purely heuristic and stem from several legitimate implementation choices that happen to match patterns that generic scanners look for:
 
-**Embedded binary blobs.** The daemon contains three binaries compiled into it as raw byte arrays (`vkbd_ko.h`, `midi_inject_ko.h`, `midi_tcp_bin.h`) and extracts and loads them at runtime - the kernel modules via the `init_module(2)` syscall directly, and the MIDI bridge via `fork()`/`execl()`. Self-extracting executables that carry and load additional binaries are a well-known malware distribution technique; heuristic scanners flag the pattern regardless of intent. The reason for doing this here is that `system()` and `/bin/sh` are unavailable on non-rooted Kronos units.
+**Embedded binary blobs.** The daemon contains three binaries compiled into it as raw byte arrays (`vkbd_ko.h`, `midi_bridge_ko.h`, `midi_tcp_bin.h`) and extracts and loads them at runtime - the kernel modules via the `init_module(2)` syscall directly, and the MIDI bridge via `fork()`/`execl()`. Self-extracting executables that carry and load additional binaries are a well-known malware distribution technique; heuristic scanners flag the pattern regardless of intent. The reason for doing this here is that `system()` and `/bin/sh` are unavailable on non-rooted Kronos units.
 
 **Direct kernel module loading.** Calling `init_module(2)` to load kernel modules without going through `/sbin/insmod` is unusual enough to be a trigger on its own. Rootkits use the same syscall to load modules that hide processes or intercept system calls. The modules here only register a virtual keyboard with the input subsystem and provide a MIDI injection interface.
 

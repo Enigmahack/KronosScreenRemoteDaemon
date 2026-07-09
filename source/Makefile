@@ -17,7 +17,7 @@ $(OUTDIR):
 vkbd_ko.h: ../vkbd_module/vkbd.c ../vkbd_module/Kbuild
 	$(MAKE) -C ../vkbd_module -f Makefile.module
 
-midi_inject_ko.h: ../midi_module/midi_inject.c ../midi_module/Kbuild
+midi_bridge_ko.h: ../midi_module/midi_bridge.c ../midi_module/Kbuild
 	$(MAKE) -C ../midi_module -f Makefile.module
 
 midi_tcp_bin.h: midi_tcp.c
@@ -25,17 +25,17 @@ midi_tcp_bin.h: midi_tcp.c
 	xxd -i midi_tcp_bin > $@
 	rm -f midi_tcp_bin
 
-$(OUTDIR)/screenremote: screenremote.c vkbd_ko.h midi_inject_ko.h midi_tcp_bin.h
+$(OUTDIR)/screenremote: screenremote.c vkbd_ko.h midi_bridge_ko.h midi_tcp_bin.h
 	$(CC) $(CFLAGS) -DBUILD_ID=\"$(BUILD_ID)\" -o $@ screenremote.c
 
 clean:
-	rm -f $(TARGETS) vkbd_ko.h midi_inject_ko.h midi_tcp_bin.h midi_tcp_bin
+	rm -f $(TARGETS) vkbd_ko.h midi_bridge_ko.h midi_tcp_bin.h midi_tcp_bin
 	# Recurse into the kernel-module build dirs.  Without this, `make clean`
 	# leaves the old .ko/.o in place; kbuild then skips recompiling when the
 	# module source mtime isn't newer than the artifact (common right after a
 	# git checkout/pull), silently re-embedding a STALE module.  That is how a
-	# fix to midi_inject.c can fail to ship and a non-rooted unit keeps
-	# freezing at boot on the old, unfixed hook.
+	# fix to midi_bridge.c can fail to ship and a unit keeps running the old,
+	# unfixed module.
 	$(MAKE) -C ../vkbd_module -f Makefile.module clean
 	$(MAKE) -C ../midi_module -f Makefile.module clean
 

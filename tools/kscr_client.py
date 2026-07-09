@@ -414,6 +414,12 @@ class KSCRMidiBridge:
             if not chunk:
                 break
             for b in chunk:
+                # Real-time bytes (0xF8-0xFF: clock, active sensing, etc.) may
+                # appear anywhere in the stream, including mid-SysEx. midi_tcp
+                # forwards them inline (spec-correct), so skip them here or they
+                # corrupt the reassembled dump. Mirrors screenremote.c's parser.
+                if b >= 0xF8:
+                    continue
                 if not in_sysex:
                     if b == 0xF0:
                         in_sysex = True

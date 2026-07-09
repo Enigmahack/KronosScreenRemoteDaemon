@@ -154,7 +154,7 @@ def _make_kronosmods_init(boot_cmds: list, debug_log: str = "") -> str:
       * Nothing here can ever stall the caller -- the script returns immediately,
         so on the GRUB path the PID-1 handoff in kronos_init is never delayed and
         a hanging insmod cannot freeze boot.
-      * Modules that need OA symbols (midi_inject.ko) and the screenremote daemon
+      * Modules that need OA symbols (midi_bridge.ko) and the screenremote daemon
         load *after* OA, not racing factory module loading during early boot.
     On a rooted Kronos OA is already up when this runs (loadoa completes before
     OA.clonos.rc executes), so the wait exits on the first iteration.

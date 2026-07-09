@@ -1,15 +1,15 @@
 /*
- * midi_tcp — TCP MIDI bridge for Korg Kronos (hub mode)
+ * midi_tcp - TCP MIDI bridge for Korg Kronos (hub mode)
  *
  * Listens on TCP port 9875 (same as Korg's MIDID).
- * Inbound:  TCP → /proc/.midi_in (kernel module injection)
- * Outbound: /proc/.midi_ring → TCP
+ * Inbound:  TCP -> /proc/.midi_in (kernel module injection)
+ * Outbound: /proc/.midi_ring -> TCP
  *
  * MIDI output is broadcast to ALL connected TCP clients simultaneously.  Channel
  * and system-common messages are parsed and broadcast whole; real-time bytes pass
  * through immediately.  SysEx is the exception: it is STREAMED in <=1 KB chunks
  * (and flushed again at F7) rather than buffered whole, so an arbitrarily large
- * object — a full Set List dump is ~79 KB — crosses the bridge with no size cap
+ * object - a full Set List dump is ~79 KB - crosses the bridge with no size cap
  * and a client's activity/keepalive stays fed through a multi-second transfer;
  * clients reassemble F0..F7 across chunk boundaries (see parser_feed).  Up to
  * MAX_CLIENTS simultaneous connections are supported.  MIDI input received from
@@ -60,7 +60,7 @@ static void broadcast(const uint8_t *buf, int len)
 }
 
 /* ------------------------------------------------------------------ */
-/*  MIDI output reader — /proc/.midi_ring                              */
+/*  MIDI output reader - /proc/.midi_ring                              */
 /* ------------------------------------------------------------------ */
 
 struct midi_out_reader {
@@ -119,11 +119,11 @@ static const int syscom_len[7] = {
 };
 
 /* SysEx is streamed to clients in small chunks, NOT buffered as a whole message.
- * A large object dump — a Kronos Set List is ~79 KB — must traverse the bridge
+ * A large object dump - a Kronos Set List is ~79 KB - must traverse the bridge
  * without any size cap, and the client's activity-based keepalive needs to see
  * bytes arriving throughout the multi-second transfer.
  *
- * The old design buffered the entire F0…F7 and broadcast once, on F7, into a
+ * The old design buffered the entire F0...F7 and broadcast once, on F7, into a
  * 64 KB buffer.  That broke large dumps two ways: (1) at 64 KB the length guard
  * also blocked the terminating F7, so the client received a truncated chunk that
  * never completed into a message; (2) nothing was sent until the whole transfer
@@ -161,7 +161,7 @@ static void parser_feed(struct midi_parser *p, uint8_t b)
 
     /* SysEx end: emit the final chunk (carrying F7) and reset.  len is always
      * < SYSEX_FLUSH_AT here (a full chunk was flushed the moment it filled), so
-     * there is room for the F7 — the old 64 KB truncation that dropped it is gone. */
+     * there is room for the F7 - the old 64 KB truncation that dropped it is gone. */
     if (b == 0xF7) {
         if (p->in_sysex) {
             p->buf[p->len++] = b;
@@ -183,7 +183,7 @@ static void parser_feed(struct midi_parser *p, uint8_t b)
 
     /* SysEx body: accumulate and stream out in SYSEX_FLUSH_AT-sized chunks so a
      * large dump traverses the bridge live rather than being buffered whole.  The
-     * flush keeps in_sysex set and re-emits no F0/F7 — the client parser stays in
+     * flush keeps in_sysex set and re-emits no F0/F7 - the client parser stays in
      * its SysEx state and reassembles the chunks into one message. */
     if (p->in_sysex) {
         p->buf[p->len++] = b;
@@ -206,7 +206,7 @@ static void parser_feed(struct midi_parser *p, uint8_t b)
         }
 
         if (b >= 0xF1 && b <= 0xF6) {
-            /* System common — cancels running status. */
+            /* System common - cancels running status. */
             int slen = syscom_len[b & 0x0F];
             p->running_status = 0;
             p->buf[0] = b;
@@ -363,7 +363,7 @@ int main(int argc, char *argv[]) {
                      * make the MSG_DONTWAIT broadcast() silently drop a chunk mid-
                      * SysEx (which offsets the rest of a bulk dump).  A full Set List
                      * is ~79 KB; 256 KB gives comfortable margin.  Belt-and-braces
-                     * alongside the kernel-ring SPSC fix — kept non-blocking so a slow
+                     * alongside the kernel-ring SPSC fix - kept non-blocking so a slow
                      * client can never stall the /proc/.midi_ring drain. */
                     int sndbuf = 256 * 1024;
                     setsockopt(new_fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
@@ -388,7 +388,7 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        /* Inbound MIDI from any TCP client → inject into Kronos. */
+        /* Inbound MIDI from any TCP client -> inject into Kronos. */
         for (i = 0; i < MAX_CLIENTS; i++) {
             if (client_fds[i] < 0 || !FD_ISSET(client_fds[i], &rfds)) continue;
             int n = recv(client_fds[i], buf, sizeof(buf), 0);
@@ -417,7 +417,7 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        /* Outbound MIDI from Kronos → parse → broadcast to all clients. */
+        /* Outbound MIDI from Kronos -> parse -> broadcast to all clients. */
         if (num_clients > 0) {
             int n = read_midi_out(&midi_out, buf, sizeof(buf));
             int j;

@@ -45,7 +45,7 @@ ZIP_NAME="ScreenRemoteDaemon_${VERSION}${ZIP_SUFFIX}.zip"
 
 # --------------------------------------------------------------------------
 # 1. Build screenremote binary (delegates to source/Makefile which builds
-#    vkbd.ko, midi_inject.ko, midi_tcp, and the final screenremote binary)
+#    vkbd.ko, midi_bridge.ko, midi_tcp, and the final screenremote binary)
 # --------------------------------------------------------------------------
 echo ""
 echo "--- Step 1: Building screenremote ---"
@@ -66,7 +66,7 @@ echo "  Build complete: $BUILD_DIR/screenremote"
 # --------------------------------------------------------------------------
 echo ""
 echo "--- Step 1b: Verifying embedded kernel modules ---"
-python3 - "$REPO_ROOT/vkbd_module/vkbd.ko" "$REPO_ROOT/midi_module/midi_inject.ko" <<'PYEOF'
+python3 - "$REPO_ROOT/vkbd_module/vkbd.ko" "$REPO_ROOT/midi_module/midi_bridge.ko" <<'PYEOF'
 import struct, sys
 REQUIRED = 0xd4
 def init_offset(path):
