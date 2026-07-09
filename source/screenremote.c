@@ -50,7 +50,7 @@
  * Config: /korg/rw/screenremote/screenremote.cfg  (stream_port, ctrl_port, screensaver_timeout)
  * All runtime files live under /korg/rw/screenremote/ (binary, extracted .ko modules, config, flag files).
  *
- * Boot-safety: /korg/rw/screenremote/.boot is written at startup and deleted only once the
+ * Boot-safety: /korg/rw/HD/ScreenRemote/.boot is written at startup and deleted only once the
  * framebuffer, network, and listeners are all up.  If it exists on entry the previous boot did not
  * complete cleanly, so midi_inject is skipped for that boot.  Delete the file over FTP to re-enable.
  */
@@ -90,7 +90,7 @@
 #define KBD_EV_KEY  1
 
 /*  Version */
-#define SCREENREMOTE_VERSION "1.8.0"
+#define SCREENREMOTE_VERSION "1.8.1"
 #ifndef BUILD_ID
 #define BUILD_ID "dev"
 #endif
@@ -876,10 +876,17 @@ static void inject_touch(int type, int x, int y)
 /* Embedded .ko extraction */
 static void extract_ko(const char *path, const unsigned char *data, unsigned int len)
 {
-    struct stat st;
-    /* Skip write if file already exists with the correct size. */
-    if (stat(path, &st) == 0 && (unsigned int)st.st_size == len)
-        return;
+    /* Always unlink then rewrite — do NOT skip on a size match.  A size-only skip
+     * silently shipped a STALE binary whenever a rebuild changed behaviour without
+     * changing the static binary's byte count (e.g. a small logic tweak to midi_tcp
+     * that the -static link rounds to the same size): the daemon kept exec'ing the
+     * old midi_tcp and the fix never ran.  unlink() first also dodges ETXTBSY — if
+     * an orphaned midi_tcp child from a previous screenremote still has this file
+     * mmap'd as its executable, open(O_TRUNC) on it would fail; unlinking drops the
+     * directory entry (the running process keeps its old inode) so the new file
+     * lands on a fresh inode.  A few-hundred-KB rewrite per daemon start is
+     * negligible on this appliance and far cheaper than shipping a stale binary. */
+    unlink(path);
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd >= 0) { write(fd, data, len); close(fd); }
 }

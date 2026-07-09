@@ -3,7 +3,7 @@
  *
  * /proc/.midi_in    — write raw MIDI bytes to inject into OA.ko MIDI IN
  * /proc/.midi_ring  — read the Kronos MIDI OUT stream (notes, CC, bend, SysEx)
- * /proc/.midi_ports — diagnostic: out-port topology / which port is captured
+ * /proc/.midi_ports — diagnostic: out-port topology, captured port, ring_overflow_bytes
  *
  * MIDI OUT is captured by hooking CSTGMidiOutPort::ReadNextMessage (the per-port
  * output drain, already driven by the always-transmitting DIN path — no USB host
@@ -11,6 +11,13 @@
  * every port mirrors the same performance stream, so we lock onto ONE port and
  * capture only it — otherwise every event is duplicated per port.  See
  * hook_read_next_msg.
+ *
+ * Captured bytes flow through a LOCK-FREE single-producer/single-consumer ring
+ * (uni_ring): the RT capture hook is the sole producer, /proc/.midi_ring the sole
+ * consumer, and they share no lock — so the producer never drops data merely
+ * because the consumer is mid-read.  This replaced a shared spin-trylock whose
+ * contention drops silently corrupted large SysEx dumps (a ~79 KB Set List).  See
+ * uni_ring_push_buf / ring_fops_read.
  *
  * Module params:
  *   receive_fn=0x...        MidiInPortGeneric7Receive (required for MIDI IN injection)
@@ -86,33 +93,50 @@ static void ring_disable(void)
 #define UNI_RING_MASK  (UNI_RING_SIZE - 1)
 
 static uint8_t  uni_ring[UNI_RING_SIZE];
-static uint32_t uni_wpos = 0;
-static uint32_t uni_rpos = 0;
-static DEFINE_SPINLOCK(uni_lock);
+static uint32_t uni_wpos = 0;      /* advanced ONLY by producers (under uni_prod_lock) */
+static uint32_t uni_rpos = 0;      /* advanced ONLY by the consumer (ring_fops_read/write) */
+static uint32_t uni_overflow = 0;  /* bytes dropped by a GENUINELY full ring (diagnostic) */
+
+/* Producer-only lock: serializes concurrent producers against EACH OTHER (the
+ * ReadNextMessage hook can fire on more than one CPU), but is NEVER taken by the
+ * consumer (midi_tcp).  That property is the whole point — the RT-domain producer
+ * therefore never spin-waits on a lock the *Linux* consumer holds, so there is no
+ * priority-inversion / RT-starvation deadlock (on a single CPU an RT spin on a
+ * Linux-held lock would starve the very task that must release it → hard freeze).
+ * The old design shared ONE lock between producer and consumer and used spin_trylock
+ * in the producer, which DROPPED the whole batch whenever midi_tcp held the lock
+ * mid-read.  Under a dense bulk dump that punched small holes into the SysEx stream,
+ * offsetting every byte after the hole (garbled Set List slots).  The
+ * producer/consumer handoff is now lock-free via the wpos/rpos cursors + barriers,
+ * so the consumer can never force a producer drop.  Single-producer/single-consumer
+ * ring; on x86 aligned 32-bit cursor loads/stores are atomic, and ACCESS_ONCE stops
+ * the compiler caching/refetching them (which would reintroduce the corruption). */
+static DEFINE_SPINLOCK(uni_prod_lock);
 
 static void uni_ring_push_buf(const uint8_t *buf, uint32_t len)
 {
     unsigned long flags;
-    uint32_t i, used, space;
+    uint32_t i, used, space, wpos, rpos;
 
-    /* Use trylock so this path never blocks.  Called potentially from the
-     * kOAMidiOutput thread (Linux) or an RTAI RT context via the
-     * ReadNextMessage hook.  Blocking here causes priority inversion against
-     * ring_fops_read (held by midi_tcp) which stalls the RT domain and makes
-     * joystick / CC inputs lag.  Drop data rather than interfere. */
-    if (!spin_trylock_irqsave(&uni_lock, flags))
-        return;
+    spin_lock_irqsave(&uni_prod_lock, flags);
 
-    used  = uni_wpos - uni_rpos;
+    wpos = uni_wpos;                 /* this lock is the only writer of uni_wpos */
+    rpos = ACCESS_ONCE(uni_rpos);    /* advanced by the consumer; a stale (smaller)
+                                        read only under-reports free space — safe */
+    used  = wpos - rpos;
     space = (used < UNI_RING_SIZE) ? (UNI_RING_SIZE - used) : 0;
-    if (len > space)
-        len = space;   /* ring full: drop new data, never overwrite unread */
-
-    for (i = 0; i < len; i++) {
-        uni_ring[uni_wpos & UNI_RING_MASK] = buf[i];
-        uni_wpos++;
+    if (len > space) {
+        uni_overflow += len - space; /* genuine overflow, NOT a lock-contention drop */
+        len = space;                 /* ring full: never overwrite unread data */
     }
-    spin_unlock_irqrestore(&uni_lock, flags);
+
+    for (i = 0; i < len; i++)
+        uni_ring[(wpos + i) & UNI_RING_MASK] = buf[i];
+
+    smp_wmb();                       /* ring bytes must be visible before we publish wpos */
+    ACCESS_ONCE(uni_wpos) = wpos + len;
+
+    spin_unlock_irqrestore(&uni_prod_lock, flags);
 }
 
 /* ------------------------------------------------------------------ */
@@ -687,25 +711,28 @@ static ssize_t ring_fops_read(struct file *file, char __user *buf,
 {
     uint8_t tmp[512];
     size_t len = 0;
-    unsigned long flags;
-    uint32_t wpos, avail;
+    uint32_t wpos, rpos, avail;
     size_t take, i;
 
-    /* The dispatch hook (hook_read_next_msg) fills uni_ring asynchronously; here we
-     * just hand the reader whatever is buffered. */
-    spin_lock_irqsave(&uni_lock, flags);
-    wpos  = uni_wpos;
-    avail = wpos - uni_rpos;
+    /* Lock-free consumer (see uni_ring_push_buf): read the producer's published
+     * wpos, copy the bytes in [rpos, wpos), then advance rpos.  Sharing no lock with
+     * the producer is exactly what stops the producer ever dropping a batch on our
+     * account.  The dispatch hook fills uni_ring asynchronously; we hand the reader
+     * whatever is buffered. */
+    rpos  = uni_rpos;                /* only the consumer (this fn / ring_fops_write) moves rpos */
+    wpos  = ACCESS_ONCE(uni_wpos);   /* published by a producer */
+    smp_rmb();                       /* order the wpos load before reading ring data */
+    avail = wpos - rpos;
     if (avail > 0) {
         take = avail;
         if (take > sizeof(tmp)) take = sizeof(tmp);
         if (take > count)       take = count;
         for (i = 0; i < take; i++)
-            tmp[i] = uni_ring[(uni_rpos + i) & UNI_RING_MASK];
-        uni_rpos += take;
+            tmp[i] = uni_ring[(rpos + i) & UNI_RING_MASK];
+        smp_mb();                    /* finish copying bytes out before we free the space */
+        ACCESS_ONCE(uni_rpos) = rpos + take;
         len = take;
     }
-    spin_unlock_irqrestore(&uni_lock, flags);
 
     if (len == 0) return 0;
     if (copy_to_user(buf, tmp, len)) return -EFAULT;
@@ -715,14 +742,12 @@ static ssize_t ring_fops_read(struct file *file, char __user *buf,
 static ssize_t ring_fops_write(struct file *file, const char __user *buf,
                                size_t count, loff_t *ppos)
 {
-    unsigned long flags;
-
     /* A write to /proc/.midi_ring means "reset my read cursor" — midi_tcp does this
-     * on a new client connection so it starts from live output, not a backlog. */
-    spin_lock_irqsave(&uni_lock, flags);
-    uni_rpos = uni_wpos;
-    spin_unlock_irqrestore(&uni_lock, flags);
-
+     * on a new client connection so it starts from live output, not a backlog.  This
+     * runs in the consumer context (single-threaded midi_tcp, never concurrent with
+     * ring_fops_read), so it moves rpos lock-free: jump to the latest published
+     * wpos.  A producer mid-push simply publishes a higher wpos afterward. */
+    ACCESS_ONCE(uni_rpos) = ACCESS_ONCE(uni_wpos);
     return (ssize_t)count;
 }
 
@@ -745,6 +770,11 @@ static int ports_read_proc(char *page, char **start, off_t off,
     len += sprintf(page + len,
                    "capture_port_idx=%d  auto_locked=%p  ports_seen=%d\n",
                    capture_port_idx, capture_port, nseen_ports);
+    /* ring_overflow_bytes must read 0 in normal use.  A nonzero value means the
+     * MIDI-out ring genuinely filled (producer outran the midi_tcp drain) and data
+     * was dropped — distinct from the old lock-contention drop, which is gone.  If a
+     * bulk dump still comes up short with this at 0, the loss is elsewhere. */
+    len += sprintf(page + len, "ring_overflow_bytes=%u\n", ACCESS_ONCE(uni_overflow));
     for (i = 0; i < nseen_ports; i++) {
         int captured = (capture_port_idx >= 0) ? (i == capture_port_idx)
                                                : (seen_ports[i] == capture_port);
@@ -920,6 +950,10 @@ static void midi_setup(struct work_struct *work)
 
 static int __init midi_inject_init(void)
 {
+    /* Build tag — grep dmesg for this after a reboot to confirm the SPSC-ring
+     * midi_inject is actually the one loaded (the .ko is xxd-embedded in
+     * screenremote and has been silently stale before; see extract_ko). */
+    printk(KERN_INFO "midi_inject: spsc-ring build\n");
     printk(KERN_INFO "midi_inject: receive=0x%lx register=0x%lx dispatch=0x%lx\n",
            receive_fn, register_fn, midi_dispatch_fn);
 

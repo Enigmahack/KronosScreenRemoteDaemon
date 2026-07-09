@@ -644,6 +644,8 @@ Response: SYSEX_RESP <hex>\n      (captured response as hex)
 
 The capture timeout is approximately 5 seconds. The response includes the first complete F0...F7 SysEx message received from the Kronos after the request is sent, up to 65536 bytes. For SysEx request/response to work, **Global > MIDI > "Enable Exclusive" must be ON** on the Kronos, or SysEx messages are silently ignored.
 
+**Small exchanges only.** `SYSEX` captures a *single* `F0…F7` block and caps at 65536 bytes, so it suits short request/response exchanges (mode request, current performance id, a name dump). To retrieve a **large** object (a full Set List is ~79 KB) or a multi-object bank dump, do **not** use `SYSEX` — send the request with `MIDI_SEND` and collect the resulting `0x73` Object Dump reply off the MIDI bridge stream (port 9875; see [Section 8](#8-midi-bridge---port-9875)), which streams SysEx incrementally with no size cap.
+
 **Asynchronous delivery.** The `midi_tcp` subprocess forwards all MIDI output from the Kronos (note events, CC, SysEx, real-time bytes) as a continuous stream without buffering or request/response pairing. Non-SysEx MIDI events such as note-on/note-off may arrive interleaved with the SysEx response. Delivery order within the stream is preserved (TCP guarantees this), but clients must be prepared to discard or buffer non-SysEx messages that arrive while waiting for a response. Response correlation is by payload content: Korg SysEx messages carry a manufacturer ID (0x42), model ID (0x68 for Kronos), and a function code that identifies the message type - match on those rather than on timing or position in the stream.
 
 ---
@@ -705,11 +707,15 @@ The capture hook fires once per active physical output port. If the Kronos has m
 
 **Running status:**
 
-The `midi_tcp` parser handles running status internally and broadcasts complete, fully-formed messages (each with an explicit status byte) to connected clients. Clients do not need to implement running-status tracking.
+Channel and system-common messages are reassembled by the `midi_tcp` parser and broadcast as complete, fully-formed messages (each with an explicit status byte), so clients do not need to implement running-status tracking for those.
+
+**SysEx streaming:**
+
+SysEx is the exception. Rather than buffer a whole `F0…F7` block and broadcast it at once, `midi_tcp` **streams SysEx bytes to clients incrementally, in chunks of up to 1 KB** (and flushes again at `F7`). This lets an arbitrarily large object — a full Set List dump is ~79 KB — traverse the bridge with **no size cap**, and keeps a client's activity/keepalive logic fed throughout a multi-second transfer. Only the first chunk carries the `F0` and only the last carries the `F7`; clients reassemble the message across chunk (and TCP) boundaries exactly as they already parse the raw byte stream (§8.2). *(Before this change SysEx was buffered whole and capped at 64 KB, which silently truncated any larger object and dropped its trailing `F7`, so a Set List dump never completed on the client.)*
 
 **Ring buffer and backpressure:**
 
-The kernel module buffers output in a 16 KB circular ring. Data written to the ring before any client is connected is discarded when the first client connects (ring cursor is reset). The ring is shared across all connected clients; when readers fall behind and the ring fills, new incoming MIDI data is dropped rather than overwriting data already in the ring that has not yet been read (the push path never blocks and never overwrites unread bytes, so a stalled reader loses the newest output, not the oldest).
+The kernel module buffers output in a 16 KB circular ring. Data written to the ring before any client is connected is discarded when the first client connects (ring cursor is reset). The ring is a **lock-free single-producer / single-consumer** design: the real-time capture hook (producer) and the `midi_tcp` reader (consumer) never share a lock, so the producer is never forced to drop data merely because the reader is mid-read. Data is dropped **only** on genuine overflow — a reader falling so far behind that the ring fills — and even then unread bytes are preserved (the newest output is lost, not the oldest). The running total of overflow-dropped bytes is exposed as `ring_overflow_bytes` in `/proc/.midi_ports` and should read `0` in normal use. *(Earlier revisions used a shared spin-trylock that dropped a whole batch whenever the reader held the lock; under a dense bulk dump this punched small holes into the SysEx byte stream and corrupted large objects such as Set List dumps — each lost byte offsetting the rest of the 8-to-7-encoded object.)*
 
 ### 8.3 Inbound - client MIDI -> Kronos
 
@@ -721,12 +727,47 @@ Maximum single write: 4096 bytes (kernel module buffer limit). Larger payloads m
 
 All connected clients share the same single input and output channel:
 
-- Kronos MIDI output is broadcast to **all** connected clients simultaneously via `send(..., MSG_DONTWAIT)`. A blocked or slow client does not affect delivery to other clients (the send is non-blocking; data to a full-buffer client is dropped for that delivery).
+- Kronos MIDI output is broadcast to **all** connected clients simultaneously via `send(..., MSG_DONTWAIT)`. A blocked or slow client does not affect delivery to other clients (the send is non-blocking; data to a full-buffer client is dropped for that delivery). Each client socket is given a **256 KB send buffer** (`SO_SNDBUF`) so a momentary client stall cannot fill the buffer and drop a chunk in the middle of a large SysEx dump.
 - MIDI injected by any client is delivered to the Kronos. Other clients do **not** receive an echo of injected data unless the Kronos itself echoes it back as MIDI output.
 
 ### 8.5 Ring cursor reset
 
 The ring cursor is reset (pre-connection buffered data discarded) when the **first** client connects to an otherwise empty hub. Clients that connect while others are already active begin receiving from the current write position and may receive mid-message data if they arrive during an active capture burst. Clients should implement standard MIDI re-sync logic (scan forward for the next status byte with bit 7 set if the first byte received is a data byte).
+
+### 8.6 Retrieving program & combi names (Kronos SysEx notes)
+
+Pulling the names of every program/combi in a bank is a common tooling task, and the Kronos firmware has a **non-obvious asymmetry** that is easy to misdiagnose. These notes apply to any client (this daemon or otherwise) that requests Object Dumps over MIDI; they are properties of the **Kronos**, not of the bridge. All are hardware-verified (2026-07-08). Names are carried in Object Dump replies (`0x73`) at data offset 0 (24 bytes, 8→7 packed) for both the full object (`0x00` Program / `0x01` Combi) and the name-only object (`0x13` Program Name / `0x12` Combi Name).
+
+**Bank numbers** (KRONOS MIDI Implementation, *2 bank map):
+
+| Object | Preset / read-only banks | USER-writable banks |
+|--------|--------------------------|---------------------|
+| Program / Program Name (`0x00`/`0x13`) | `0x00`–`0x05` (INT-A…F), `0x10`–`0x1A` (GM, g(1)–g(9), g(d)) | `0x40`–`0x4D` (USER-A…G, AA…GG) |
+| Combi / Combi Name (`0x01`/`0x12`) | `0x00`–`0x06` (INT-A…G) | `0x40`–`0x46` (USER-A…G) |
+
+**The asymmetry — the whole-bank name enum is preset-only.** The **Dump Bank Request** (`func 0x77`, e.g. `F0 42 3g 68 77 13 <bank> F7`) works for the **preset** banks (INT, GM/g) and streams all 128 names in ~20 ms, but for every **USER-writable** bank it returns a **Reply (`func 0x24`) with code 4 "target object not found"** — even when the bank is fully populated. This is a firmware limitation of the name-only enum, not an empty bank and not a permissions issue.
+
+- There is **no** "banks per session" throttle. A persistent belief that the Kronos rejects everything after ~13 banks was a misreading of *this* preset-only reject (preset banks dump, USER banks reject). Preset `0x77` enums and USER per-object fetches (below) both stream reliably with no session cap.
+
+**The workaround — request each object individually with `func 0x72`.** The single **Object Dump Request** (`func 0x72`) works for **every** bank, including USER:
+
+```
+Request (one name):  F0 42 3g 68 72 <obj> <bank> <idH> <idL> F7
+   obj  = 0x13 (Program Name) or 0x12 (Combi Name)
+   idH  = (index >> 7) & 0x7F,  idL = index & 0x7F     (index 0..127)
+Reply:               F0 42 3g 68 73 <obj> <bank> <idH> <idL> <version> <name...> F7
+```
+
+Loop `index` 0…127 to pull a whole USER bank. Empty slots reply with a **blank-named** object (not a reject), so all 128 indices respond for a bank that exists.
+
+**Pacing is mandatory — never burst.** Injecting a bank's worth of requests back-to-back **overruns the Kronos MIDI-in**: it drops *every* reply and can corrupt a request in flight (a lost `F7`), which makes the Kronos pop a user-facing **"MIDI Receiving Error"** dialog. Two safe patterns, both verified at a clean 128/128:
+
+- **Batched (recommended):** concatenate ~32 `0x72` requests into one injection (keep it under the ctrl port's ~2 KB line limit if using `MIDI_SEND`; the bridge's inbound path caps a single write at 4096 bytes — see §8.3), then **wait for that batch's `0x73` replies to go idle (~350 ms) before sending the next batch**. ~4 batches pull a 128-object bank in ~2 s.
+- **Paced singles:** one `0x72` request every ~10 ms.
+
+Also avoid **connection churn**: if you inject via the one-shot control port (`MIDI_SEND`, one TCP connection per command — §6.1), one-connection-per-request is ~2688 connections for a full 21-bank user sweep and can overwhelm the daemon. Batching (~4 injections/bank) or a persistent control session (§6.2) avoids this.
+
+**Absent vs. empty vs. rejected** when driving a sweep: match replies by content (§7 `SYSEX` note) — a `0x73` with the requested `obj`/`bank` is a name (blank or not); a `0x24` code 4 with no `0x73` for that bank means the whole-bank enum was refused (you asked with `0x77` on a USER bank — switch to `0x72`). A bank that yields no reply to a full first batch of `0x72` requests (after a generous wait) is genuinely absent/nonexistent.
 
 ---
 
@@ -934,10 +975,12 @@ Every authentication attempt (success or failure) is appended to `/korg/rw/scree
 | MIDI_SEND max message size | 4096 bytes | Limited by the kernel module's static buffer |
 | MIDI_SEND CC throttle interval | 7 ms | Minimum spacing between injected Control Change messages sharing the same (status, controller) |
 | MIDI_SEND CC throttle tracked controllers | 32 | Concurrent (status, controller) pairs tracked; a 33rd distinct controller bypasses throttling |
-| SysEx capture buffer | 65536 bytes | Maximum response size from a single SYSEX command |
+| SysEx capture buffer (`SYSEX` command) | 65536 bytes | Max response for a single `SYSEX` command; larger objects must be collected off the MIDI bridge stream (§8), which has no cap |
 | SysEx capture timeout | ~5 seconds | Initial 5 s recv timeout, then 1 s for trailing data |
 | MIDI bridge max clients | 8 | Connections beyond this are rejected with no response |
-| MIDI bridge output ring | 16384 bytes | Kernel circular ring shared across all clients; on overflow new data is dropped, unread data is preserved |
+| MIDI bridge SysEx stream chunk | 1024 bytes | SysEx is flushed to clients in ≤1 KB chunks; large objects (e.g. a ~79 KB Set List) stream with no total size cap |
+| MIDI bridge output ring | 16384 bytes | Kernel lock-free single-producer/single-consumer ring; drops only on genuine overflow (unread data preserved); overflow byte count in `/proc/.midi_ports` as `ring_overflow_bytes` |
+| MIDI bridge client send buffer | 262144 bytes | `SO_SNDBUF` per client socket, so a stalled client can't drop a chunk mid-dump |
 | MIDI bridge inbound buffer | 4096 bytes | Per-write maximum for MIDI injection; split larger payloads across writes |
 | Touch calibration: `touch_x_offset` | 10 | Pixels added to x before ADC scaling |
 | Touch calibration: `touch_x_range` | 813 | Pixel span mapped to ADC 0-255 (horizontal) |

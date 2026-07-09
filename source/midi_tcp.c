@@ -5,12 +5,16 @@
  * Inbound:  TCP → /proc/.midi_in (kernel module injection)
  * Outbound: /proc/.midi_ring → TCP
  *
- * All MIDI output is parsed into complete messages and broadcast to ALL
- * connected TCP clients simultaneously — SysEx, regular channel messages,
- * and real-time bytes alike.  Up to MAX_CLIENTS simultaneous connections
- * are supported.  MIDI input received from any client is injected into
- * the Kronos; clients are independent and see each other's injected data
- * only if the Kronos echoes it back.
+ * MIDI output is broadcast to ALL connected TCP clients simultaneously.  Channel
+ * and system-common messages are parsed and broadcast whole; real-time bytes pass
+ * through immediately.  SysEx is the exception: it is STREAMED in <=1 KB chunks
+ * (and flushed again at F7) rather than buffered whole, so an arbitrarily large
+ * object — a full Set List dump is ~79 KB — crosses the bridge with no size cap
+ * and a client's activity/keepalive stays fed through a multi-second transfer;
+ * clients reassemble F0..F7 across chunk boundaries (see parser_feed).  Up to
+ * MAX_CLIENTS simultaneous connections are supported.  MIDI input received from
+ * any client is injected into the Kronos; clients are independent and see each
+ * other's injected data only if the Kronos echoes it back.
  *
  * Usage: midi_tcp [-p port] [-d] [-s]
  *   -p port  TCP port (default 9875)
@@ -114,7 +118,20 @@ static const int syscom_len[7] = {
     1,  /* 0xF6 Tune Request */
 };
 
-#define SYSEX_BUF_SIZE 65536
+/* SysEx is streamed to clients in small chunks, NOT buffered as a whole message.
+ * A large object dump — a Kronos Set List is ~79 KB — must traverse the bridge
+ * without any size cap, and the client's activity-based keepalive needs to see
+ * bytes arriving throughout the multi-second transfer.
+ *
+ * The old design buffered the entire F0…F7 and broadcast once, on F7, into a
+ * 64 KB buffer.  That broke large dumps two ways: (1) at 64 KB the length guard
+ * also blocked the terminating F7, so the client received a truncated chunk that
+ * never completed into a message; (2) nothing was sent until the whole transfer
+ * finished, so the client's no-response timer fired mid-dump.  Now we flush every
+ * SYSEX_FLUSH_AT bytes and again on F7; the client's MIDI parser reassembles
+ * across chunk boundaries (only the first chunk carries F0, only the last F7). */
+#define SYSEX_BUF_SIZE 4096
+#define SYSEX_FLUSH_AT 1024
 
 struct midi_parser {
     uint8_t  buf[SYSEX_BUF_SIZE];
@@ -142,14 +159,15 @@ static void parser_feed(struct midi_parser *p, uint8_t b)
         return;
     }
 
-    /* SysEx end: flush accumulated SysEx message. */
+    /* SysEx end: emit the final chunk (carrying F7) and reset.  len is always
+     * < SYSEX_FLUSH_AT here (a full chunk was flushed the moment it filled), so
+     * there is room for the F7 — the old 64 KB truncation that dropped it is gone. */
     if (b == 0xF7) {
         if (p->in_sysex) {
-            if (p->len < SYSEX_BUF_SIZE)
-                p->buf[p->len++] = b;
+            p->buf[p->len++] = b;
             if (debug) {
                 int j;
-                fprintf(stderr, "MIDI->TCP %d bytes (SysEx):", p->len);
+                fprintf(stderr, "MIDI->TCP %d bytes (SysEx end):", p->len);
                 for (j = 0; j < p->len && j < 16; j++)
                     fprintf(stderr, " %02x", p->buf[j]);
                 if (p->len > 16) fprintf(stderr, " ...");
@@ -163,10 +181,16 @@ static void parser_feed(struct midi_parser *p, uint8_t b)
         return;
     }
 
-    /* SysEx body: accumulate until F7. */
+    /* SysEx body: accumulate and stream out in SYSEX_FLUSH_AT-sized chunks so a
+     * large dump traverses the bridge live rather than being buffered whole.  The
+     * flush keeps in_sysex set and re-emits no F0/F7 — the client parser stays in
+     * its SysEx state and reassembles the chunks into one message. */
     if (p->in_sysex) {
-        if (p->len < SYSEX_BUF_SIZE)
-            p->buf[p->len++] = b;
+        p->buf[p->len++] = b;
+        if (p->len >= SYSEX_FLUSH_AT) {
+            broadcast(p->buf, p->len);
+            p->len = 0;
+        }
         return;
     }
 
@@ -289,8 +313,10 @@ int main(int argc, char *argv[]) {
 
     parser_init(&parser);
 
-    fprintf(stderr, "midi_tcp: listening on port %d%s (hub, max %d clients)\n",
-            port, midi_out.valid ? " (midi_ring)" : " (no MIDI out)", MAX_CLIENTS);
+    fprintf(stderr, "midi_tcp: listening on port %d%s (hub, max %d clients) "
+            "[sysex-streaming flush=%d]\n",
+            port, midi_out.valid ? " (midi_ring)" : " (no MIDI out)", MAX_CLIENTS,
+            SYSEX_FLUSH_AT);
 
     while (running) {
         fd_set rfds;
@@ -332,6 +358,15 @@ int main(int argc, char *argv[]) {
                 } else {
                     int nodelay = 1;
                     setsockopt(new_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+
+                    /* Big send buffer so a momentary client stall can't fill it and
+                     * make the MSG_DONTWAIT broadcast() silently drop a chunk mid-
+                     * SysEx (which offsets the rest of a bulk dump).  A full Set List
+                     * is ~79 KB; 256 KB gives comfortable margin.  Belt-and-braces
+                     * alongside the kernel-ring SPSC fix — kept non-blocking so a slow
+                     * client can never stall the /proc/.midi_ring drain. */
+                    int sndbuf = 256 * 1024;
+                    setsockopt(new_fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
 
                     /* Open MIDI injection and reset ring cursor on first client */
                     if (num_clients == 0) {
