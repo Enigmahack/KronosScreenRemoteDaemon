@@ -55,6 +55,8 @@
  * complete cleanly, so midi_bridge is skipped for that boot.  Delete the file over FTP to re-enable.
  */
 
+#define _GNU_SOURCE   /* for sched_setaffinity / CPU_SET */
+#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -90,7 +92,7 @@
 #define KBD_EV_KEY  1
 
 /*  Version */
-#define SCREENREMOTE_VERSION "1.9.1"
+#define SCREENREMOTE_VERSION "1.9.2"
 #ifndef BUILD_ID
 #define BUILD_ID "dev"
 #endif
@@ -188,6 +190,15 @@ static int midi_in_fd    = -1;  /* fd to /proc/.midi_in (MIDI injection) */
 static int midi_cap_fd   = -1;  /* TCP socket to midi_tcp child on localhost */
 static pid_t midi_cap_pid = -1;
 static int g_midi_loaded = 0;
+static int g_midi_load_pending = 0;  /* 1 = load midi_bridge once EVA UI is up */
+/* Calibration mode: if /korg/rw/screenremote/.fbcurve exists at startup, log the
+ * framebuffer non-black% + distinct-color count every second to fbcurve.log and
+ * NEVER load midi_bridge.  A totally brick-safe reboot (the hazardous tap never
+ * fires) that captures the real loading->UI transition, so the EVA-ready threshold
+ * can be set from data instead of a guess.  Remove the flag file to go live. */
+static int g_fbcurve_cal = 0;
+#define FBCURVE_FLAG SCREENREMOTE_DIR "/.fbcurve"
+#define FBCURVE_LOG  SCREENREMOTE_DIR "/fbcurve.log"
 #define MIDI_TCP_PORT 9875
 
 /* Button table - pkt[2]=dev, pkt[3]=code, pkt[4]=0x7f/0x00 for press/release */
@@ -873,22 +884,40 @@ static void inject_touch(int type, int x, int y)
     send_rtf5_event(0x11u, (uint32_t)type, v_adc | (h_adc << 8u));
 }
 
-/* Embedded .ko extraction */
+/* Embedded .ko / binary extraction - atomic same-dir temp + rename.
+ *
+ * Write the payload to "<path>.tmp", verify the FULL write, fsync, then rename() it
+ * onto <path>.  rename(2) is atomic and gives the target a fresh inode, so:
+ *   - a failed or short write NEVER destroys the existing good file (it stays intact
+ *     until the rename succeeds) - unlike unlink-then-write, which left a truncated
+ *     binary if the write failed, and this file is execl()'d (midi_tcp) / init_module'd;
+ *   - it still dodges ETXTBSY exactly as the old unlink-first did: an orphaned child
+ *     still exec'ing the old inode keeps it alive; rename only repoints the directory
+ *     entry onto the new inode.
+ * We always rewrite (never skip on a size match): a rebuild can change behaviour
+ * without changing the -static binary's byte count. */
 static void extract_ko(const char *path, const unsigned char *data, unsigned int len)
 {
-    /* Always unlink then rewrite - do NOT skip on a size match.  A size-only skip
-     * silently shipped a STALE binary whenever a rebuild changed behaviour without
-     * changing the static binary's byte count (e.g. a small logic tweak to midi_tcp
-     * that the -static link rounds to the same size): the daemon kept exec'ing the
-     * old midi_tcp and the fix never ran.  unlink() first also dodges ETXTBSY - if
-     * an orphaned midi_tcp child from a previous screenremote still has this file
-     * mmap'd as its executable, open(O_TRUNC) on it would fail; unlinking drops the
-     * directory entry (the running process keeps its old inode) so the new file
-     * lands on a fresh inode.  A few-hundred-KB rewrite per daemon start is
-     * negligible on this appliance and far cheaper than shipping a stale binary. */
-    unlink(path);
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd >= 0) { write(fd, data, len); close(fd); }
+    char tmp[512];
+    int fd, ok = 0;
+
+    if (snprintf(tmp, sizeof(tmp), "%s.tmp", path) >= (int)sizeof(tmp))
+        return;
+    fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) {
+        unsigned int off = 0;
+        ok = 1;
+        while (off < len) {
+            ssize_t w = write(fd, data + off, len - off);
+            if (w <= 0) { ok = 0; break; }   /* short/failed write -> abandon */
+            off += (unsigned int)w;
+        }
+        if (ok && fsync(fd) != 0) ok = 0;
+        close(fd);
+    }
+    if (ok && rename(tmp, path) == 0)
+        return;
+    unlink(tmp);   /* leave the existing good file in place on any failure */
 }
 
 /* Mode button keycode - g_mode */
@@ -1882,6 +1911,97 @@ static int capture_to_staging(void)
     return memcmp(staging, shadow, frame_bytes) != 0;
 }
 
+/* EVA-ready gate for the DEFERRED midi_bridge load.  midi_bridge's tap does a
+ * lock-xadd on OA's transmit-queue reader count; doing that while EVA is still
+ * bringing up the USB codec (the ~67 s "initializing user interface" window)
+ * wedges EVA - the observed brick.  So we hold the load until EVA has drawn its
+ * UI, detected from the framebuffer.
+ *
+ * Boot curve, measured on hardware (fb1, 8 bpp, sampled every 37th byte):
+ *   loading:  nonblack=0,  distinct=2   (67 s, dead flat - pure black + text)
+ *   UI drawn: nonblack>=21, distinct>=17 (Set List, the darkest default screen)
+ * The transition is a single-second snap with an enormous margin, so we AND two
+ * signals - non-black% (brightness) AND distinct palette-index count
+ * (colorfulness, immune to a dark UI) - and require both held for a couple of
+ * seconds so no one-frame anomaly can trip it.  Loading fails both by a mile. */
+#define EVA_UI_NONBLACK_PCT 10   /* loading=0,  darkest UI=21 */
+#define EVA_UI_DISTINCT_MIN 8    /* loading=2,  darkest UI=17 */
+#define EVA_UI_READY_CHECKS 2    /* consecutive 1 s passes before loading */
+/* Sample fb1 sparsely and report two independent "is EVA's UI up?" measures:
+ *   *pct      = percent of sampled pixels that are non-black (brightness)
+ *   *distinct = number of distinct 8-bpp palette indices seen (colorfulness)
+ * The loading/update screen is >90% black AND uses only a handful of indices
+ * (black + progress text/bar); even the darkest real UI (Set List, ~21-32%
+ * non-black) uses many indices.  distinct is therefore the sturdier signal - it
+ * doesn't collapse when the UI happens to be dark.  Either pointer may be NULL. */
+static void fb_metrics(int *pct, int *distinct)
+{
+    uint32_t i, n = 0, nb = 0, total = fb1_stride * fb_h;
+    uint8_t seen[256];
+    int d = 0;
+    if (pct) *pct = 0;
+    if (distinct) *distinct = 0;
+    if (!fb1_map || total == 0) return;
+    memset(seen, 0, sizeof(seen));
+    for (i = 0; i < total; i += 37) {
+        uint8_t v = fb1_map[i];
+        n++;
+        if (v) nb++;
+        if (!seen[v]) { seen[v] = 1; d++; }
+    }
+    if (pct)      *pct = n ? (int)((100u * nb) / n) : 0;
+    if (distinct) *distinct = d;
+}
+
+/* Load midi_bridge + open its /proc surfaces + start MIDI capture.  Called ONLY
+ * after EVA has drawn its UI (see the main loop).  midi_bridge taps OA's transmit
+ * queues (AllocReader) and reads the in-port objects at load; doing that while EVA
+ * is still initializing the USB codec wedges EVA (observed brick).  Loading it only
+ * after the UI is up removes it from that window entirely.  eva_ready=1 is passed
+ * because EVA is already up, so injection is enabled immediately (the in-module
+ * gate stays as defense-in-depth). */
+static void load_midi_bridge(void)
+{
+    unsigned long recv_fn = 0, reg_fn = 0, outport_fn = 0;
+    char params[512];
+    long ret;
+
+    /* EVA having drawn its UI implies OA is Live, so this returns at once - but
+     * assert it anyway before reading OA's in-memory objects. */
+    if (!wait_for_oa_live(50)) {
+        fprintf(stderr, "screenremote: OA not Live at midi_bridge load - MIDI disabled\n");
+        return;
+    }
+    resolve_kallsyms(&recv_fn, &reg_fn, &outport_fn);
+    if (!outport_fn) {
+        fprintf(stderr, "screenremote: no usable MIDI symbols in kallsyms - MIDI disabled\n");
+        return;
+    }
+    snprintf(params, sizeof(params),
+             "receive_fn=0x%lx register_fn=0x%lx regoutport=0x%lx eva_ready=1 tap_shared=1",
+             recv_fn, reg_fn, outport_fn);
+    extract_ko(MIDI_BRIDGE_KO, midi_bridge_ko, midi_bridge_ko_len);
+    ret = syscall(SYS_init_module, (void *)midi_bridge_ko,
+                  (unsigned long)midi_bridge_ko_len, params);
+    if (ret == 0 || errno == EEXIST) {
+        int _mi;
+        fprintf(stderr, "screenremote: midi_bridge %s (recv=%s reg=%s outport=%s)\n",
+                ret == 0 ? "loaded" : "already loaded",
+                recv_fn ? "ok" : "none", reg_fn ? "ok" : "none",
+                outport_fn ? "ok" : "none");
+        for (_mi = 0; _mi < 20 && midi_in_fd < 0; _mi++) {
+            usleep(100000);
+            midi_in_fd = open("/proc/.midi_in", O_WRONLY);
+        }
+        g_midi_loaded = (midi_in_fd >= 0);
+        start_midi_capture();
+        fprintf(stderr, "screenremote: midi_in=%d capture=%d\n",
+                midi_in_fd >= 0 ? 1 : 0, midi_cap_fd >= 0 ? 1 : 0);
+    } else {
+        fprintf(stderr, "screenremote: midi_bridge failed (%ld)\n", ret);
+    }
+}
+
 /* ---- Boot kernel-log capture (stock non-rooted diagnosis) ---------------
  * Stock (non-rooted) Kronos units have no dmesg/klogd, so a freeze during
  * early-boot module loading normally leaves no retrievable evidence - and
@@ -1968,14 +2088,40 @@ static void stop_helper_children(pid_t kmsg_pid)
     }
 }
 
+/* Pin ourselves - and, by inheritance across fork+exec, our streaming children and
+ * the midi_tcp child - to physical CORE 0 (logical CPUs 0,1).  On the Kronos (Atom
+ * D2550, 2 cores + HT: core0=CPU0,1 / core1=CPU2,3) the RT audio engine, EVA, and
+ * boot-time PCM sample loading all run on core 1, which pins at 100% during boot.
+ * The scheduler otherwise places screenremote's fb-streaming on core 1 too; that
+ * extra load during the ~4 s boot-settling window starves the RT engine, rtf0 backs
+ * up, and EVA freezes (confirmed: no crash without a client, i.e. without the
+ * streaming load).  Keeping our load on the otherwise-idle core 0 removes it from
+ * the RT core entirely.  Best-effort: a failure just leaves default scheduling. */
+static void pin_off_rt_core(void)
+{
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(0, &set);
+    CPU_SET(1, &set);
+    if (sched_setaffinity(0, sizeof(set), &set) != 0)
+        fprintf(stderr, "screenremote: sched_setaffinity(core0) failed: %s\n",
+                strerror(errno));
+    else
+        fprintf(stderr, "screenremote: pinned to core 0 (CPUs 0,1), off the RT core (2,3)\n");
+}
+
 /*  Main */
 int main(void)
 {
     pid_t kmsg_pid = -1;
+    pin_off_rt_core();   /* keep our load off the RT/sample-loading core - do this
+                          * before any fork so children inherit the affinity */
     int stream_listen, ctrl_listen, disc_fd = -1, client_fd = -1;
     /* ctrl_fd and ctrl_lb* are file-scope globals (see top of file) */
     uint8_t client_mode = MODE_CHANGE, client_fps = FPS_MAX;
-    time_t last_mirror_chk = 0, last_net_chk = 0;
+    time_t last_mirror_chk = 0, last_net_chk = 0, last_eva_chk = 0;
+    time_t g_start_time = time(NULL);  /* for FBCURVE relative timestamps */
+    int eva_ready_streak = 0;          /* consecutive EVA-UI-detected checks */
     struct timespec last_frame = {0, 0};
     ss_last_chg = time(NULL);
 
@@ -2072,65 +2218,27 @@ int main(void)
         }
     }
 
-    /* Load MIDI injection module */
-    if (load_mods && !boot_flag_found) {
-        unsigned long recv_fn = 0, reg_fn = 0;
-        unsigned long outport_fn = 0;
-
-        /* midi_bridge reads OA symbol addresses and OA in-memory objects (the MIDI
-         * in-port array and the out-queue it taps as a reader).  Unlike its
-         * predecessor midi_inject it does NOT patch OA .text, so the old
-         * module_put/.text-patch race is gone - but it still must not run until OA
-         * is fully MODULE_STATE_COMING->Live, or those objects aren't built yet.
-         * On the GRUB-hook boot path screenremote starts as soon as /proc/.oacmd
-         * appears, but that entry is created while OA is still COMING - so wait
-         * here until OA is actually Live.  On the rooted path OA is already Live
-         * when this runs, so the wait returns at once.  Timeout is generous; if OA
-         * never goes Live we skip MIDI rather than read half-built state. */
-        if (!wait_for_oa_live(600)) {
-            fprintf(stderr, "screenremote: OA not Live after 60s - "
-                    "skipping midi_bridge\n");
-            goto midi_done;
-        }
-
-        resolve_kallsyms(&recv_fn, &reg_fn, &outport_fn);
-        if (outport_fn) {
-            char params[512];
-            snprintf(params, sizeof(params),
-                     "receive_fn=0x%lx register_fn=0x%lx regoutport=0x%lx",
-                     recv_fn, reg_fn, outport_fn);
-            extract_ko(MIDI_BRIDGE_KO, midi_bridge_ko, midi_bridge_ko_len);
-            long ret = syscall(SYS_init_module,
-                               (void *)midi_bridge_ko,
-                               (unsigned long)midi_bridge_ko_len,
-                               params);
-            if (ret == 0 || errno == EEXIST) {
-                /* midi_bridge_init() always returns 0 to the kernel (setup is
-                 * deferred to a worker), so "the syscall succeeded" does not imply
-                 * "MIDI actually works"; /proc/.midi_in's openability below is the
-                 * real signal, so g_midi_loaded is set from that, not from ret. */
-                fprintf(stderr, "screenremote: midi_bridge %s "
-                        "(recv=%s reg=%s outport=%s)\n",
-                        ret == 0 ? "loaded" : "already loaded",
-                        recv_fn     ? "ok" : "none",
-                        reg_fn      ? "ok" : "none",
-                        outport_fn  ? "ok" : "none");
-
-                for (int _mi = 0; _mi < 20 && midi_in_fd < 0; _mi++) {
-                    usleep(100000);
-                    midi_in_fd = open("/proc/.midi_in", O_WRONLY);
-                }
-                g_midi_loaded = (midi_in_fd >= 0);
-                start_midi_capture();
-                fprintf(stderr, "screenremote: midi_in=%d capture=%d\n",
-                        midi_in_fd >= 0 ? 1 : 0, midi_cap_fd >= 0 ? 1 : 0);
-            } else {
-                fprintf(stderr, "screenremote: midi_bridge failed (%ld)\n", ret);
-            }
-        } else {
-            fprintf(stderr, "screenremote: no usable MIDI symbols in kallsyms - MIDI disabled\n");
-        }
-    midi_done: ;
+    /* MIDI injection module: DEFERRED, not loaded here.
+     *
+     * midi_bridge taps OA's transmit queues (AllocReader) and reads the in-port
+     * objects at load time.  Doing that while EVA is still "initializing user
+     * interface" - i.e. mid-init of the USB codec whose queues midi_bridge taps -
+     * wedges EVA (observed brick: EVA blocks and never reaches the UI, even with
+     * MIDI injection fully gated, so the load itself is the hazard, not injection).
+     *
+     * So we only flag it here and let the main loop load it once EVA has drawn its
+     * UI (framebuffer no longer mostly-black - see load_midi_bridge / EVA-ready
+     * latch).  vkbd above is safe to load now: it registers a uinput device and
+     * never touches OA.  OA-Live is implied by EVA having drawn its UI, so no
+     * separate wait_for_oa_live is needed on this path. */
+    if (access(FBCURVE_FLAG, F_OK) == 0) {
+        g_fbcurve_cal = 1;
+        FILE *cf = fopen(FBCURVE_LOG, "w");  /* fresh log per boot */
+        if (cf) fclose(cf);
+        fprintf(stderr, "screenremote: FBCURVE calibration mode - logging "
+                "framebuffer curve, midi_bridge will NOT load\n");
+    } else if (load_mods && !boot_flag_found) {
+        g_midi_load_pending = 1;
     }
 
     /* On the non-rooted boot path, screenremote starts before /sbin/init via the
@@ -2214,6 +2322,39 @@ int main(void)
         if (now - last_mirror_chk >= 1) {
             check_mirror_flag();
             last_mirror_chk = now;
+        }
+
+        /* Deferred midi_bridge load: hold the load until EVA has finished the
+         * ~67 s "initializing user interface" window (its tap wedges EVA if it
+         * fires mid codec-init).  EVA-done is signalled by the framebuffer both
+         * brightening AND gaining colors; require both for EVA_UI_READY_CHECKS
+         * consecutive seconds.  One-shot: cleared after the first load attempt.
+         * Runs regardless of client connections.  In calibration mode we only
+         * log the curve and never load (a brick-safe reboot for tuning). */
+        if (g_fbcurve_cal && now - last_eva_chk >= 1) {
+            last_eva_chk = now;
+            int pct = 0, dist = 0;
+            fb_metrics(&pct, &dist);
+            FILE *cf = fopen(FBCURVE_LOG, "a");
+            if (cf) {
+                fprintf(cf, "t=%ld nonblack=%d distinct=%d\n",
+                        (long)(now - g_start_time), pct, dist);
+                fclose(cf);
+            }
+        } else if (g_midi_load_pending && !g_midi_loaded && now - last_eva_chk >= 1) {
+            last_eva_chk = now;
+            int pct = 0, dist = 0;
+            fb_metrics(&pct, &dist);
+            if (pct >= EVA_UI_NONBLACK_PCT && dist >= EVA_UI_DISTINCT_MIN) {
+                if (++eva_ready_streak >= EVA_UI_READY_CHECKS) {
+                    fprintf(stderr, "screenremote: EVA UI up (nonblack=%d distinct=%d) "
+                                    "- loading midi_bridge\n", pct, dist);
+                    load_midi_bridge();
+                    g_midi_load_pending = 0;
+                }
+            } else {
+                eva_ready_streak = 0;
+            }
         }
 
         /* Periodic network check - re-bind if IP changed (DHCP, link down/up) */

@@ -22,6 +22,8 @@
  *   -s       don't daemonize
  */
 
+#define _GNU_SOURCE   /* for sched_setaffinity / CPU_SET */
+#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -34,6 +36,10 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <stdint.h>
+
+#ifndef SO_SNDBUFFORCE
+#define SO_SNDBUFFORCE 32   /* set SO_SNDBUF past wmem_max (needs CAP_NET_ADMIN/root) */
+#endif
 
 #define MAX_CLIENTS 8
 
@@ -54,8 +60,20 @@ static void broadcast(const uint8_t *buf, int len)
 {
     int i;
     for (i = 0; i < MAX_CLIENTS; i++) {
-        if (client_fds[i] >= 0)
-            send(client_fds[i], buf, len, MSG_DONTWAIT);
+        if (client_fds[i] < 0)
+            continue;
+        ssize_t n = send(client_fds[i], buf, len, MSG_DONTWAIT);
+        if (n != len) {
+            /* Short send or EAGAIN: this client's socket buffer is full (it has
+             * fallen behind), so a hole has just been punched in its byte stream -
+             * which would corrupt an in-flight SysEx dump.  We must NOT block the
+             * drain waiting for it, so drop the client instead of silently corrupting
+             * it; it can reconnect and re-request.  (The 256 KB SO_SNDBUFFORCE buffer
+             * absorbs momentary stalls, so reaching here means a sustained stall.) */
+            close(client_fds[i]);
+            client_fds[i] = -1;
+            if (num_clients > 0) num_clients--;
+        }
     }
 }
 
@@ -181,6 +199,23 @@ static void parser_feed(struct midi_parser *p, uint8_t b)
         return;
     }
 
+    /* Aborting status byte inside SysEx.  Real-time (0xF8-0xFF) and the terminator
+     * 0xF7 are handled above, so a byte with bit 7 set here (0x80-0xF6) is a status
+     * byte that, per the MIDI spec, ends the current SysEx.  Without this the parser
+     * would treat it as SysEx data and - because output is chunked - flush the
+     * following channel traffic to clients as SysEx garbage, and never leave
+     * in_sysex.  Flush any pending body and emit an 0xF7 so clients don't wedge in
+     * their own SysEx reassembly either, then fall through to process b as a new
+     * status byte. */
+    if (p->in_sysex && (b & 0x80)) {
+        uint8_t f7 = 0xF7;
+        if (p->len > 0) broadcast(p->buf, p->len);
+        broadcast(&f7, 1);
+        p->len = 0;
+        p->in_sysex = 0;
+        p->running_status = 0;
+    }
+
     /* SysEx body: accumulate and stream out in SYSEX_FLUSH_AT-sized chunks so a
      * large dump traverses the bridge live rather than being buffered whole.  The
      * flush keeps in_sysex set and re-emits no F0/F7 - the client parser stays in
@@ -268,6 +303,16 @@ int main(int argc, char *argv[]) {
     int i;
     struct sockaddr_in addr;
     struct midi_out_reader midi_out;
+
+    /* Stay on core 0 (CPUs 0,1), off the Kronos RT/EVA/sample-loading core (2,3).
+     * Inherited from screenremote across fork+exec, but set it explicitly too. */
+    {
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        CPU_SET(0, &set);
+        CPU_SET(1, &set);
+        sched_setaffinity(0, sizeof(set), &set);
+    }
     struct midi_parser parser;
     uint8_t buf[4096];
 
@@ -318,6 +363,7 @@ int main(int argc, char *argv[]) {
             port, midi_out.valid ? " (midi_ring)" : " (no MIDI out)", MAX_CLIENTS,
             SYSEX_FLUSH_AT);
 
+    int fast_polls = 0;   /* >0 = poll /proc/.midi_ring at 1 ms; re-armed on MIDI flow */
     while (running) {
         fd_set rfds;
         struct timeval tv;
@@ -332,8 +378,17 @@ int main(int argc, char *argv[]) {
             }
         }
 
+        /* Adaptive outbound-drain rate.  Polling /proc/.midi_ring at a fixed 1 kHz
+         * makes this process wake 1000x/sec; on the Kronos's RTAI kernel that many
+         * timer events through the RT interrupt pipeline starves the real-time audio
+         * engine under load and freezes EVA (confirmed: killing this poller un-froze
+         * it).  So poll slowly (20 ms) when idle and only burst to 1 ms while MIDI is
+         * actually flowing - a dump keeps re-arming fast_polls, so it drains at full
+         * speed, then settles back to the low-impact idle rate.  Inbound client data
+         * (dump requests) wakes select() immediately regardless of the timeout. */
         tv.tv_sec = 0;
-        tv.tv_usec = 1000;
+        if (fast_polls > 0) { tv.tv_usec = 1000; fast_polls--; }
+        else                  tv.tv_usec = 20000;
 
         int ret = select(maxfd + 1, &rfds, NULL, NULL, &tv);
         if (ret < 0) {
@@ -360,13 +415,14 @@ int main(int argc, char *argv[]) {
                     setsockopt(new_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
 
                     /* Big send buffer so a momentary client stall can't fill it and
-                     * make the MSG_DONTWAIT broadcast() silently drop a chunk mid-
-                     * SysEx (which offsets the rest of a bulk dump).  A full Set List
-                     * is ~79 KB; 256 KB gives comfortable margin.  Belt-and-braces
-                     * alongside the kernel-ring SPSC fix - kept non-blocking so a slow
-                     * client can never stall the /proc/.midi_ring drain. */
+                     * make the MSG_DONTWAIT broadcast() drop a chunk mid-SysEx (which
+                     * offsets the rest of a bulk dump).  A full Set List is ~79 KB;
+                     * 256 KB gives comfortable margin.  Use SO_SNDBUFFORCE (we run as
+                     * root) so the request isn't silently clamped to wmem_max (~106 KB
+                     * on this box); fall back to SO_SNDBUF if FORCE is unavailable. */
                     int sndbuf = 256 * 1024;
-                    setsockopt(new_fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+                    if (setsockopt(new_fd, SOL_SOCKET, SO_SNDBUFFORCE, &sndbuf, sizeof(sndbuf)) != 0)
+                        setsockopt(new_fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
 
                     /* Open MIDI injection and reset ring cursor on first client */
                     if (num_clients == 0) {
@@ -423,6 +479,9 @@ int main(int argc, char *argv[]) {
             int j;
             for (j = 0; j < n; j++)
                 parser_feed(&parser, buf[j]);
+            /* Any captured bytes = a dump/MIDI is flowing: stay at 1 ms for ~0.3 s
+             * past the last byte so the whole burst drains fast, then idle-slow. */
+            if (n > 0) fast_polls = 300;
         }
     }
 

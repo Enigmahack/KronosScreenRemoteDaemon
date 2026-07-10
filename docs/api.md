@@ -701,13 +701,17 @@ Once connected the server streams raw MIDI bytes captured from the Kronos MIDI o
 
 Internal Korg STG message-bus traffic (e.g. patch-name parameter broadcasts) never reaches the physical MIDI output layer and will not appear in the stream. These were incorrectly captured in versions prior to 1.7.4.
 
-**Generic, destination-agnostic capture (since 1.9.0).**
+**Generic, destination-agnostic capture.**
 
-The stream is a **single generic MIDI-out feed**: it carries everything the Kronos transmits, regardless of which physical destination (DIN or USB) a message is bound for, and the client never has to know or choose. Concretely, the kernel module taps OA's shared performance queue (notes, CC, program/combi changes, aftertouch, pitch bend, system-common) **once**, plus every out-port's per-destination dump queue, and merges them into this one stream.
+The stream is a **single generic MIDI-out feed**: it carries everything the Kronos transmits — live performance (notes, CC, program/combi change, aftertouch, pitch bend, system-common) **and** SysEx responses and bulk data dumps — regardless of which physical destination (DIN or USB) a message is bound for, and the client never has to know or choose. Concretely, the kernel module taps OA's shared performance queue **once** plus every out-port's per-destination dump queue, and merges them into this one stream.
 
-- **No duplication.** Each performance message appears **exactly once**, even when both DIN and USB outputs are enabled — they share one source queue, which is read once. **Migration note:** versions before 1.9.0 captured per physical port and doubled every event, and this doc previously told clients to deduplicate consecutive identical messages within ~5 ms. **That dedup logic must be removed** — it will now wrongly collapse two legitimately-identical rapid events (e.g. two successive identical CC values). Treat every message as a distinct event.
-- **Bulk data dumps are captured** to any destination. A dump the user sends to **USB** streams at memory speed (~800 KB/s+); one sent to **DIN** arrives at 5-pin MIDI speed (~3.6 KB/s) — the same bytes, just slower off the wire. Either way it lands on this one stream with no size cap.
+- **No duplication.** Each performance message appears **exactly once**, even when both DIN and USB outputs are enabled — they share one source queue, read once.
+- **Bulk data dumps are captured** to any destination. A dump sent to **USB** streams at memory speed (~800 KB/s+); one sent to **DIN** arrives at 5-pin MIDI speed (~3.6 KB/s) — the same bytes, just slower off the wire. Either way it lands on this one stream with no size cap.
 - OA may still emit its own genuine copies of some messages (e.g. a program change echoed per active timbre). Those are real MIDI from the Kronos, not a capture artifact, and are passed through unchanged.
+
+*(Real-time footprint, since 1.9.2: this continuous tap accesses the codec's real-time-critical memory, so it depends on the daemon being pinned off the audio engine's CPU core — see "Ring buffer and backpressure" below. A `tap_shared=0` module option drops live-performance capture and reads the codec queues only inside a request-scoped dump window, for a minimal-footprint dump-only build; it is **not** the default.)*
+
+**Migration note (pre-1.9.0):** early revisions captured per physical port and doubled every event, and this doc once told clients to deduplicate consecutive identical messages within ~5 ms. **That dedup logic must be removed** — treat every message as a distinct event.
 
 **Running status:**
 
@@ -719,11 +723,19 @@ SysEx is the exception. Rather than buffer a whole `F0…F7` block and broadcast
 
 **Ring buffer and backpressure:**
 
-The kernel module (`midi_bridge.ko`, since 1.9.0) captures MIDI out by attaching as an additional reader on OA's own transmit queues — it does **not** patch OA code. Captured bytes are staged in a 64 KB circular ring and drained to `midi_tcp` when it reads. Data written to the ring before any client is connected is discarded when the first client connects (the read cursor is reset). Draining is **best-effort**: if the client falls behind, the module skips its own copy forward rather than hold OA's transmit queue back — so a slow or stalled client can **never** throttle or corrupt the Kronos's real MIDI output; the only casualty is the client's own captured copy of the bytes it was too slow to read. Dropped bytes are counted in `overflow` in `/proc/.midi_ports` and should read `0` in normal use. A full USB Set List / All Data dump (multiple MB) has been verified to capture losslessly (`overflow=0`) at ~800 KB/s. *(Pre-1.9.0 revisions inline-hooked OA's output drain and used a shared spin-trylock that dropped a whole batch whenever the reader held the lock; under a dense bulk dump this punched holes into the SysEx byte stream and corrupted large objects. The current reader-tap design has neither hazard.)*
+The kernel module (`midi_bridge.ko`) captures MIDI out by attaching as an additional reader on OA's own transmit queues — it does **not** patch OA code. Captured bytes are staged in a 64 KB circular ring and drained to `midi_tcp` when it reads. Data written to the ring before any client is connected is discarded when the first client connects (the read cursor is reset). Draining is **best-effort**: if the client falls behind, the module skips its own copy forward rather than hold OA's transmit queue back — so a slow or stalled client can **never** throttle or corrupt the Kronos's real MIDI output; the only casualty is the client's own captured copy of the bytes it was too slow to read. Dropped bytes are counted in `overflow` in `/proc/.midi_ports` and should read `0` in normal use. A full USB Set List / All Data dump (multiple MB) has been verified to capture losslessly (`overflow=0`) at ~800 KB/s.
+
+**Real-time safety (1.9.2).** OA's transmit queues live in the codec's real-time-critical memory, so continuously tapping them is safe only because the daemon and its `midi_tcp` subprocess are pinned to a CPU core away from the audio engine's core (`sched_setaffinity`). Two related operational notes for host software:
+- **MIDI is unavailable for roughly the first minute after power-on.** `midi_bridge` is loaded only after the Kronos UI has finished initializing (the port `9875` listener does not exist before then); a connection attempt before that simply fails and should be retried. `MIDI_STATUS` (§7) reports readiness.
+- The core-pinning is internal and needs no client action, but it is why streaming + continuous MIDI capture can run together without disturbing the synth. *(Earlier builds let the OS schedule streaming onto the audio core; during the boot-settling window that starved the real-time engine and froze the UI — the whole reason capture is gated on both the core pinning and the deferred, post-UI load.)*
+
+*(Pre-1.9.0 revisions inline-hooked OA's output drain and used a shared spin-trylock that dropped a whole batch whenever the reader held the lock; under a dense bulk dump this punched holes into the SysEx byte stream and corrupted large objects. The current reader-tap design has neither hazard.)*
 
 ### 8.3 Inbound - client MIDI -> Kronos
 
 Write raw MIDI bytes to the TCP connection to inject them into the Kronos MIDI receive engine (`MidiInPortGeneric7Receive`). Any valid MIDI message type is accepted: note on/off, CC, program change, pitch bend, SysEx, real-time, etc.
+
+Requests are injected into the Kronos's **USB** input port, so the Kronos routes its reply back out the fast USB path — a Set List dump returns in well under a second rather than the ~25 s a DIN-routed reply would take. The reply appears on the port-9875 outbound stream (§8.2); the normal dump workflow is *inject the request, then collect the reply off that stream*. (In the non-default `tap_shared=0` dump-only build, injecting is also what opens the outbound capture window.)
 
 Maximum single write: 4096 bytes (kernel module buffer limit). Larger payloads must be split across multiple writes.
 

@@ -73,6 +73,60 @@ module_param(register_fn, ulong, 0444);
 static unsigned long regoutport = 0;
 module_param(regoutport, ulong, 0444);
 
+/* Which sMidiInPorts index to inject into. -1 (default) = auto-select the USB
+ * in-port by type (see in_type); >=0 = force that index (diagnostics).
+ *
+ * OA routes a SysEx reply back to the SOURCE the request arrived on. A dump
+ * request injected into the DIN in-port replies on the slow 5-pin path
+ * (~3.6 KB/s, ~25 s for a 79 KB Set List); injected into the USB in-port it
+ * replies on the fast USB path (~800 KB/s, well under a second). Verified on
+ * hardware: the reply is source-routed, NOT broadcast to both. Applied at load. */
+static int in_port = -1;
+module_param(in_port, int, 0644);
+
+/* Port-type byte (CSTGMidiInPort +0x25) of the USB in-port, used for auto-select.
+ * The codec's two inputs are type 0x00 (DIN) and 0x01 (USB), mirroring the two
+ * out-ports; 0x01 is USB. Param so it can be retargeted per OS version if needed. */
+static int in_type = 0x01;
+module_param(in_type, int, 0644);
+
+/* Tap the SHARED performance queues (q1,q2) in addition to the per-port bulk-dump
+ * queues (q3)?  q2 carries live notes/CC/program-change/combi SysEx, so tapping it
+ * gives live-performance capture on the stream.  BUT: draining q2 at ~1 kHz while a
+ * client streams races with OA reconfiguring MIDI during a Program/Combi *load*
+ * (e.g. a Set List program change) and wedges EVA - reproduced on hardware, with
+ * inject_ok=0 proving injection was not involved.  Default OFF: capture bulk dumps
+ * (the primary feature, per-port q3, untouched by program loads) safely, and leave
+ * live-note streaming opt-in until the shared-queue race is understood/fixed. */
+static int tap_shared = 0;
+module_param(tap_shared, int, 0644);
+
+/* Injection gate. MIDI IN injection (midi_write) is BLOCKED until this is set.
+ * A client that reconnects and sends SysEx while EVA is still "initializing user
+ * interface" injects into the USB codec mid-init and wedges EVA (observed brick).
+ * screenremote latches this to 1 once it sees EVA has drawn the UI (framebuffer
+ * no longer mostly-black). Injections before that are silently dropped. */
+static int eva_ready = 0;
+module_param(eva_ready, int, 0644);
+static uint32_t inject_gated;   /* count of injections dropped while not ready */
+static uint32_t inject_ok;      /* count of injections that reached OA (fn called) */
+static uint32_t inject_bytes;   /* total bytes handed to MidiInPortGeneric7Receive */
+static uint8_t  inject_first;   /* first byte of the most recent injection */
+
+/* Drain window.  The per-port queues live in the codec's ioremapped memory, and
+ * even IDLE 1 kHz wpos polling there contends with the RT engine under load
+ * (framebuffer stream + rtf5 touch + a Program/Combi load) and stalls it -> EVA
+ * freeze.  Dumps are always client-request-driven, so we poll/drain the codec
+ * region ONLY inside a window opened by an injection (the dump request) and kept
+ * alive while reply bytes are still flowing.  Outside the window tap_drain touches
+ * no codec memory at all.  jiffies-based; best-effort, no lock needed. */
+static unsigned long drain_until;          /* drain active while time_before(jiffies, this) */
+static int slots_held;                      /* 1 while reader slots are claimed (dump window) */
+#define DRAIN_OPEN_MS    3000   /* window after a dump request (covers OA reply latency);
+                                 * kept short so a non-dump inject (e.g. a connect-time
+                                 * Device Inquiry) doesn't hold the reader slot long */
+#define DRAIN_EXTEND_MS  2000   /* keep alive this long past the last captured byte */
+
 
 /* Port layout from CSTGMidiOutPort::Activate: queue ptr @ port+0x08/+0x14/+0x20/
  * +0x2c, data buffer @ port+0x0c/+0x18/+0x24/+0x30 (reader-index bytes at
@@ -163,15 +217,15 @@ static unsigned long resolve_out_ports(unsigned long fn)
     return (unsigned long)*(const uint32_t *)(p + 7);
 }
 
-/* Claim a spare reader slot on one queue slot of the given out-port object. Mirrors OA's
- * AllocReader (lock xadd on the count byte) without calling into OA .text. On
- * success appends a tapq entry and returns 0; returns -1 if that queue is invalid
- * or already has all 4 reader slots in use (refuse rather than corrupt). */
+/* Resolve one queue slot of the given out-port object into a tapq entry WITHOUT
+ * claiming a reader slot (reader_idx=-1).  We claim on demand per dump window (see
+ * tap_claim_slots) rather than persistently: a persistent AllocReader slot in the
+ * codec's ioremapped queue memory collides with OA's codec-MIDI reconfiguration on
+ * a Program/Combi load and stalls the RT engine (observed EVA freeze). Returns 0 on
+ * success (appends a tapq), -1 if the queue pointers are invalid. */
 static int tap_claim_one(unsigned long portp, int qslot)
 {
     unsigned long qptr, qbuf;
-    volatile uint8_t *rcount;
-    uint8_t idx;
     struct tapq *t;
 
     qptr = *(uint32_t *)(portp + QUEUE_PTR_OFF[qslot]);
@@ -179,27 +233,58 @@ static int tap_claim_one(unsigned long portp, int qslot)
     if (!kptr_ok(qptr) || !kptr_ok(qbuf))
         return -1;
 
-    rcount = (volatile uint8_t *)(qptr + RC_RCOUNT);
-    if (*rcount >= RC_MAXREADERS)   /* no spare slot - refuse (never corrupt) */
-        return -1;
-    /* No concurrent AllocReader at runtime (OA builds its out-ports once at boot),
-     * so read-then-add is race-free here. */
-    idx = __sync_fetch_and_add(rcount, 1);
-    if (idx >= RC_MAXREADERS) {      /* raced to full - back out */
-        __sync_fetch_and_sub(rcount, 1);
-        return -1;
-    }
-
     t = &taps[ntaps++];
     t->ringctl    = qptr;
     t->buf        = qbuf;
     t->mask       = *(uint32_t *)(qptr + RC_MASK);
     t->cap        = t->mask + 1;
-    t->reader_idx = idx;
-    /* Start from "now" so we don't dump the pre-existing backlog. */
-    t->cursor     = *(uint32_t *)(qptr + RC_WPOS);
-    *(uint32_t *)(qptr + RC_RCUR0 + idx * 4) = t->cursor;
+    t->reader_idx = -1;   /* unclaimed - claimed on demand while a dump window is open */
+    t->cursor     = 0;
     return 0;
+}
+
+/* Claim a spare reader slot on every resolved queue (OA's AllocReader = lock xadd on
+ * the count byte).  Called when a dump window opens; the slots are released again the
+ * moment it closes (tap_release_slots) so nothing is held during idle or mode changes.
+ * Skips a queue whose 4 slots are all in use (refuse rather than corrupt). */
+static void tap_claim_slots(void)
+{
+    int i;
+    for (i = 0; i < ntaps; i++) {
+        struct tapq *t = &taps[i];
+        volatile uint8_t *rcount;
+        uint8_t idx;
+        if (!t->ringctl || t->reader_idx >= 0)
+            continue;
+        rcount = (volatile uint8_t *)(t->ringctl + RC_RCOUNT);
+        if (*rcount >= RC_MAXREADERS)
+            continue;
+        idx = __sync_fetch_and_add(rcount, 1);
+        if (idx >= RC_MAXREADERS) { __sync_fetch_and_sub(rcount, 1); continue; }
+        t->reader_idx = idx;
+        t->cursor     = *(uint32_t *)(t->ringctl + RC_WPOS);   /* start from now */
+        *(uint32_t *)(t->ringctl + RC_RCUR0 + idx * 4) = t->cursor;
+    }
+}
+
+/* Give back every currently-claimed slot but KEEP the resolved queue info so the next
+ * dump window can re-claim.  Safe because OA never grows a queue's reader count at
+ * runtime, so we are always the top reader (count == reader_idx+1). */
+static void tap_release_slots(void)
+{
+    int i;
+    for (i = 0; i < ntaps; i++) {
+        struct tapq *t = &taps[i];
+        volatile uint8_t *rcount;
+        if (!t->ringctl || t->reader_idx < 0)
+            continue;
+        rcount = (volatile uint8_t *)(t->ringctl + RC_RCOUNT);
+        if (*rcount == (uint8_t)(t->reader_idx + 1)) {
+            *(uint32_t *)(t->ringctl + RC_RCUR0 + t->reader_idx * 4) = 0;
+            __sync_fetch_and_sub(rcount, 1);
+        }
+        t->reader_idx = -1;
+    }
 }
 
 /* Generic capture: tap the SHARED performance queues (q1,q2 - identical across
@@ -208,7 +293,9 @@ static int tap_claim_one(unsigned long portp, int qslot)
  * MIDI-out stream: performance appears once (no duplication - verified on hardware,
  * per-port queues don't echo the shared stream), and a dump sent to ANY
  * destination (USB or DIN) is captured. q0 (active-sensing/realtime) is excluded.
- * Returns the number of queues successfully tapped. */
+ * This only RESOLVES the queues (pointers into tapq[]); reader slots are claimed on
+ * demand per dump window (tap_claim_slots), never held persistently.
+ * Returns the number of queues resolved. */
 static int tap_claim_reader(void)
 {
     unsigned long p0 = 0;
@@ -226,8 +313,12 @@ static int tap_claim_reader(void)
     if (!p0)
         return 0;
 
-    tap_claim_one(p0, 1);   /* q1 shared (misc)                    */
-    tap_claim_one(p0, 2);   /* q2 shared (performance: notes/CC/PC/combi SysEx) */
+    /* Shared queues carry live performance BUT draining them races with OA's MIDI
+     * reconfiguration on a Program/Combi load and wedges EVA - opt-in via param. */
+    if (tap_shared) {
+        tap_claim_one(p0, 1);   /* q1 shared (misc)                    */
+        tap_claim_one(p0, 2);   /* q2 shared (performance: notes/CC/PC/combi SysEx) */
+    }
 
     /* Per-port bulk-dump queue (q3) from every activated out-port. */
     for (i = 0; i < 4; i++) {
@@ -235,6 +326,13 @@ static int tap_claim_reader(void)
         if (kptr_ok(v))
             tap_claim_one(v, 3);
     }
+    /* Close the drain window NOW.  drain_until must not stay 0: on this kernel
+     * jiffies boots negative-as-signed, so time_after(jiffies, 0) is FALSE and the
+     * drain would poll the codec region at idle from boot until the first dump -
+     * exactly the RT-stall we are avoiding.  Seed it to the current jiffies so the
+     * gate is shut until a real injection opens it (one tick in the past so
+     * time_after() is already true on the very first drain check). */
+    drain_until = jiffies - 1;
     return ntaps;
 }
 
@@ -244,19 +342,10 @@ static int tap_claim_reader(void)
 static void tap_release_reader(void)
 {
     int i;
-    for (i = 0; i < ntaps; i++) {
-        struct tapq *t = &taps[i];
-        volatile uint8_t *rcount = (volatile uint8_t *)(t->ringctl + RC_RCOUNT);
-        if (!t->ringctl || t->reader_idx < 0)
-            continue;
-        /* Only decrement if the count is still exactly what we left it. */
-        if (*rcount == (uint8_t)(t->reader_idx + 1)) {
-            *(uint32_t *)(t->ringctl + RC_RCUR0 + t->reader_idx * 4) = 0;
-            __sync_fetch_and_sub(rcount, 1);
-        }
-        t->ringctl = 0;
-        t->reader_idx = -1;
-    }
+    tap_release_slots();      /* give back any slot still held by an open dump window */
+    slots_held = 0;
+    for (i = 0; i < ntaps; i++)
+        taps[i].ringctl = 0;
     ntaps = 0;
 }
 
@@ -271,6 +360,15 @@ static void tap_drain_one(struct tapq *t)
         return;
 
     wpos  = *(volatile uint32_t *)(t->ringctl + RC_WPOS);
+    /* Idle fast-path: nothing new transmitted.  Return WITHOUT writing our cursor
+     * back - the per-port queues live in the codec's ioremapped region, and a
+     * cursor writeback on every 1 kHz poll (even when idle) hammers that region in
+     * parallel with the framebuffer stream and stalls the RT engine (observed EVA
+     * freeze).  When idle our cursor already equals wpos, so the writeback was a
+     * no-op semantically anyway; skipping it means idle costs one ioremapped READ
+     * of wpos and nothing else. */
+    if (wpos == t->cursor)
+        return;
     avail = wpos - t->cursor;
     /* If we fell more than a full buffer behind, those bytes were already refused
      * by the writer; resync to the oldest still-valid data. */
@@ -290,6 +388,15 @@ static void tap_drain_one(struct tapq *t)
     uni_wpos  += take;
     t->cursor += take;
 
+    /* Reply bytes are still arriving - keep the drain window open so a long dump
+     * (which can outlast the initial DRAIN_OPEN_MS) isn't cut off.  Only ever push
+     * the deadline forward, never shorten a still-open window. */
+    if (take) {
+        unsigned long e = jiffies + msecs_to_jiffies(DRAIN_EXTEND_MS);
+        if (time_after(e, drain_until))
+            drain_until = e;
+    }
+
     /* Best-effort: drop our copy (not OA's) rather than let our backlog grow. */
     if (wpos != t->cursor) {
         uni_overflow += wpos - t->cursor;
@@ -304,6 +411,25 @@ static void tap_drain_one(struct tapq *t)
 static void tap_drain(void)
 {
     int i;
+    /* tap_shared = live-capture mode: the shared performance queue carries a
+     * continuous stream (notes/CC/PC/...), not request-driven traffic, so the slots
+     * are claimed persistently (at setup) and we drain EVERY read.  This was unsafe
+     * before the CPU-affinity fix (streaming crowded the RT core); with the daemon
+     * pinned off that core it is being re-validated. */
+    if (tap_shared) {
+        for (i = 0; i < ntaps; i++)
+            tap_drain_one(&taps[i]);
+        return;
+    }
+    /* Default (dump-only) mode: outside a dump window hold NO reader slot and touch
+     * NO codec memory (a persistent slot collides with OA's codec-MIDI reconfig on a
+     * mode change; idle ioremapped polling stalls the RT engine).  Release on close,
+     * claim on open, entirely in this (drain) context under ring_lock. */
+    if (time_after(jiffies, drain_until)) {
+        if (slots_held) { tap_release_slots(); slots_held = 0; }
+        return;
+    }
+    if (!slots_held) { tap_claim_slots(); slots_held = 1; }
     for (i = 0; i < ntaps; i++)
         tap_drain_one(&taps[i]);
 }
@@ -316,14 +442,22 @@ static ssize_t ring_fops_read(struct file *file, char __user *buf,
                               size_t count, loff_t *ppos)
 {
     uint32_t avail, take, off, first;
-    unsigned long flags;
 
     /* Drain the tapped queues into uni_ring first, in this reader's context.
-     * ring_lock + oa_dead guard against OA teardown mid-drain. */
-    spin_lock_irqsave(&ring_lock, flags);
-    if (!oa_dead)
-        tap_drain();
-    spin_unlock_irqrestore(&ring_lock, flags);
+     * ring_lock + oa_dead guard against OA teardown mid-drain.
+     *
+     * midi_tcp polls this at ~1 kHz.  spin_lock_irqsave disables interrupts, and
+     * doing that 1000x/sec disrupts the RTAI real-time engine under load (confirmed
+     * on hardware: killing the poller un-froze EVA).  So take the IRQ-off lock ONLY
+     * when there is real work - a dump window is open, or a slot is still held and
+     * needs releasing now that the window closed.  At idle this is a lock-free,
+     * interrupt-safe "ring is empty -> return 0", with no RT impact. */
+    if (tap_shared || time_before(jiffies, drain_until) || slots_held) {
+        spin_lock(&ring_lock);
+        if (!oa_dead)
+            tap_drain();
+        spin_unlock(&ring_lock);
+    }
 
     avail = uni_wpos - uni_rpos;
     if (avail == 0)
@@ -351,17 +485,22 @@ static ssize_t ring_fops_read(struct file *file, char __user *buf,
 static ssize_t ring_fops_write(struct file *file, const char __user *buf,
                                size_t count, loff_t *ppos)
 {
-    unsigned long flags;
     int i;
-    spin_lock_irqsave(&ring_lock, flags);
+    spin_lock(&ring_lock);
     uni_rpos = uni_wpos;
+    /* Only resync queues we currently hold a slot on.  When no dump window is open
+     * reader_idx is -1 (unclaimed) and we must NOT touch the codec memory - writing
+     * at RC_RCUR0 + (-1)*4 would clobber RC_WPOS, and any access here is exactly the
+     * idle codec traffic that stalls the RT engine. */
     if (!oa_dead)
         for (i = 0; i < ntaps; i++) {
             struct tapq *t = &taps[i];
+            if (!t->ringctl || t->reader_idx < 0)
+                continue;
             t->cursor = *(volatile uint32_t *)(t->ringctl + RC_WPOS);
             *(uint32_t *)(t->ringctl + RC_RCUR0 + t->reader_idx * 4) = t->cursor;
         }
-    spin_unlock_irqrestore(&ring_lock, flags);
+    spin_unlock(&ring_lock);
     return (ssize_t)count;
 }
 
@@ -379,8 +518,12 @@ static int ports_read_proc(char *page, char **start, off_t off,
                            int count, int *eof, void *data)
 {
     int len = 0, i;
-    len += sprintf(page + len, "out_ports=0x%lx ntaps=%d overflow=%u\n",
-                   out_ports, ntaps, uni_overflow);
+    len += sprintf(page + len, "out_ports=0x%lx ntaps=%d overflow=%u eva_ready=%d "
+                   "inject_gated=%u inject_ok=%u inject_bytes=%u inject_first=0x%02x "
+                   "drain_open=%d\n",
+                   out_ports, ntaps, uni_overflow, eva_ready,
+                   inject_gated, inject_ok, inject_bytes, inject_first,
+                   time_before(jiffies, drain_until) ? 1 : 0);
     for (i = 0; i < ntaps; i++) {
         struct tapq *t = &taps[i];
         uint8_t rc = *(volatile uint8_t *)(t->ringctl + RC_RCOUNT);
@@ -416,12 +559,55 @@ static void *find_port_object(void)
     ports_array = (uint32_t *)*(uint32_t *)(fn_bytes + 7);
     printk(KERN_INFO "midi_bridge: sMidiInPorts at %p\n", ports_array);
 
-    for (i = 0; i < 4; i++) {
+    /* Enumerate for diagnosis: type (+0x25), active-flag (+0x26 bit1), vtable. */
+    for (i = 0; i < 8; i++) {
+        uint32_t addr = ports_array[i];
+        if (addr > 0x40000000) {
+            uint8_t *p = (uint8_t *)(unsigned long)addr;
+            printk(KERN_INFO "midi_bridge:   inport[%d]=%08x type=0x%02x flags=0x%02x vtbl=%08x\n",
+                   i, addr, p[0x25], p[0x26], *(uint32_t *)p);
+        }
+    }
+
+    /* Explicit index override (diagnostics). */
+    if (in_port >= 0 && in_port < 8) {
+        uint32_t addr = ports_array[in_port];
+        if (addr > 0x40000000) {
+            printk(KERN_INFO "midi_bridge: injecting into sMidiInPorts[%d]=%08x (forced)\n",
+                   in_port, addr);
+            return (void *)(unsigned long)addr;
+        }
+        printk(KERN_WARNING "midi_bridge: in_port=%d not present, falling back\n", in_port);
+    }
+
+    /* Default: auto-select the active USB in-port (type == in_type) so injected
+     * requests get fast USB-routed replies.
+     * SAFETY TODO (not yet implemented): gate injection (midi_write) until EVA has
+     * finished "initializing user interface" - a client that reconnects and sends
+     * SysEx DURING boot injects into the USB codec mid-init and wedges EVA - so
+     * injection is gated by eva_ready (set by screenremote once the UI is drawn). */
+    for (i = 0; i < 8; i++) {
+        uint32_t addr = ports_array[i];
+        if (addr > 0x40000000) {
+            uint8_t *p = (uint8_t *)(unsigned long)addr;
+            if ((p[0x26] & 0x02) && p[0x25] == (uint8_t)in_type) {
+                printk(KERN_INFO "midi_bridge: injecting into USB in-port sMidiInPorts[%d]=%08x (type=0x%02x)\n",
+                       i, addr, p[0x25]);
+                return (void *)(unsigned long)addr;
+            }
+        }
+    }
+
+    /* Fallback: first active in-port (legacy behaviour, e.g. DIN). */
+    for (i = 0; i < 8; i++) {
         uint32_t addr = ports_array[i];
         if (addr > 0x40000000) {
             uint8_t flags = ((uint8_t *)(unsigned long)addr)[0x26];
-            if (flags & 0x02)
+            if (flags & 0x02) {
+                printk(KERN_INFO "midi_bridge: no USB in-port (type 0x%02x); "
+                       "falling back to first active sMidiInPorts[%d]=%08x\n", in_type, i, addr);
                 return (void *)(unsigned long)addr;
+            }
         }
     }
     return NULL;
@@ -436,16 +622,24 @@ static int midi_write(struct file *f, const char __user *buf,
     void *obj;
     uint8_t *kbuf;
     int len = count > MIDI_INJECT_MAX ? MIDI_INJECT_MAX : count;
-    unsigned long flags;
 
-    spin_lock_irqsave(&ring_lock, flags);
+    /* Gate: block ALL injection until EVA has finished booting. Injecting into
+     * the USB codec while EVA is initializing wedges it - screenremote latches
+     * eva_ready once the UI is drawn. Accept-and-drop (return count) so callers
+     * (MIDI_SEND / raw 9875) don't error; nothing reaches OA. */
+    if (!eva_ready) {
+        inject_gated++;
+        return count;
+    }
+
+    spin_lock(&ring_lock);
     if (oa_dead || !port_obj || !receive_fn) {
-        spin_unlock_irqrestore(&ring_lock, flags);
+        spin_unlock(&ring_lock);
         return -ENODEV;
     }
     fn  = (receive_fn_t)receive_fn;
     obj = port_obj;
-    spin_unlock_irqrestore(&ring_lock, flags);
+    spin_unlock(&ring_lock);
 
     if (len <= 0)
         return count;
@@ -458,6 +652,18 @@ static int midi_write(struct file *f, const char __user *buf,
         kfree(kbuf);
         return -EFAULT;
     }
+    inject_first = kbuf[0];
+    inject_ok++;
+    inject_bytes += len;
+    /* Open the drain window AND claim our reader slots NOW, before injecting the
+     * request - so the slot is held from before OA starts replying and the whole
+     * dump is captured losslessly even though the drainer may poll slowly (20 ms)
+     * at idle.  Claiming here (not lazily in the drain) avoids missing the reply's
+     * first bytes.  Under ring_lock, serialized with the drain's claim/release. */
+    spin_lock(&ring_lock);
+    drain_until = jiffies + msecs_to_jiffies(DRAIN_OPEN_MS);
+    if (!oa_dead && !slots_held) { tap_claim_slots(); slots_held = 1; }
+    spin_unlock(&ring_lock);
     fn(obj, kbuf, len);
     kfree(kbuf);
     return count;
@@ -473,16 +679,15 @@ static int midi_module_notify(struct notifier_block *nb,
     struct module *mod = data;
     if (action == MODULE_STATE_GOING &&
         (strcmp(mod->name, "OA") == 0 || strcmp(mod->name, "loadmod") == 0)) {
-        unsigned long flags;
         /* OA is being torn down ("Preparing to Install"). Stop touching OA memory:
          * disable injection and the tap. No .text to restore, no trampoline to
          * leak - the hook-free design has nothing to undo here beyond releasing
          * our reader slot while OA memory is still valid. */
-        spin_lock_irqsave(&ring_lock, flags);
+        spin_lock(&ring_lock);
         oa_dead   = 1;
         port_obj  = NULL;
         tap_release_reader();
-        spin_unlock_irqrestore(&ring_lock, flags);
+        spin_unlock(&ring_lock);
         printk(KERN_INFO "midi_bridge: %s unloading, MIDI disabled\n", mod->name);
     }
     return NOTIFY_OK;
@@ -516,7 +721,18 @@ static void midi_setup(struct work_struct *work)
         if (out_ports && tap_claim_reader() > 0) {
             int i;
             have_out = 1;
-            printk(KERN_INFO "midi_bridge: generic out tap, %d queue(s):\n", ntaps);
+            /* tap_shared live-capture mode holds the slots persistently; default
+             * dump-only mode claims them on demand per dump window. */
+            if (tap_shared) {
+                spin_lock(&ring_lock);
+                tap_claim_slots();
+                slots_held = 1;
+                spin_unlock(&ring_lock);
+            }
+            printk(KERN_INFO "midi_bridge: generic out tap, %d queue(s) resolved "
+                   "(%s):\n", ntaps,
+                   tap_shared ? "shared+per-port, slots held (live-capture mode)"
+                              : "slots claimed on demand per dump");
             for (i = 0; i < ntaps; i++)
                 printk(KERN_INFO "midi_bridge:   tap[%d] ringctl=0x%lx cap=%u readerIdx=%d\n",
                        i, taps[i].ringctl, taps[i].cap, taps[i].reader_idx);
@@ -564,18 +780,17 @@ static int __init midi_bridge_init(void)
 
 static void __exit midi_bridge_exit(void)
 {
-    unsigned long flags;
     flush_scheduled_work();
     unregister_module_notifier(&midi_nb);
 
     /* Release our reader slot while OA memory is still valid (unless OA already
      * went away, in which case the notifier already released it). */
-    spin_lock_irqsave(&ring_lock, flags);
+    spin_lock(&ring_lock);
     if (!oa_dead)
         tap_release_reader();
     oa_dead  = 1;
     port_obj = NULL;
-    spin_unlock_irqrestore(&ring_lock, flags);
+    spin_unlock(&ring_lock);
 
     if (proc_midi_ports)
         remove_proc_entry(".midi_ports", NULL);
