@@ -44,6 +44,9 @@ desktop.ini
 
 # Troubleshooting Files
 .rawGrab/
+tools/evatrace/
+shm_peek_module/
+chord_probe_module/
 
 # Unnecessary files/documentation
 docs/vm_environment.md

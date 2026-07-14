@@ -122,7 +122,7 @@
 #define KBD_EV_KEY  1
 
 /*  Version */
-#define SCREENREMOTE_VERSION "1.10.0"
+#define SCREENREMOTE_VERSION "1.11.0"
 #ifndef BUILD_ID
 #define BUILD_ID "dev"
 #endif
