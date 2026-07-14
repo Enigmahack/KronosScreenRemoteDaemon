@@ -20,16 +20,19 @@ vkbd_ko.h: ../vkbd_module/vkbd.c ../vkbd_module/Kbuild
 midi_bridge_ko.h: ../midi_module/midi_bridge.c ../midi_module/Kbuild
 	$(MAKE) -C ../midi_module -f Makefile.module
 
+nks4_inject_ko.h: ../nks4_inject_module/nks4_inject.c ../nks4_inject_module/Kbuild
+	$(MAKE) -C ../nks4_inject_module -f Makefile.module
+
 midi_tcp_bin.h: midi_tcp.c
 	$(CC) $(CFLAGS) -o midi_tcp_bin midi_tcp.c
 	xxd -i midi_tcp_bin > $@
 	rm -f midi_tcp_bin
 
-$(OUTDIR)/screenremote: screenremote.c vkbd_ko.h midi_bridge_ko.h midi_tcp_bin.h
+$(OUTDIR)/screenremote: screenremote.c vkbd_ko.h midi_bridge_ko.h nks4_inject_ko.h midi_tcp_bin.h
 	$(CC) $(CFLAGS) -DBUILD_ID=\"$(BUILD_ID)\" -o $@ screenremote.c
 
 clean:
-	rm -f $(TARGETS) vkbd_ko.h midi_bridge_ko.h midi_tcp_bin.h midi_tcp_bin
+	rm -f $(TARGETS) vkbd_ko.h midi_bridge_ko.h nks4_inject_ko.h midi_tcp_bin.h midi_tcp_bin
 	# Recurse into the kernel-module build dirs.  Without this, `make clean`
 	# leaves the old .ko/.o in place; kbuild then skips recompiling when the
 	# module source mtime isn't newer than the artifact (common right after a
@@ -38,5 +41,6 @@ clean:
 	# unfixed module.
 	$(MAKE) -C ../vkbd_module -f Makefile.module clean
 	$(MAKE) -C ../midi_module -f Makefile.module clean
+	$(MAKE) -C ../nks4_inject_module -f Makefile.module clean
 
 .PHONY: all clean

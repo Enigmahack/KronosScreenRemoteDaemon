@@ -15,10 +15,11 @@ This document describes every network interface exposed by the `screenremote` da
 7. [Control port - command reference](#7-control-port---command-reference)
 8. [MIDI bridge - port 9875](#8-midi-bridge---port-9875)
 9. [Button name reference](#9-button-name-reference)
-10. [SYSINFO field reference](#10-sysinfo-field-reference)
-11. [Authentication internals](#11-authentication-internals)
-12. [Error handling and disconnection](#12-error-handling-and-disconnection)
-13. [Implementation limits](#13-implementation-limits)
+10. [Analog device code reference](#10-analog-device-code-reference)
+11. [SYSINFO field reference](#11-sysinfo-field-reference)
+12. [Authentication internals](#12-authentication-internals)
+13. [Error handling and disconnection](#13-error-handling-and-disconnection)
+14. [Implementation limits](#14-implementation-limits)
 
 ---
 
@@ -245,6 +246,18 @@ In persistent mode the server reads commands with `O_NONBLOCK` and never blocks 
 
 All commands respond with `OK\n` on success or `ERR\n` on invalid arguments, except where noted.
 
+### 7.0 Front-panel injection architecture (as of 1.10.0)
+
+`TOUCH*`, `BUTTON`, `CHORD`, `WHEEL`, `SLIDER`, `KNOB`, and `VSLIDER` no longer write raw packets to `/dev/rtf5`. Prior versions of this daemon injected events by writing directly to `/dev/rtf5`, the RTAI FIFO Eva reads front-panel events from. That worked well for touch and mode-select buttons but never reliably drove sequencer transport, tempo, or some MIDI-triggering touch actions - because `/dev/rtf5` is actually OA.ko's own **outbound** notification channel to Eva, not an input path. Genuine hardware events reach OA through a separate, internal route (`CSTGOmapNKSMsgHandler::ProcessNextNKSEvent()` pulling raw NKS4 commands and dispatching straight to `CSTGFrontPanel::Handle*`), so a synthetic rtf5 packet only ever fooled Eva's own UI-mirroring logic - it never touched the real OA-side action that channel was originally logging.
+
+As of 1.10.0, these commands write to `/proc/.nks4inject`, exposed by a small companion kernel module (`nks4_inject.ko`, extracted from an embedded buffer and loaded early at startup) that calls OA's real `CSTGFrontPanel::HandleSwitchEvent` / `HandleTouchPanel` / `HandleRotary` / `HandleAnalogController` directly - the exact functions a physical press/touch/turn dispatches through. Injected events get the same response as hardware, independent of whatever mode Eva is currently in.
+
+**If `nks4_inject.ko` failed to load** (symbol resolution failure against `/proc/kallsyms`, the boot-safety kill-switch present, OA not reaching the Live module state, etc.), every command in this section returns `ERR NKS4_NOT_LOADED\n` rather than silently falling back to the old, proven-unreliable `/dev/rtf5` path.
+
+**Input validation policy.** Every numeric argument below is either **snapped** into its valid range or the request is **rejected outright** - never silently passed through out-of-range or forwarded to the kernel unchecked:
+- A value with a natural nearest-valid interpretation (a slider/knob index, a 0-127 magnitude, a touch coordinate, a chord hold duration) is **clamped** to the nearest in-range value. `SLIDER 99 500` is accepted as `SLIDER 8 127`, not rejected.
+- A value with no sensible "nearest" (an unrecognised button name, a `WHEEL` direction that isn't `CW`/`CCW`, a line that doesn't parse at all) is **rejected** with `ERR\n`.
+
 ---
 
 ### CTRL_PERSIST
@@ -289,6 +302,8 @@ Simulate a complete touchscreen tap (pen-down then pen-up) at pixel coordinates.
 ```
 Request:  TOUCH <x> <y>\n
 Response: OK\n
+          ERR\n                 (line does not parse as two integers)
+          ERR NKS4_NOT_LOADED\n (nks4_inject.ko not loaded)
 ```
 
 | Argument | Type | Range | Description |
@@ -296,7 +311,7 @@ Response: OK\n
 | x | integer | 0 to width-1 | Horizontal pixel coordinate |
 | y | integer | 0 to height-1 | Vertical pixel coordinate |
 
-Coordinates are clamped to the framebuffer bounds. Events are written to `/dev/rtf5` as the Kronos touchscreen FIFO protocol (see TOUCH_DOWN/TOUCH_UP for the encoding).
+Coordinates outside the framebuffer are **snapped** to the nearest edge, not rejected. The resulting ADC-space event is delivered via `/proc/.nks4inject` straight into `CSTGFrontPanel::HandleTouchPanel` (see TOUCH_DOWN/TOUCH_UP for the ADC encoding) - the same function a physical finger dispatches through, so any conditional side effect a real touch has (including ones that trigger MIDI output) fires the same way here.
 
 ---
 
@@ -307,6 +322,8 @@ Send a pen-down event only.
 ```
 Request:  TOUCH_DOWN <x> <y>\n
 Response: OK\n
+          ERR\n                 (line does not parse as two integers)
+          ERR NKS4_NOT_LOADED\n
 ```
 
 Arguments are the same as `TOUCH`. Use `TOUCH_DOWN` followed by zero or more `TOUCH_MOVE` calls and then `TOUCH_UP` to simulate a drag gesture.
@@ -320,6 +337,8 @@ Send a pen-move (drag) event.
 ```
 Request:  TOUCH_MOVE <x> <y>\n
 Response: OK\n
+          ERR\n                 (line does not parse as two integers)
+          ERR NKS4_NOT_LOADED\n
 ```
 
 Arguments are the same as `TOUCH`. Should be sent between a `TOUCH_DOWN` and `TOUCH_UP`.
@@ -333,23 +352,21 @@ Send a pen-up event.
 ```
 Request:  TOUCH_UP <x> <y>\n
 Response: OK\n
+          ERR\n                 (line does not parse as two integers)
+          ERR NKS4_NOT_LOADED\n
 ```
 
 Arguments are the same as `TOUCH`.
 
-#### Touch event wire encoding (internal, `/dev/rtf5`)
-
-Each touch event is a 20-byte packet of five `uint32_t` values:
+#### Touch event encoding (internal, `/proc/.nks4inject`)
 
 ```
-pkt[0] = 0x00010014   (fixed header)
-pkt[1] = 0x00000000   (reserved)
-pkt[2] = 0x00000011   (fixed: touch device ID)
-pkt[3] = event_type   (1 = pen-down, 2 = pen-up, 3 = pen-move)
-pkt[4] = v_adc | (h_adc << 8)
+TOUCH <event_type> <coord>\n
+  event_type: 1 = pen-down, 2 = pen-up, 3 = pen-move
+  coord:      v_adc | (h_adc << 8)
 ```
 
-ADC values are computed from pixel coordinates using configurable touch calibration parameters (see [Section 13](#13-implementation-limits) for config keys):
+ADC values are computed from pixel coordinates using configurable touch calibration parameters (see [Section 14](#14-implementation-limits) for config keys):
 
 ```
 cx = x + touch_x_offset          (default: 10)
@@ -360,6 +377,8 @@ v_adc = clamp(round(cy * 255 / touch_y_range), 0, 255)
 
 With defaults (`touch_x_offset=10`, `touch_x_range=813`, `touch_y_offset=20`, `touch_y_range=638`), pixel (0,0) maps to approximately ADC (3,8) and pixel (799,599) maps to approximately ADC (254,247). The calibration parameters can be adjusted in `screenremote.cfg` if the touch response is misaligned on a particular unit.
 
+`nks4_inject.ko` calls `CSTGFrontPanel::HandleTouchPanel(this, event_type, coord)` with these exact values - `this` resolved from OA's own `CSTGFrontPanel::sInstance`, `event_type`/`coord` passed through unmodified from the values above.
+
 ---
 
 ### BUTTON
@@ -368,25 +387,26 @@ Press and release a named front-panel button. See [Section 9](#9-button-name-ref
 
 ```
 Request:  BUTTON <name>\n
-Response: OK\n  (button found)
-          ERR\n (button name not recognised)
+Response: OK\n                  (button found)
+          ERR\n                 (button name not recognised - no valid "nearest" to snap to)
+          ERR NKS4_NOT_LOADED\n
 ```
 
 | Argument | Type | Description |
 |----------|------|-------------|
 | name | string | Button name from the button table (case-sensitive, uppercase) |
 
-The event is delivered as two 20-byte packets on `/dev/rtf5` - press (`0x7f`) then release (`0x00`). Mode-select buttons (SETLIST, COMBI, etc.) also update the daemon's internal mode state so `STATE` queries reflect the change immediately.
+The event is delivered as two commands on `/proc/.nks4inject` - `BTN <code>` implies a press then release internally (see below). This calls `CSTGFrontPanel::HandleSwitchEvent(this, code, pressed)` directly, the same function a physical press dispatches through, so the full real action fires (including RT-domain effects rtf5 injection never reached - sequencer transport, KARMA control-surface state changes, etc.). Mode-select buttons (SETLIST, COMBI, etc.) also update the daemon's internal mode state so `STATE` queries reflect the change immediately.
 
-#### Button event wire encoding (internal, `/dev/rtf5`)
+#### Button event encoding (internal, `/proc/.nks4inject`)
 
 ```
-pkt[0] = 0x00010014   (fixed header)
-pkt[1] = 0x00000000   (reserved)
-pkt[2] = button.dev   (device group; see button table)
-pkt[3] = button.code  (button code within the device group)
-pkt[4] = 0x7f         (press) or 0x00 (release)
+BTN <code>\n        press + release
+BTN_DOWN <code>\n   press only (used by CHORD)
+BTN_UP <code>\n     release only (used by CHORD)
 ```
+
+`code` is the button's flat NKS4 hardware scan code (0-127) - see [Section 9](#9-button-name-reference). This is a single value, not the `(dev, code)` pair earlier versions of this document described; that pairing was specific to the old `/dev/rtf5` packet format and does not apply here.
 
 ---
 
@@ -396,18 +416,19 @@ Press two or more buttons as a chord: buttons are pressed left-to-right, then re
 
 ```
 Request:  CHORD [<hold_ms>] <name1> <name2> [<name3> ... <name8>]\n
-Response: OK\n  (all buttons found)
-          ERR\n (any button name not recognised)
+Response: OK\n                  (all buttons found)
+          ERR\n                 (fewer than 2 names, or any button name not recognised)
+          ERR NKS4_NOT_LOADED\n
 ```
 
 | Argument | Type | Description |
 |----------|------|-------------|
-| hold_ms | integer | Optional hold duration in milliseconds (0-5000) before releasing. If omitted, buttons are released immediately after all are pressed. |
+| hold_ms | integer | Optional hold duration in milliseconds, **snapped** into [0, 5000] (a negative value snaps to 0, anything above 5000 snaps to 5000). If omitted, buttons are released immediately after all are pressed. |
 | name1 | string | First button (held down first, released last) |
 | name2 | string | Second button |
 | name3..name8 | string | Optional additional buttons (up to 8 total) |
 
-For N buttons, 2xN `/dev/rtf5` packets are sent: N presses in order, then N releases in reverse order. If `hold_ms` is specified, the daemon sleeps that duration between the press and release phases (blocks the main loop for the duration).
+For N buttons, 2xN `/proc/.nks4inject` commands are sent: N `BTN_DOWN` in order, then N `BTN_UP` in reverse order. If `hold_ms` is specified, the daemon sleeps that duration between the press and release phases (blocks the main loop for the duration). Unlike button *names* (which have no sensible fallback and are rejected), `hold_ms` is a plain magnitude and is snapped rather than rejected.
 
 ---
 
@@ -419,7 +440,8 @@ Send one data wheel tick.
 Request:  WHEEL CW\n
           WHEEL CCW\n
 Response: OK\n
-          ERR\n (direction not CW or CCW)
+          ERR\n                 (direction not CW or CCW - no numeric value to snap)
+          ERR NKS4_NOT_LOADED\n
 ```
 
 | Argument | Value | Description |
@@ -427,73 +449,156 @@ Response: OK\n
 | CW | clockwise | Increment (positive direction) |
 | CCW | counter-clockwise | Decrement (negative direction) |
 
-#### Wheel event wire encoding (internal, `/dev/rtf5`)
-
-The wheel uses a 16-byte (4 x `uint32_t`) packet:
+#### Wheel event encoding (internal, `/proc/.nks4inject`)
 
 ```
-pkt[0] = 0x00010010   (fixed header, 16-byte packet)
-pkt[1] = 0x00000000   (reserved)
-pkt[2] = 0x0000000d   (wheel device ID)
-pkt[3] = 0x00000100   (CW)  or  0x0000FF00 (CCW)
+ROT <delta>\n
+  delta: 256 (0x00000100) for CW, 65280 (0x0000FF00) for CCW
 ```
+
+Calls `CSTGFrontPanel::HandleRotary(this, delta)` directly. These exact 32-bit values are ground-truthed from a real hardware capture - `HandleRotary`'s delta argument is zero-extended from the raw 16-bit NKS4 field, **not** a signed `-256` for CCW; sending a signed negative value here would not reproduce real hardware behaviour.
 
 ---
 
 ### SLIDER
 
-Set the position of a CC slider or RT knob (1-8).
+Set the position of physical Slider n (1-8) - the linear faders, e.g. the ones used for track/timbre volume.
 
 ```
 Request:  SLIDER <n> <value>\n
 Response: OK\n
-          ERR\n (n not 1-8, value not 0-127, or parse failure)
+          ERR\n                 (line does not parse as two integers)
+          ERR NKS4_NOT_LOADED\n
 ```
 
 | Argument | Type | Range | Description |
 |----------|------|-------|-------------|
-| n | integer | 1-8 | Controller index (1 = leftmost slider/knob) |
-| value | integer | 0-127 | Absolute position |
+| n | integer | 1-8 | Slider index (1 = leftmost), **snapped** into range |
+| value | integer | 0-127 | Absolute position, **snapped** into range |
 
-The physical effect depends on the active Control Assign page on the Kronos. In RT KNOBS/KARMA mode, `SLIDER n` moves knob n. In a slider-active mode, it moves slider n. In TIMBRE/TRACK mode the raw position event may not be interpreted (that mode uses processed 44-byte parameter packets internally).
+The physical effect (which parameter each slider controls) depends on the active Control Assign page on the Kronos - this is genuine hardware behaviour identical to moving the physical slider, not a quirk of injection.
 
-#### Wire encoding (internal, `/dev/rtf5`)
+#### Encoding (internal, `/proc/.nks4inject`)
 
 ```
-pkt[0] = 0x00010014   (fixed header)
-pkt[1] = 0x00000000   (reserved)
-pkt[2] = 0x0000000e   (CC slider/knob device)
-pkt[3] = n - 1        (0-based controller index)
-pkt[4] = value        (0-127)
+ANALOG <device_code> <byte0> <byte1>\n
+  device_code: 16 + (n - 1)     (physical sliders occupy device codes 16-23)
+  byte0:       value * 2
+  byte1:       0
 ```
+
+Calls `ShortInvertNkS4AnalogValue(byte0, byte1, &out_hi, &out_lo)` (OA's own raw-ADC transform) followed by `CSTGFrontPanel::HandleAnalogController(this, device_code, out_hi, out_lo)`. With `byte1=0`, the transform simplifies to `out_hi = byte0 >> 1`, which is what the consuming Slider handler reads as the 0-127 display value - hence `byte0 = value * 2` reproduces `value` exactly. Confirmed empirically on hardware: a `byte0` sweep from 0 to 224 in steps of 32 moved the on-screen value in a clean, exact staircase (steps of 16).
+
+---
+
+### KNOB
+
+Set the position of physical RT Knob n (1-8) - the rotary Realtime Controls / KARMA knob row, addressed separately from the sliders above.
+
+```
+Request:  KNOB <n> <value>\n
+Response: OK\n
+          ERR\n                 (line does not parse as two integers)
+          ERR NKS4_NOT_LOADED\n
+```
+
+| Argument | Type | Range | Description |
+|----------|------|-------|-------------|
+| n | integer | 1-8 | Knob index (1 = leftmost), **snapped** into range |
+| value | integer | 0-127 | Absolute position, **snapped** into range |
+
+#### Encoding (internal, `/proc/.nks4inject`)
+
+Identical to `SLIDER` above except `device_code = 8 + (n - 1)` (RT knobs occupy device codes 8-15, a completely separate range from sliders - they are two distinct physical control rows on the Kronos, not the same controls in a different mode).
 
 ---
 
 ### VSLIDER
 
-Set the value slider position.
+Set the value slider position - the single slider that edits whatever field is currently highlighted/selected on screen. On real hardware this control does nothing when nothing is selected; the same is true here.
 
 ```
 Request:  VSLIDER <value>\n
 Response: OK\n
-          ERR\n (value not 0-127 or parse failure)
+          ERR\n                 (line does not parse as an integer)
+          ERR NKS4_NOT_LOADED\n
 ```
 
 | Argument | Type | Range | Description |
 |----------|------|-------|-------------|
-| value | integer | 0-127 | Absolute slider position |
+| value | integer | 0-127 | Absolute slider position, **snapped** into range |
 
-The value slider changes the currently selected on-screen parameter proportionally. Moving to 0 sets the parameter minimum; 127 sets the maximum.
+The value slider changes the currently selected on-screen parameter proportionally. Moving to 0 sets the parameter minimum; 127 sets the maximum. If nothing is currently highlighted for value-slider editing, the call still succeeds (`OK\n`) but has no visible effect - matching real hardware.
 
-#### Wire encoding (internal, `/dev/rtf5`)
+#### Encoding (internal, `/proc/.nks4inject`)
+
+Identical to `SLIDER`/`KNOB` above with `device_code = 25` (a single fixed value slider control, not an 8-wide indexed group). **Device code 24 is a different, context-dependent effects-rack parameter edit control, not the value slider** - an easy mistake to make since it sits directly adjacent; it is not exposed by any command in this daemon.
+
+---
+
+### JOYSTICK, VECTOR, RIBBON, AFTERTOUCH, PEDAL, FOOTSWITCH, DAMPER
+
+All seven of these commands are **hardware-confirmed** against a real unit (`RIBBON`'s `Z` axis is the one remaining untested exception - its device code is real, but no test has verified what its value means).
 
 ```
-pkt[0] = 0x00010014   (fixed header)
-pkt[1] = 0x00000000   (reserved)
-pkt[2] = 0x0000000f   (value slider device)
-pkt[3] = 0x00000009   (value slider code)
-pkt[4] = value        (0-127)
+Request:  JOYSTICK <X|Y> <value>\n
+          VECTOR <X|Y> <value>\n
+          RIBBON <X|Z> <value>\n
+          AFTERTOUCH <value>\n
+          PEDAL <value>\n
+          FOOTSWITCH <value>\n
+          DAMPER <value>\n
+Response: OK\n
+          ERR\n                 (bad axis letter, or line does not parse)
+          ERR NKS4_NOT_LOADED\n
 ```
+
+| Command | Argument | Range | device_code | Description |
+|---------|----------|-------|-------------|-------------|
+| `JOYSTICK` | axis `X` or `Y` | - | 1 (X) / 2 (Y) | Standard Joystick (Kronos manual item 12) - pitch bend / vibrato-wah. Confirmed via a full-radius clockwise circular sweep then a half-radius counter-clockwise sweep. Axis letter is rejected outright if not `X`/`Y` (no numeric fallback to snap to); `value` is snapped into [0,127] |
+| `VECTOR` | axis `X` or `Y` | - | 5 (X) / 6 (Y) | **Vector Joystick** (item 9) - a separate physical control from `JOYSTICK`, used for Vector Synthesis blending, not pitch/mod. Confirmed the same way as `JOYSTICK` |
+| `RIBBON` | axis `X` or `Z` | - | 3 (X) / 4 (Z) | Ribbon controller (item 13) touch strip. `X` (finger position) confirmed via a center/max/center/min/center sweep. `Z` axis meaning (commonly touch pressure) is real but **not** hardware-verified |
+| `AFTERTOUCH` | value | 0-127 | 7 | Keybed channel aftertouch. Confirmed via a 0/half/full/half/0 sweep |
+| `PEDAL` | value | 0-127 | 27 | Rear-panel assignable PEDAL jack. Confirmed via a 0/half/full/half/0 sweep - large single-step jumps work fine |
+| `FOOTSWITCH` | value | 0-127 | 28 | Rear-panel assignable foot SWITCH jack. Confirmed via a single on(127)/off(0) tap, including that polarity (normally-open/closed) doesn't affect this injection path - it's resolved at the physical ADC layer, before the byte reaches this pipeline. Any value in range is accepted and forwarded rather than restricted to 0/127 |
+| `DAMPER` | value | 0-127 | 29 | Rear-panel DAMPER jack - sustain, or half-damper position if the current Program/Combi has half-damper response configured. Ramped internally (see below) - send a target value like any other command here |
+
+All seven `value` arguments are **snapped** into [0,127], matching `SLIDER`/`KNOB`/`VSLIDER`. `JOYSTICK`/`VECTOR`/`RIBBON`'s axis letter has no numeric "nearest" to snap to, so an unrecognised axis is **rejected** with `ERR\n`, the same policy as `WHEEL`'s direction argument.
+
+**Why `DAMPER` ramps internally.** The jack accepts either a simple on/off footswitch (Korg PS-1) or a continuous half-damper pedal (Korg DS-1H), and `AnalogDamperHandler` evidently uses rate-of-change to tell them apart - this is *not* a polarity-setting effect (a polarity change was tried first, based on the odd initial symptoms, and made no difference). A direct jump to a target value produced inconsistent, non-repeatable results on real hardware across two otherwise-identical test runs; a gradual ramp through every intermediate value did not - confirmed via a 256-step sweep (1 unit per step, ~40ms/step, full `0`-`127`-`0` sweep), smooth and repeatable in both directions. `DAMPER` therefore steps to its target internally rather than jumping - see [Section 7.0](#70-front-panel-injection-architecture-as-of-1100)'s `nks4_analog_ramp()` reference and `screenremote.c`'s own comment for the implementation. This blocks the daemon's main loop for the ramp's duration, the same tradeoff `CHORD`'s `hold_ms` already makes elsewhere in this API.
+
+#### Encoding (internal, `/proc/.nks4inject`)
+
+Identical to `SLIDER`/`KNOB`/`VSLIDER`: `ANALOG <device_code> <value*2> 0`. See [Section 10](#10-analog-device-code-reference) for the full device code table and confidence level of each.
+
+---
+
+### TEMPO
+
+Set the song/pattern tempo. **Hardware-confirmed**, including a full sweep verified identical in both directions.
+
+```
+Request:  TEMPO <value>\n
+Response: OK\n
+          ERR\n                 (line does not parse as an integer)
+          ERR NKS4_NOT_LOADED\n
+```
+
+| Argument | Type | Range | Description |
+|----------|------|-------|--------------|
+| value | integer | 0-127 | **Not** a direct BPM number - snapped into [0,127] like every other analog command, then mapped onto tempo through the confirmed curve below |
+
+`TEMPO` is device code 26, and - like `DAMPER` - ramps internally rather than jumping directly to the target, for the same reason: a direct jump to a target value produces inconsistent, non-repeatable results on real hardware, while a smooth monotonic ramp through every intermediate value is precisely reproducible. This was confirmed with a full `0`-`127` sweep in both directions, landing on **identical BPM values ascending and descending**:
+
+| value | 0 | 16 | 32 | 48 | 64 | 80 | 96 | 112 | 127 |
+|-------|---|----|----|----|----|----|----|----|-----|
+| bpm | 40.00 | 51.00 | 68.00 | 92.00 | 120.00 | 154.00 | 196.00 | 245.00 | 297.00 |
+
+`value=0` lands almost exactly on the documented minimum (40bpm) and `value=127` almost exactly on the documented maximum (300bpm - measured 297). The curve is **not linear** - the BPM gap between consecutive sample points grows steadily (11, 17, 24, 28, 34, 42, 49, 52), meaning `TEMPO` has more resolution at low tempos than high ones. No closed-form formula is exposed here; interpolate between these nine confirmed points if a client needs a specific intermediate BPM, since the measured data is the more reliable source than a guessed curve fit.
+
+#### Encoding (internal, `/proc/.nks4inject`)
+
+Same `ANALOG <device_code> <value*2> 0` encoding as every other analog command, with `device_code = 26`, but sent as a ramp (one `ANALOG` call per intermediate value, ~25ms apart) from the last value this daemon commanded rather than a single jump - see `nks4_analog_ramp()` in `screenremote.c`. The first `TEMPO` call after daemon startup has no known starting point to ramp from and jumps directly as a best-effort default; every call after that ramps from the previous `TEMPO` call's target. A physical hand on the front-panel tempo control between `TEMPO` calls would desync this tracking, the same caveat any absolute-position software control over a real analog input has.
 
 ---
 
@@ -599,7 +704,7 @@ Request:  SYSINFO\n
 Response: <key>=<value>\n ... OK\n
 ```
 
-See [Section 10](#10-sysinfo-field-reference) for the full field reference.
+See [Section 11](#11-sysinfo-field-reference) for the full field reference.
 
 Note: CPU percentage fields require two successive `SYSINFO` calls to be meaningful. The first call will report `-1` for all `CPU*_PCT` fields because there is no prior sample to compute a delta from. The second and subsequent calls report the average CPU utilisation since the previous call.
 
@@ -644,7 +749,7 @@ Response: SYSEX_RESP <hex>\n      (captured response as hex)
 
 The capture timeout is approximately 5 seconds. The response includes the first complete F0...F7 SysEx message received from the Kronos after the request is sent, up to 65536 bytes. For SysEx request/response to work, **Global > MIDI > "Enable Exclusive" must be ON** on the Kronos, or SysEx messages are silently ignored.
 
-**Small exchanges only.** `SYSEX` captures a *single* `F0…F7` block and caps at 65536 bytes, so it suits short request/response exchanges (mode request, current performance id, a name dump). To retrieve a **large** object (a full Set List is ~79 KB) or a multi-object bank dump, do **not** use `SYSEX` — send the request with `MIDI_SEND` and collect the resulting `0x73` Object Dump reply off the MIDI bridge stream (port 9875; see [Section 8](#8-midi-bridge---port-9875)), which streams SysEx incrementally with no size cap.
+**Small exchanges only.** `SYSEX` captures a *single* `F0...F7` block and caps at 65536 bytes, so it suits short request/response exchanges (mode request, current performance id, a name dump). To retrieve a **large** object (a full Set List is ~79 KB) or a multi-object bank dump, do **not** use `SYSEX` - send the request with `MIDI_SEND` and collect the resulting `0x73` Object Dump reply off the MIDI bridge stream (port 9875; see [Section 8](#8-midi-bridge---port-9875)), which streams SysEx incrementally with no size cap.
 
 **Asynchronous delivery.** The `midi_tcp` subprocess forwards all MIDI output from the Kronos (note events, CC, SysEx, real-time bytes) as a continuous stream without buffering or request/response pairing. Non-SysEx MIDI events such as note-on/note-off may arrive interleaved with the SysEx response. Delivery order within the stream is preserved (TCP guarantees this), but clients must be prepared to discard or buffer non-SysEx messages that arrive while waiting for a response. Response correlation is by payload content: Korg SysEx messages carry a manufacturer ID (0x42), model ID (0x68 for Kronos), and a function code that identifies the message type - match on those rather than on timing or position in the stream.
 
@@ -703,15 +808,15 @@ Internal Korg STG message-bus traffic (e.g. patch-name parameter broadcasts) nev
 
 **Generic, destination-agnostic capture.**
 
-The stream is a **single generic MIDI-out feed**: it carries everything the Kronos transmits — live performance (notes, CC, program/combi change, aftertouch, pitch bend, system-common) **and** SysEx responses and bulk data dumps — regardless of which physical destination (DIN or USB) a message is bound for, and the client never has to know or choose. Concretely, the kernel module taps OA's shared performance queue **once** plus every out-port's per-destination dump queue, and merges them into this one stream.
+The stream is a **single generic MIDI-out feed**: it carries everything the Kronos transmits - live performance (notes, CC, program/combi change, aftertouch, pitch bend, system-common) **and** SysEx responses and bulk data dumps - regardless of which physical destination (DIN or USB) a message is bound for, and the client never has to know or choose. Concretely, the kernel module taps OA's shared performance queue **once** plus every out-port's per-destination dump queue, and merges them into this one stream.
 
-- **No duplication.** Each performance message appears **exactly once**, even when both DIN and USB outputs are enabled — they share one source queue, read once.
-- **Bulk data dumps are captured** to any destination. A dump sent to **USB** streams at memory speed (~800 KB/s+); one sent to **DIN** arrives at 5-pin MIDI speed (~3.6 KB/s) — the same bytes, just slower off the wire. Either way it lands on this one stream with no size cap.
+- **No duplication.** Each performance message appears **exactly once**, even when both DIN and USB outputs are enabled - they share one source queue, read once.
+- **Bulk data dumps are captured** to any destination. A dump sent to **USB** streams at memory speed (~800 KB/s+); one sent to **DIN** arrives at 5-pin MIDI speed (~3.6 KB/s) - the same bytes, just slower off the wire. Either way it lands on this one stream with no size cap.
 - OA may still emit its own genuine copies of some messages (e.g. a program change echoed per active timbre). Those are real MIDI from the Kronos, not a capture artifact, and are passed through unchanged.
 
-*(Real-time footprint, since 1.9.2: this continuous tap accesses the codec's real-time-critical memory, so it depends on the daemon being pinned off the audio engine's CPU core — see "Ring buffer and backpressure" below. A `tap_shared=0` module option drops live-performance capture and reads the codec queues only inside a request-scoped dump window, for a minimal-footprint dump-only build; it is **not** the default.)*
+*(Real-time footprint, since 1.9.2: this continuous tap accesses the codec's real-time-critical memory, so it depends on the daemon being pinned off the audio engine's CPU core - see "Ring buffer and backpressure" below. A `tap_shared=0` module option drops live-performance capture and reads the codec queues only inside a request-scoped dump window, for a minimal-footprint dump-only build; it is **not** the default.)*
 
-**Migration note (pre-1.9.0):** early revisions captured per physical port and doubled every event, and this doc once told clients to deduplicate consecutive identical messages within ~5 ms. **That dedup logic must be removed** — treat every message as a distinct event.
+**Migration note (pre-1.9.0):** early revisions captured per physical port and doubled every event, and this doc once told clients to deduplicate consecutive identical messages within ~5 ms. **That dedup logic must be removed** - treat every message as a distinct event.
 
 **Running status:**
 
@@ -719,15 +824,15 @@ Channel and system-common messages are reassembled by the `midi_tcp` parser and 
 
 **SysEx streaming:**
 
-SysEx is the exception. Rather than buffer a whole `F0…F7` block and broadcast it at once, `midi_tcp` **streams SysEx bytes to clients incrementally, in chunks of up to 1 KB** (and flushes again at `F7`). This lets an arbitrarily large object — a full Set List dump is ~79 KB — traverse the bridge with **no size cap**, and keeps a client's activity/keepalive logic fed throughout a multi-second transfer. Only the first chunk carries the `F0` and only the last carries the `F7`; clients reassemble the message across chunk (and TCP) boundaries exactly as they already parse the raw byte stream (§8.2). *(Before this change SysEx was buffered whole and capped at 64 KB, which silently truncated any larger object and dropped its trailing `F7`, so a Set List dump never completed on the client.)*
+SysEx is the exception. Rather than buffer a whole `F0...F7` block and broadcast it at once, `midi_tcp` **streams SysEx bytes to clients incrementally, in chunks of up to 1 KB** (and flushes again at `F7`). This lets an arbitrarily large object - a full Set List dump is ~79 KB - traverse the bridge with **no size cap**, and keeps a client's activity/keepalive logic fed throughout a multi-second transfer. Only the first chunk carries the `F0` and only the last carries the `F7`; clients reassemble the message across chunk (and TCP) boundaries exactly as they already parse the raw byte stream (Section 8.2). *(Before this change SysEx was buffered whole and capped at 64 KB, which silently truncated any larger object and dropped its trailing `F7`, so a Set List dump never completed on the client.)*
 
 **Ring buffer and backpressure:**
 
-The kernel module (`midi_bridge.ko`) captures MIDI out by attaching as an additional reader on OA's own transmit queues — it does **not** patch OA code. Captured bytes are staged in a 64 KB circular ring and drained to `midi_tcp` when it reads. Data written to the ring before any client is connected is discarded when the first client connects (the read cursor is reset). Draining is **best-effort**: if the client falls behind, the module skips its own copy forward rather than hold OA's transmit queue back — so a slow or stalled client can **never** throttle or corrupt the Kronos's real MIDI output; the only casualty is the client's own captured copy of the bytes it was too slow to read. Dropped bytes are counted in `overflow` in `/proc/.midi_ports` and should read `0` in normal use. A full USB Set List / All Data dump (multiple MB) has been verified to capture losslessly (`overflow=0`) at ~800 KB/s.
+The kernel module (`midi_bridge.ko`) captures MIDI out by attaching as an additional reader on OA's own transmit queues - it does **not** patch OA code. Captured bytes are staged in a 64 KB circular ring and drained to `midi_tcp` when it reads. Data written to the ring before any client is connected is discarded when the first client connects (the read cursor is reset). Draining is **best-effort**: if the client falls behind, the module skips its own copy forward rather than hold OA's transmit queue back - so a slow or stalled client can **never** throttle or corrupt the Kronos's real MIDI output; the only casualty is the client's own captured copy of the bytes it was too slow to read. Dropped bytes are counted in `overflow` in `/proc/.midi_ports` and should read `0` in normal use. A full USB Set List / All Data dump (multiple MB) has been verified to capture losslessly (`overflow=0`) at ~800 KB/s.
 
 **Real-time safety (1.9.2).** OA's transmit queues live in the codec's real-time-critical memory, so continuously tapping them is safe only because the daemon and its `midi_tcp` subprocess are pinned to a CPU core away from the audio engine's core (`sched_setaffinity`). Two related operational notes for host software:
-- **MIDI is unavailable for roughly the first minute after power-on.** `midi_bridge` is loaded only after the Kronos UI has finished initializing (the port `9875` listener does not exist before then); a connection attempt before that simply fails and should be retried. `MIDI_STATUS` (§7) reports readiness.
-- The core-pinning is internal and needs no client action, but it is why streaming + continuous MIDI capture can run together without disturbing the synth. *(Earlier builds let the OS schedule streaming onto the audio core; during the boot-settling window that starved the real-time engine and froze the UI — the whole reason capture is gated on both the core pinning and the deferred, post-UI load.)*
+- **MIDI is unavailable for roughly the first minute after power-on.** `midi_bridge` is loaded only after the Kronos UI has finished initializing (the port `9875` listener does not exist before then); a connection attempt before that simply fails and should be retried. `MIDI_STATUS` (Section 7) reports readiness.
+- The core-pinning is internal and needs no client action, but it is why streaming + continuous MIDI capture can run together without disturbing the synth. *(Earlier builds let the OS schedule streaming onto the audio core; during the boot-settling window that starved the real-time engine and froze the UI - the whole reason capture is gated on both the core pinning and the deferred, post-UI load.)*
 
 *(Pre-1.9.0 revisions inline-hooked OA's output drain and used a shared spin-trylock that dropped a whole batch whenever the reader held the lock; under a dense bulk dump this punched holes into the SysEx byte stream and corrupted large objects. The current reader-tap design has neither hazard.)*
 
@@ -735,7 +840,7 @@ The kernel module (`midi_bridge.ko`) captures MIDI out by attaching as an additi
 
 Write raw MIDI bytes to the TCP connection to inject them into the Kronos MIDI receive engine (`MidiInPortGeneric7Receive`). Any valid MIDI message type is accepted: note on/off, CC, program change, pitch bend, SysEx, real-time, etc.
 
-Requests are injected into the Kronos's **USB** input port, so the Kronos routes its reply back out the fast USB path — a Set List dump returns in well under a second rather than the ~25 s a DIN-routed reply would take. The reply appears on the port-9875 outbound stream (§8.2); the normal dump workflow is *inject the request, then collect the reply off that stream*. (In the non-default `tap_shared=0` dump-only build, injecting is also what opens the outbound capture window.)
+Requests are injected into the Kronos's **USB** input port, so the Kronos routes its reply back out the fast USB path - a Set List dump returns in well under a second rather than the ~25 s a DIN-routed reply would take. The reply appears on the port-9875 outbound stream (Section 8.2); the normal dump workflow is *inject the request, then collect the reply off that stream*. (In the non-default `tap_shared=0` dump-only build, injecting is also what opens the outbound capture window.)
 
 Maximum single write: 4096 bytes (kernel module buffer limit). Larger payloads must be split across multiple writes.
 
@@ -752,20 +857,20 @@ The ring cursor is reset (pre-connection buffered data discarded) when the **fir
 
 ### 8.6 Retrieving program & combi names (Kronos SysEx notes)
 
-Pulling the names of every program/combi in a bank is a common tooling task, and the Kronos firmware has a **non-obvious asymmetry** that is easy to misdiagnose. These notes apply to any client (this daemon or otherwise) that requests Object Dumps over MIDI; they are properties of the **Kronos**, not of the bridge. All are hardware-verified (2026-07-08). Names are carried in Object Dump replies (`0x73`) at data offset 0 (24 bytes, 8→7 packed) for both the full object (`0x00` Program / `0x01` Combi) and the name-only object (`0x13` Program Name / `0x12` Combi Name).
+Pulling the names of every program/combi in a bank is a common tooling task, and the Kronos firmware has a **non-obvious asymmetry** that is easy to misdiagnose. These notes apply to any client (this daemon or otherwise) that requests Object Dumps over MIDI; they are properties of the **Kronos**, not of the bridge. All are hardware-verified (2026-07-08). Names are carried in Object Dump replies (`0x73`) at data offset 0 (24 bytes, 8->7 packed) for both the full object (`0x00` Program / `0x01` Combi) and the name-only object (`0x13` Program Name / `0x12` Combi Name).
 
 **Bank numbers** (KRONOS MIDI Implementation, *2 bank map):
 
 | Object | Preset / read-only banks | USER-writable banks |
 |--------|--------------------------|---------------------|
-| Program / Program Name (`0x00`/`0x13`) | `0x00`–`0x05` (INT-A…F), `0x10`–`0x1A` (GM, g(1)–g(9), g(d)) | `0x40`–`0x4D` (USER-A…G, AA…GG) |
-| Combi / Combi Name (`0x01`/`0x12`) | `0x00`–`0x06` (INT-A…G) | `0x40`–`0x46` (USER-A…G) |
+| Program / Program Name (`0x00`/`0x13`) | `0x00`-`0x05` (INT-A...F), `0x10`-`0x1A` (GM, g(1)-g(9), g(d)) | `0x40`-`0x4D` (USER-A...G, AA...GG) |
+| Combi / Combi Name (`0x01`/`0x12`) | `0x00`-`0x06` (INT-A...G) | `0x40`-`0x46` (USER-A...G) |
 
-**The asymmetry — the whole-bank name enum is preset-only.** The **Dump Bank Request** (`func 0x77`, e.g. `F0 42 3g 68 77 13 <bank> F7`) works for the **preset** banks (INT, GM/g) and streams all 128 names in ~20 ms, but for every **USER-writable** bank it returns a **Reply (`func 0x24`) with code 4 "target object not found"** — even when the bank is fully populated. This is a firmware limitation of the name-only enum, not an empty bank and not a permissions issue.
+**The asymmetry - the whole-bank name enum is preset-only.** The **Dump Bank Request** (`func 0x77`, e.g. `F0 42 3g 68 77 13 <bank> F7`) works for the **preset** banks (INT, GM/g) and streams all 128 names in ~20 ms, but for every **USER-writable** bank it returns a **Reply (`func 0x24`) with code 4 "target object not found"** - even when the bank is fully populated. This is a firmware limitation of the name-only enum, not an empty bank and not a permissions issue.
 
 - There is **no** "banks per session" throttle. A persistent belief that the Kronos rejects everything after ~13 banks was a misreading of *this* preset-only reject (preset banks dump, USER banks reject). Preset `0x77` enums and USER per-object fetches (below) both stream reliably with no session cap.
 
-**The workaround — request each object individually with `func 0x72`.** The single **Object Dump Request** (`func 0x72`) works for **every** bank, including USER:
+**The workaround - request each object individually with `func 0x72`.** The single **Object Dump Request** (`func 0x72`) works for **every** bank, including USER:
 
 ```
 Request (one name):  F0 42 3g 68 72 <obj> <bank> <idH> <idL> F7
@@ -774,109 +879,149 @@ Request (one name):  F0 42 3g 68 72 <obj> <bank> <idH> <idL> F7
 Reply:               F0 42 3g 68 73 <obj> <bank> <idH> <idL> <version> <name...> F7
 ```
 
-Loop `index` 0…127 to pull a whole USER bank. Empty slots reply with a **blank-named** object (not a reject), so all 128 indices respond for a bank that exists.
+Loop `index` 0...127 to pull a whole USER bank. Empty slots reply with a **blank-named** object (not a reject), so all 128 indices respond for a bank that exists.
 
-**Pacing is mandatory — never burst.** Injecting a bank's worth of requests back-to-back **overruns the Kronos MIDI-in**: it drops *every* reply and can corrupt a request in flight (a lost `F7`), which makes the Kronos pop a user-facing **"MIDI Receiving Error"** dialog. Two safe patterns, both verified at a clean 128/128:
+**Pacing is mandatory - never burst.** Injecting a bank's worth of requests back-to-back **overruns the Kronos MIDI-in**: it drops *every* reply and can corrupt a request in flight (a lost `F7`), which makes the Kronos pop a user-facing **"MIDI Receiving Error"** dialog. Two safe patterns, both verified at a clean 128/128:
 
-- **Batched (recommended):** concatenate ~32 `0x72` requests into one injection (keep it under the ctrl port's ~2 KB line limit if using `MIDI_SEND`; the bridge's inbound path caps a single write at 4096 bytes — see §8.3), then **wait for that batch's `0x73` replies to go idle (~350 ms) before sending the next batch**. ~4 batches pull a 128-object bank in ~2 s.
+- **Batched (recommended):** concatenate ~32 `0x72` requests into one injection (keep it under the ctrl port's ~2 KB line limit if using `MIDI_SEND`; the bridge's inbound path caps a single write at 4096 bytes - see Section 8.3), then **wait for that batch's `0x73` replies to go idle (~350 ms) before sending the next batch**. ~4 batches pull a 128-object bank in ~2 s.
 - **Paced singles:** one `0x72` request every ~10 ms.
 
-Also avoid **connection churn**: if you inject via the one-shot control port (`MIDI_SEND`, one TCP connection per command — §6.1), one-connection-per-request is ~2688 connections for a full 21-bank user sweep and can overwhelm the daemon. Batching (~4 injections/bank) or a persistent control session (§6.2) avoids this.
+Also avoid **connection churn**: if you inject via the one-shot control port (`MIDI_SEND`, one TCP connection per command - Section 6.1), one-connection-per-request is ~2688 connections for a full 21-bank user sweep and can overwhelm the daemon. Batching (~4 injections/bank) or a persistent control session (Section 6.2) avoids this.
 
-**Absent vs. empty vs. rejected** when driving a sweep: match replies by content (§7 `SYSEX` note) — a `0x73` with the requested `obj`/`bank` is a name (blank or not); a `0x24` code 4 with no `0x73` for that bank means the whole-bank enum was refused (you asked with `0x77` on a USER bank — switch to `0x72`). A bank that yields no reply to a full first batch of `0x72` requests (after a generous wait) is genuinely absent/nonexistent.
+**Absent vs. empty vs. rejected** when driving a sweep: match replies by content (Section 7 `SYSEX` note) - a `0x73` with the requested `obj`/`bank` is a name (blank or not); a `0x24` code 4 with no `0x73` for that bank means the whole-bank enum was refused (you asked with `0x77` on a USER bank - switch to `0x72`). A bank that yields no reply to a full first batch of `0x72` requests (after a generous wait) is genuinely absent/nonexistent.
 
 ---
 
 ## 9. Button name reference
 
-Button names are case-sensitive and must be uppercase.
+Button names are case-sensitive and must be uppercase. The `code` column is the button's flat NKS4 hardware scan code (0-127) - see [Section 7.0](#70-front-panel-injection-architecture-as-of-1100) for what that means and how it was obtained. Every code below was captured directly off a real unit's NKS4 test/calibration mode (one physical press per button) and independently cross-checked against `OA.ko`'s own `ButtonPressHandler` disassembly.
+
+**`INC`/`DEC`** (front-panel value +/-, codes 51/52) were captured in a dedicated follow-up pass after the main table, independently of the "PanelSW+/-" label an earlier capture pass used for the same two codes - two captures agreeing on the same codes for what both the C# and Python clients already call `INC`/`DEC` confirms it's one physical button pair with one correct name, not two.
 
 ### Navigation
 
-| Name | Description |
-|------|-------------|
-| `EXIT` | Exit button |
-| `ENTER` | Enter / confirm button |
-
-### Mode select
-
-| Name | Description |
-|------|-------------|
-| `SETLIST` | Setlist mode |
-| `COMBI` | Combi mode |
-| `PROGRAM` | Program mode |
-| `SEQUENCE` | Sequence mode |
-| `SAMPLING` | Sampling mode |
-| `GLOBAL` | Global mode |
-| `DISK` | Disk mode |
-
-### Utility
-
-| Name | Description |
-|------|-------------|
-| `HELP` | Help button |
-| `COMPARE` | Compare button |
-| `RESET` | Reset button |
-
-### Numeric pad
-
-| Name | Description |
-|------|-------------|
-| `NUM0` - `NUM9` | Numeric keys 0-9 |
-| `NUM_DASH` | Numeric dash / minus |
-| `NUM_DOT` | Numeric dot / decimal |
+| Name | code | Description |
+|------|------|-------------|
+| `EXIT` | 8 | Exit button |
+| `ENTER` | 23 | Enter / confirm button |
 
 ### Value control
 
-| Name | Description |
-|------|-------------|
-| `INC` | Increment value |
-| `DEC` | Decrement value |
+| Name | code | Description |
+|------|------|-------------|
+| `INC` | 51 | Increment the currently selected value |
+| `DEC` | 52 | Decrement the currently selected value |
+
+### Mode select
+
+| Name | code | Description |
+|------|------|-------------|
+| `SETLIST` | 7 | Setlist mode |
+| `COMBI` | 1 | Combi mode |
+| `PROGRAM` | 2 | Program mode |
+| `SEQUENCE` | 3 | Sequence mode |
+| `SAMPLING` | 4 | Sampling mode |
+| `GLOBAL` | 5 | Global mode |
+| `DISK` | 6 | Disk mode |
+
+### Utility
+
+| Name | code | Description |
+|------|------|-------------|
+| `HELP` | 9 | Help button |
+| `COMPARE` | 10 | Compare button |
+| `RESET` | 75 | Reset Controls button |
+
+### Numeric pad
+
+| Name | code | Description |
+|------|------|-------------|
+| `NUM0` - `NUM9` | 11, 12-20 | Numeric keys 0-9 (0 is code 11, then 1-9 are codes 12-20 in order) |
+| `NUM_DASH` | 21 | Numeric dash / minus |
+| `NUM_DOT` | 22 | Numeric dot / decimal |
 
 ### Mix Play buttons
 
-`MP1` through `MP8`
+`MP1` through `MP8` = codes 58-65 in order.
 
 ### Mix Select buttons
 
-`MS1` through `MS8`
+`MS1` through `MS8` = codes 66-73 in order.
 
 ### Bank buttons
 
-| Name | Description |
-|------|-------------|
-| `BANK_IA` - `BANK_IG` | Internal banks A through G |
-| `BANK_UA` - `BANK_UG` | User banks A through G |
+| Name | code | Description |
+|------|------|-------------|
+| `BANK_IA` - `BANK_IG` | 24-30 | Internal banks A through G, in order |
+| `BANK_UA` - `BANK_UG` | 31-37 | User banks A through G, in order |
 
 ### Sequencer
 
-| Name | Description |
-|------|-------------|
-| `SEQ_START` | Sequencer start / stop |
-| `SEQ_REC` | Sequencer record |
-| `SEQ_LOCATE` | Locate / return to start |
-| `SEQ_FF` | Fast forward |
-| `SEQ_REW` | Rewind |
-| `SEQ_PAUSE` | Pause |
-| `TAP_TEMPO` | Tap tempo |
+| Name | code | Description |
+|------|------|-------------|
+| `SEQ_PAUSE` | 38 | Pause |
+| `SEQ_REW` | 39 | Rewind |
+| `SEQ_FF` | 40 | Fast forward |
+| `SEQ_LOCATE` | 41 | Locate / return to start |
+| `SEQ_REC` | 42 | Sequencer record |
+| `SEQ_START` | 43 | Sequencer start / stop (same physical button drives both) |
+| `TAP_TEMPO` | 44 | Tap tempo |
 
 ### Sampling
 
-| Name | Description |
-|------|-------------|
-| `SMPL_REC` | Sampling record |
-| `SMPL_START` | Sampling start |
+| Name | code | Description |
+|------|------|-------------|
+| `SMPL_REC` | 45 | Sampling record |
+| `SMPL_START` | 46 | Sampling start |
 
-### Channel strip
+### Channel strip / control surface
 
-| Name | Description |
-|------|-------------|
-| `MIX_KNOBS` | Mix knobs selector |
-| `SOLO` | Solo (fires on release; the daemon sends press+release so the release event triggers it) |
+| Name | code | Description |
+|------|------|-------------|
+| `MIX_KNOBS` | 74 | Mixer Knobs selector |
+| `SOLO` | 76 | Solo (fires on release; the daemon sends press+release so the release event triggers it) |
+| `MODULE_CONTROL` | 47 | Module Control |
+| `KARMA_ONOFF` | 48 | Karma On/Off |
+| `KARMA_LATCH` | 49 | Karma Latch |
+| `DRUM_TRACK` | 50 | Drum Track select |
+| `TIMBRE_TRACK` | 53 | Timbre/Track select |
+| `AUDIO_TRACK` | 54 | Audio select |
+| `EXT_TRACK` | 55 | Ext select |
+| `RTKNOBS_KARMA` | 56 | "RT Knobs/Karma" control-surface page select |
+| `TONE_ADJUST` | 57 | Tone Adjust |
+| `SW1` | 77 | Front-panel switch 1 |
+| `SW2` | 78 | Front-panel switch 2 |
 
 ---
 
-## 10. SYSINFO field reference
+## 10. Analog device code reference
+
+The `SLIDER`, `KNOB`, `VSLIDER`, `JOYSTICK`, `VECTOR`, `RIBBON` (X axis), `AFTERTOUCH`, `PEDAL`, and `FOOTSWITCH` commands (Section 7) are all hardware-confirmed against a real unit and accept a direct jump to any target value. `DAMPER` and `TEMPO` are also hardware-confirmed, and take the same `byte0 = value * 2` input, but neither can be jumped to directly - a large single-step change produces inconsistent, non-repeatable results, while a smooth monotonic ramp through every intermediate value is clean and precisely reproducible (confirmed both ways for `TEMPO`: identical results ascending and descending). Both commands ramp internally now, so this is handled for the caller - see their own sections below. `RIBBON`'s Z axis remains the one untested exception - its device code is real (a confirmed dispatch entry), but no command has verified how its value is interpreted. Static analysis of `OA.ko`'s own `AnalogControllerHandler` dispatch tables (three separate jump tables, each entry a real relocation to a named `CSTGControllerInfo::Analog*Handler` method) identified the **full** `eSTGAnalogDeviceCode` range with high confidence, and every one of these was independently cross-checked against the official Kronos Operation Guide's front-panel control list to confirm it's a real, standard control - not inert code shared from another product in the same codebase with no hardware behind it on this unit. Device code 24 remains deliberately unexposed - a context-dependent effects-rack edit, not a fixed control.
+
+| Code | Handler | Control | Status |
+|------|---------|---------|--------|
+| 1 | `AnalogJoystickXHandler` | Joystick (item 12 in the Kronos manual), left/right - pitch bend | **Hardware-confirmed** - circular sweep test |
+| 2 | `AnalogJoystickYHandler` | Joystick (item 12), forward/back - vibrato/wah | **Hardware-confirmed** - circular sweep test |
+| 3 | `AnalogRibbonXHandler` | Ribbon controller (item 13), finger position | **Hardware-confirmed** - center/max/min sweep |
+| 4 | `AnalogRibbonZHandler` | Ribbon controller (item 13), second axis - real dispatch entry confirmed, but which physical property it reads is not verified (a ribbon's "Z" axis commonly means touch pressure, unconfirmed here) | Command implemented, scaling unverified |
+| 5 | `AnalogVectorXHandler` | **Vector Joystick** (item 9) - Vector Synthesis. A genuinely separate physical joystick from codes 1/2, not a duplicate | **Hardware-confirmed** - circular sweep test |
+| 6 | `AnalogVectorYHandler` | Vector Joystick (item 9), other axis | **Hardware-confirmed** - circular sweep test |
+| 7 | `AnalogAftertouchHandler` | Keybed channel aftertouch | **Hardware-confirmed** - 0/half/full/half/0 sweep |
+| 8-15 | (per-page `knobHandlers`) | RT Knobs 1-8 | **Hardware-confirmed** - see `KNOB` |
+| 16-23 | (per-page `sliderHandlers`) | Sliders 1-8 | **Hardware-confirmed** - see `SLIDER` |
+| 24 | (context handler) | Effects-rack parameter edit - only reachable in an effects-editing UI context, not a fixed physical control; do not treat as a stable device | Identified, not hardware-tested |
+| 25 | `AnalogValueSliderHandler` | Value Slider | **Hardware-confirmed** - see `VSLIDER` |
+| 26 | `AnalogTempoHandler` | Tempo - non-linear 0-127 to ~40-300bpm curve, requires a gradual ramp (same behaviour class as `DAMPER`) | **Hardware-confirmed** - see `TEMPO` |
+| 27 | `AnalogFootPedalHandler` | Rear-panel assignable PEDAL jack | **Hardware-confirmed** - 0/half/full/half/0 sweep, large jumps fine |
+| 28 | `AnalogFootSwitchHandler` | Rear-panel assignable foot SWITCH jack | **Hardware-confirmed** - on/off tap |
+| 29 | `AnalogDamperHandler` | Rear-panel DAMPER jack (sustain / half-damper) | **Hardware-confirmed**, but requires a gradual ramp - see `DAMPER` command notes |
+| 30 | `SetControllerAssignment` | **Not a physical control** - assigns what a controller maps to, a system action rather than a value reading. Out of scope for this table | Identified, different kind of action |
+
+"Identified" means: a real, named dispatch table entry in `OA.ko` reaching a plausible handler for a control confirmed to physically exist on this hardware by the Kronos manual - high confidence, but no injected value has been confirmed to produce the expected on-screen/audible result the way the hardware-confirmed group has.
+
+---
+
+## 11. SYSINFO field reference
 
 All fields are plain ASCII decimal unless otherwise noted. Fields that cannot be read from the system are omitted from the response.
 
@@ -916,7 +1061,7 @@ OK\n
 
 ---
 
-## 11. Authentication internals
+## 12. Authentication internals
 
 Authentication is attempted in priority order. The first backend that recognises the username determines the result.
 
@@ -948,7 +1093,7 @@ Every authentication attempt (success or failure) is appended to `/korg/rw/scree
 
 ---
 
-## 12. Error handling and disconnection
+## 13. Error handling and disconnection
 
 ### Stream port
 
@@ -969,7 +1114,7 @@ Every authentication attempt (success or failure) is appended to `/korg/rw/scree
 
 ---
 
-## 13. Implementation limits
+## 14. Implementation limits
 
 | Limit | Value | Notes |
 |-------|-------|-------|
@@ -987,14 +1132,19 @@ Every authentication attempt (success or failure) is appended to `/korg/rw/scree
 | fb0 poll for `/dev/fb1` at startup | 30 seconds | 300 x 100 ms; daemon exits if fb1 never appears |
 | vkbd.ko open poll at startup | 2 seconds | 20 x 100 ms; falls back to uinput if /proc/.vkbd never appears |
 | midi_bridge.ko open poll at startup | 2 seconds | 20 x 100 ms; MIDI disabled if /proc/.midi_in never appears |
+| nks4_inject.ko open poll at startup | 2 seconds | 20 x 100 ms; front-panel injection (BUTTON/CHORD/TOUCH*/WHEEL/SLIDER/KNOB/VSLIDER) unavailable if /proc/.nks4inject never appears |
 | midi_tcp connect poll at startup | 6 seconds | 30 x 200 ms; SysEx capture unavailable if connection fails |
+| CHORD max buttons | 8 | `name1`..`name8`; a 9th name is silently ignored (parser stops filling the array) |
+| CHORD hold_ms range | 0 - 5000 ms | Snapped, not rejected - see Section 7.0 |
+| SLIDER / KNOB index range | 1 - 8 | Snapped, not rejected |
+| SLIDER / KNOB / VSLIDER value range | 0 - 127 | Snapped, not rejected |
 | MIDI_SEND max message size | 4096 bytes | Limited by the kernel module's static buffer |
 | MIDI_SEND CC throttle interval | 7 ms | Minimum spacing between injected Control Change messages sharing the same (status, controller) |
 | MIDI_SEND CC throttle tracked controllers | 32 | Concurrent (status, controller) pairs tracked; a 33rd distinct controller bypasses throttling |
-| SysEx capture buffer (`SYSEX` command) | 65536 bytes | Max response for a single `SYSEX` command; larger objects must be collected off the MIDI bridge stream (§8), which has no cap |
+| SysEx capture buffer (`SYSEX` command) | 65536 bytes | Max response for a single `SYSEX` command; larger objects must be collected off the MIDI bridge stream (Section 8), which has no cap |
 | SysEx capture timeout | ~5 seconds | Initial 5 s recv timeout, then 1 s for trailing data |
 | MIDI bridge max clients | 8 | Connections beyond this are rejected with no response |
-| MIDI bridge SysEx stream chunk | 1024 bytes | SysEx is flushed to clients in ≤1 KB chunks; large objects (e.g. a ~79 KB Set List) stream with no total size cap |
+| MIDI bridge SysEx stream chunk | 1024 bytes | SysEx is flushed to clients in <=1 KB chunks; large objects (e.g. a ~79 KB Set List) stream with no total size cap |
 | MIDI bridge output ring | 16384 bytes | Kernel lock-free single-producer/single-consumer ring; drops only on genuine overflow (unread data preserved); overflow byte count in `/proc/.midi_ports` as `ring_overflow_bytes` |
 | MIDI bridge client send buffer | 262144 bytes | `SO_SNDBUF` per client socket, so a stalled client can't drop a chunk mid-dump |
 | MIDI bridge inbound buffer | 4096 bytes | Per-write maximum for MIDI injection; split larger payloads across writes |

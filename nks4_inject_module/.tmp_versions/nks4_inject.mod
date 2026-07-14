@@ -1,0 +1,2 @@
+/home/share/KronosScreenRemoteDaemon/nks4_inject_module/nks4_inject.ko
+/home/share/KronosScreenRemoteDaemon/nks4_inject_module/nks4_inject.o

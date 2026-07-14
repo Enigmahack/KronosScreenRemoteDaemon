@@ -1,0 +1,1 @@
+cmd_/home/share/KronosScreenRemoteDaemon/nks4_inject_module/nks4_inject.ko := ld -r -m elf_i386 -T /home/build/linux-kronos/scripts/module-common.lds --build-id -o /home/share/KronosScreenRemoteDaemon/nks4_inject_module/nks4_inject.ko /home/share/KronosScreenRemoteDaemon/nks4_inject_module/nks4_inject.o /home/share/KronosScreenRemoteDaemon/nks4_inject_module/nks4_inject.mod.o

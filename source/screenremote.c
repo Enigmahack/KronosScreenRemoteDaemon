@@ -21,12 +21,19 @@
  *   TOUCH_MOVE nx ny        - pen-move (client coalesces consecutive moves)
  *   TOUCH_UP nx ny          - pen-up only
  *   BUTTON name             - press + release a named front-panel button (see btn_table[])
- *   CHORD name1 name2       - press name1, press name2, release name2, release name1
+ *   CHORD [hold_ms] name1 name2 ...  - press left-to-right, release right-to-left
  *   WHEEL CW|CCW            - one data-wheel tick clockwise or counter-clockwise
- *   SLIDER n value          - set CC slider/knob n (1 - 8) to value (0 - 127)
- *                            Effect depends on active Control Assign page:
- *                            RT KNOBS/KARMA -> moves knob n; slider-active -> moves slider n
+ *   SLIDER n value          - set physical Slider n (1 - 8) to value (0 - 127)
+ *   KNOB n value            - set physical RT Knob n (1 - 8) to value (0 - 127)
  *   VSLIDER value           - set value slider position (0 - 127)
+ *   JOYSTICK X|Y value      - set Joystick axis to value (0 - 127)
+ *   VECTOR X|Y value        - set Vector Joystick axis (0 - 127)
+ *   RIBBON X|Z value        - set Ribbon controller axis (0 - 127) - Z axis unverified
+ *   AFTERTOUCH value        - set keybed aftertouch (0 - 127)
+ *   PEDAL value             - set assignable PEDAL jack (0 - 127)
+ *   FOOTSWITCH value        - set assignable foot SWITCH jack (0 - 127)
+ *   DAMPER value            - set DAMPER jack (0 - 127), ramped internally
+ *   TEMPO value             - set tempo (0 - 127, maps to ~40-300bpm, non-linear), ramped internally
  *   KEY code val            - raw key inject: code 1 - 511, val 0=release 1=press
  *   REFRESH                 - force full-frame resend (clears shadow_valid)
  *   MIDI_SEND hex           - inject raw MIDI bytes (hex pairs, spaces allowed)
@@ -53,6 +60,27 @@
  * Boot-safety: /korg/rw/HD/ScreenRemote/.boot is written at startup and deleted only once the
  * framebuffer, network, and listeners are all up.  If it exists on entry the previous boot did not
  * complete cleanly, so midi_bridge is skipped for that boot.  Delete the file over FTP to re-enable.
+ *
+ * Front-panel injection (BUTTON, CHORD, the TOUCH commands, WHEEL, SLIDER, KNOB,
+ * VSLIDER): as of 1.10.0 these no
+ * longer write raw packets to /dev/rtf5.  rtf5 is OA.ko's own OUTBOUND notification FIFO to Eva
+ * (created by OA in stg_rtfifo_init, direction OA-RT -> Eva) - genuine hardware events reach OA
+ * through a completely separate path (CSTGOmapNKSMsgHandler::ProcessNextNKSEvent() pulling raw
+ * NKS4 commands via the exported OmapNKS4InputFifo_ReadCommand and dispatching directly to
+ * CSTGFrontPanel::Handle*), so writing a synthetic packet to rtf5 only ever fooled Eva's own
+ * UI-mirroring code - it never touched the real OA-side action.  That's exactly why touch/mode
+ * buttons "mostly worked" (Eva's own widget hit-testing reconstructed the right behaviour from
+ * the mirrored packet) while sequencer transport, tempo, and some MIDI-triggering touch actions
+ * did nothing (their real effect lives inside OA and was never reached).
+ *
+ * nks4_inject.ko (extracted from the embedded buffer below, loaded early at startup - see
+ * load_nks4_inject()) calls OA's real CSTGFrontPanel::HandleSwitchEvent / HandleTouchPanel /
+ * HandleRotary / HandleAnalogController directly via /proc/.nks4inject, i.e. the exact function
+ * a physical press/touch/turn dispatches through - so injected events get bit-for-bit the same
+ * response as hardware, independent of whatever mode Eva happens to be in.  If the module fails
+ * to load (symbol resolution failure, kill-switch present, etc.) these commands return
+ * "ERR NKS4_NOT_LOADED\n" rather than silently falling back to the old, proven-unreliable rtf5
+ * path - see g_nks4_loaded.
  */
 
 #define _GNU_SOURCE   /* for sched_setaffinity / CPU_SET */
@@ -61,6 +89,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdarg.h>
 #include <signal.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -86,13 +115,14 @@
 #include "vkbd_ko.h"
 #include "midi_bridge_ko.h"
 #include "midi_tcp_bin.h"
+#include "nks4_inject_ko.h"
 
 /*  Keyboard injection (uinput fallback) */
 #define KBD_EV_SYN  0
 #define KBD_EV_KEY  1
 
 /*  Version */
-#define SCREENREMOTE_VERSION "1.9.2"
+#define SCREENREMOTE_VERSION "1.10.0"
 #ifndef BUILD_ID
 #define BUILD_ID "dev"
 #endif
@@ -102,6 +132,7 @@
 #define VKBD_KO           SCREENREMOTE_DIR "/vkbd.ko"
 #define MIDI_BRIDGE_KO    SCREENREMOTE_DIR "/midi_bridge.ko"
 #define MIDI_TCP_BIN      SCREENREMOTE_DIR "/midi_tcp"
+#define NKS4_INJECT_KO    SCREENREMOTE_DIR "/nks4_inject.ko"
 
 #define FB_SRC       "/dev/fb1"
 #define FB_DST       "/dev/fb0"
@@ -182,8 +213,13 @@ typedef struct {
 static cpu_snap_t g_si_prev[SI_NCPU + 1]; /* [0]=aggregate  [1..4]=per-cpu  */
 static int        g_si_prev_valid = 0;
 
-/* Touch / button injection */
-static int touch_fd = -1;  /* fd to /dev/rtf5 O_WRONLY - injects into Eva's FIFO */
+/* Front-panel injection: nks4_inject.ko calls OA's real CSTGFrontPanel::Handle*
+ * methods directly (see header comment above) - this replaces the old /dev/rtf5
+ * packet-write approach entirely, not just for touch. */
+static int nks4_fd      = -1;  /* fd to /proc/.nks4inject O_WRONLY */
+static int g_nks4_loaded = 0;  /* 1 once nks4_inject.ko is loaded and nks4_fd is open */
+static int g_tempo_value = -1;   /* last value TEMPO commanded, -1 = unknown (see nks4_analog_ramp) */
+static int g_damper_value = -1;  /* last value DAMPER commanded, -1 = unknown */
 static int vkbd_fd  = -1;  /* fd to /proc/.vkbd (vkbd.ko virtual keyboard) */
 static int kbd_fd   = -1;  /* fd to physical USB keyboard evdev node (fallback) */
 static int midi_in_fd    = -1;  /* fd to /proc/.midi_in (MIDI injection) */
@@ -201,89 +237,115 @@ static int g_fbcurve_cal = 0;
 #define FBCURVE_LOG  SCREENREMOTE_DIR "/fbcurve.log"
 #define MIDI_TCP_PORT 9875
 
-/* Button table - pkt[2]=dev, pkt[3]=code, pkt[4]=0x7f/0x00 for press/release */
-struct btn_def { const char *name; uint32_t dev; uint32_t code; };
+/* Button table - flat NKS4 hardware scan code (0-127), NOT the old rtf5 (dev,code)
+ * pair.  This is the exact eSTGButtonCode value CSTGFrontPanel::HandleSwitchEvent
+ * dispatches on - ground-truthed two independent ways that agree exactly:
+ *   1. Live capture via the Kronos's own NKS4 test/calibration mode (every code
+ *      below was read directly off the front panel by pressing each physical
+ *      button once with test mode active).
+ *   2. Cross-checked against OA.ko's own ButtonPressHandler disassembly - e.g.
+ *      codes 53/54 (Timbre Track / Audio) land on the two ChangeControlSurfaceMode
+ *      switch cases, code 9 (Help) sets a status flag bit, code 44 (Tap Tempo)
+ *      calls SendKarmaCCToKG - all consistent with the physical function.
+ * INC/DEC codes were captured separately (see their own entry below) after the
+ * main pass, not reused from the old, unrelated rtf5 dev/code guess. */
+struct btn_def { const char *name; uint32_t code; };
 static const struct btn_def btn_table[] = {
     /* Exit / Enter */
-    { "EXIT",       0x06u, 0x02u },
-    { "ENTER",      0x06u, 0x10u },
+    { "EXIT",           8 },
+    { "ENTER",          23 },
     /* Mode select (Radio group) */
-    { "SETLIST",    0x07u, 0x0eu },
-    { "COMBI",      0x07u, 0x08u },
-    { "PROGRAM",    0x07u, 0x09u },
-    { "SEQUENCE",   0x07u, 0x0au },
-    { "SAMPLING",   0x07u, 0x0bu },
-    { "GLOBAL",     0x07u, 0x0cu },
-    { "DISK",       0x07u, 0x0du },
+    { "SETLIST",        7 },
+    { "COMBI",          1 },
+    { "PROGRAM",        2 },
+    { "SEQUENCE",       3 },
+    { "SAMPLING",       4 },
+    { "GLOBAL",         5 },
+    { "DISK",           6 },
     /* Utility */
-    { "HELP",       0x08u, 0x00u },
-    { "COMPARE",    0x08u, 0x01u },
-    { "RESET",      0x08u, 0x02u },
+    { "HELP",           9 },
+    { "COMPARE",        10 },
+    { "RESET",          75 },   /* ResetControls */
     /* Number pad */
-    { "NUM_DASH",   0x06u, 0x05u },
-    { "NUM0",       0x06u, 0x06u },
-    { "NUM_DOT",    0x06u, 0x04u },
-    { "NUM1",       0x06u, 0x07u },
-    { "NUM2",       0x06u, 0x08u },
-    { "NUM3",       0x06u, 0x09u },
-    { "NUM4",       0x06u, 0x0au },
-    { "NUM5",       0x06u, 0x0bu },
-    { "NUM6",       0x06u, 0x0cu },
-    { "NUM7",       0x06u, 0x0du },
-    { "NUM8",       0x06u, 0x0eu },
-    { "NUM9",       0x06u, 0x0fu },
-    /* Value increment/decrement */
-    { "INC",        0x06u, 0x00u },
-    { "DEC",        0x06u, 0x01u },
-    /* Mix Play buttons */
-    { "MP1",        0x04u, 0x00u },
-    { "MP2",        0x04u, 0x01u },
-    { "MP3",        0x04u, 0x02u },
-    { "MP4",        0x04u, 0x03u },
-    { "MP5",        0x04u, 0x04u },
-    { "MP6",        0x04u, 0x05u },
-    { "MP7",        0x04u, 0x06u },
-    { "MP8",        0x04u, 0x07u },
+    { "NUM0",           11 },
+    { "NUM1",           12 },
+    { "NUM2",           13 },
+    { "NUM3",           14 },
+    { "NUM4",           15 },
+    { "NUM5",           16 },
+    { "NUM6",           17 },
+    { "NUM7",           18 },
+    { "NUM8",           19 },
+    { "NUM9",           20 },
+    { "NUM_DASH",       21 },
+    { "NUM_DOT",        22 },
+    /* Mix Play buttons (PlayMute 1-8) */
+    { "MP1",            58 },
+    { "MP2",            59 },
+    { "MP3",            60 },
+    { "MP4",            61 },
+    { "MP5",            62 },
+    { "MP6",            63 },
+    { "MP7",            64 },
+    { "MP8",            65 },
     /* Mix Select buttons */
-    { "MS1",        0x05u, 0x00u },
-    { "MS2",        0x05u, 0x01u },
-    { "MS3",        0x05u, 0x02u },
-    { "MS4",        0x05u, 0x03u },
-    { "MS5",        0x05u, 0x04u },
-    { "MS6",        0x05u, 0x05u },
-    { "MS7",        0x05u, 0x06u },
-    { "MS8",        0x05u, 0x07u },
+    { "MS1",            66 },
+    { "MS2",            67 },
+    { "MS3",            68 },
+    { "MS4",            69 },
+    { "MS5",            70 },
+    { "MS6",            71 },
+    { "MS7",            72 },
+    { "MS8",            73 },
     /* Bank buttons */
-    { "BANK_IA",    0x09u, 0x00u },
-    { "BANK_IB",    0x09u, 0x01u },
-    { "BANK_IC",    0x09u, 0x02u },
-    { "BANK_ID",    0x09u, 0x03u },
-    { "BANK_IE",    0x09u, 0x04u },
-    { "BANK_IF",    0x09u, 0x05u },
-    { "BANK_IG",    0x09u, 0x06u },
-    { "BANK_UA",    0x09u, 0x07u },
-    { "BANK_UB",    0x09u, 0x08u },
-    { "BANK_UC",    0x09u, 0x09u },
-    { "BANK_UD",    0x09u, 0x0au },
-    { "BANK_UE",    0x09u, 0x0bu },
-    { "BANK_UF",    0x09u, 0x0cu },
-    { "BANK_UG",    0x09u, 0x0du },
+    { "BANK_IA",        24 },
+    { "BANK_IB",        25 },
+    { "BANK_IC",        26 },
+    { "BANK_ID",        27 },
+    { "BANK_IE",        28 },
+    { "BANK_IF",        29 },
+    { "BANK_IG",        30 },
+    { "BANK_UA",        31 },
+    { "BANK_UB",        32 },
+    { "BANK_UC",        33 },
+    { "BANK_UD",        34 },
+    { "BANK_UE",        35 },
+    { "BANK_UF",        36 },
+    { "BANK_UG",        37 },
     /* Sequencer controls */
-    { "SEQ_START",  0x0bu, 0x00u },
-    { "SEQ_REC",    0x0bu, 0x01u },
-    { "SEQ_LOCATE", 0x0bu, 0x02u },
-    { "SEQ_FF",     0x0bu, 0x03u },
-    { "SEQ_REW",    0x0bu, 0x04u },
-    { "SEQ_PAUSE",  0x0bu, 0x05u },
-    { "TAP_TEMPO",  0x0bu, 0x06u },
+    { "SEQ_PAUSE",      38 },
+    { "SEQ_REW",        39 },
+    { "SEQ_FF",         40 },
+    { "SEQ_LOCATE",     41 },
+    { "SEQ_REC",        42 },
+    { "SEQ_START",      43 },   /* also STOP - same physical button */
+    { "TAP_TEMPO",      44 },
     /* Sampling controls */
-    { "SMPL_REC",   0x0au, 0x00u },
-    { "SMPL_START", 0x0au, 0x01u },
-    /* Channel strip */
-    { "MIX_KNOBS",  0x07u, 0x05u },
+    { "SMPL_REC",       45 },
+    { "SMPL_START",     46 },
+    /* Channel strip / control surface */
+    { "MIX_KNOBS",      74 },   /* MixerKnobs */
     /* SOLO fires on release; daemon sends press+release so release triggers it */
-    { "SOLO",       0x07u, 0x06u },
-    { NULL, 0u, 0u }
+    { "SOLO",           76 },
+    { "MODULE_CONTROL", 47 },
+    { "KARMA_ONOFF",    48 },
+    { "KARMA_LATCH",    49 },
+    { "DRUM_TRACK",     50 },
+    /* Captured twice under two different labels ("PanelSW+/-" in the first pass,
+     * "INC/DEC" in a dedicated follow-up capture) - same codes both times, so
+     * this is one physical button pair, not two.  INC/DEC is the name both the
+     * C# and Python clients already send (BTN_Inc/BTN_Dec, left-panel INC/DEC),
+     * so that's the name that ships. */
+    { "INC",            51 },
+    { "DEC",            52 },
+    { "TIMBRE_TRACK",   53 },
+    { "AUDIO_TRACK",    54 },
+    { "EXT_TRACK",      55 },
+    { "RTKNOBS_KARMA",  56 },   /* "RT Knobs/Karma" control-surface page select */
+    { "TONE_ADJUST",    57 },
+    { "SW1",            77 },
+    { "SW2",            78 },
+    { NULL, 0u }
 };
 
 /* Access control */
@@ -857,22 +919,108 @@ static void inject_key(int code, int val)
     (void)write(kbd_fd, &ev, sizeof(ev));
 }
 
-static void send_rtf5_event(uint32_t dev, uint32_t code, uint32_t value)
+/* Clamp v into [lo,hi].  Used everywhere a client-supplied numeric value feeds
+ * into an nks4_inject command: we never want to forward an out-of-range value
+ * to the kernel module (which has its own defense-in-depth bounds checks, but
+ * a client should always see its input snapped to something valid, not ERR'd
+ * for a merely-out-of-range-but-otherwise-well-formed request). */
+static int clampi(int v, int lo, int hi)
 {
-    if (touch_fd < 0)
-        touch_fd = open("/dev/rtf5", O_WRONLY);
-    if (touch_fd >= 0) {
-        uint32_t pkt[5] = { 0x00010014u, 0u, dev, code, value };
-        (void)write(touch_fd, pkt, 20);
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+/* Write one command line to /proc/.nks4inject (BTN/BTN_DOWN/BTN_UP/TOUCH/ROT/ANALOG
+ * - see nks4_inject.c's own header comment for the grammar).  Returns 0 on success,
+ * -1 if the module isn't loaded or the write failed.  All callers below are
+ * responsible for clamping/validating their arguments BEFORE calling this - this
+ * function only formats and writes, it does not re-validate. */
+static int nks4_write(const char *fmt, ...)
+{
+    char buf[80];
+    va_list ap;
+    int n;
+
+    if (!g_nks4_loaded || nks4_fd < 0)
+        return -1;
+    va_start(ap, fmt);
+    n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (n < 0 || n >= (int)sizeof(buf))
+        return -1;
+    return write_all(nks4_fd, buf, (size_t)n) == 0 ? 0 : -1;
+}
+
+/* eSTGAnalogDeviceCode raw byte packing, derived from ShortInvertNkS4AnalogValue's
+ * own disassembly: with byte1=0, ebx = byte0*4 exactly (the AND-0x3f8-then-
+ * conditionally-OR-4 sequence cancels out for every byte0 parity), and the
+ * consuming Handle-, Slider-, and Knob- code reads ebx>>3 as its 0-127 display value.
+ * So byte0>>1 == displayed value, i.e. to reach display value V (0-127) send
+ * byte0 = V*2.  Confirmed empirically on hardware for knobs, sliders, and the
+ * value slider (all three read cleanly, exactly matching this formula).
+ *
+ * Tempo (device code 26) and Damper (29) DO take the same byte0 = V*2 input,
+ * but neither can be jumped to directly the way the others can: a large
+ * single-step change produces inconsistent, non-repeatable results, while a
+ * smooth monotonic ramp through intermediate values is clean and precisely
+ * reproducible (confirmed identical ascending and descending for Tempo -
+ * value 0=40bpm ... 127=297bpm, non-linear). See TEMPO's own comment below
+ * for the ramping this requires; nks4_analog_write() itself stays a single
+ * fire-and-forget call for the other commands, which do not need ramping.
+ *
+ * Full eSTGAnalogDeviceCode table (0-30, joystick/vector/ribbon/aftertouch/
+ * pedal/switch/damper included) lives in nks4_inject.c's own header comment.
+ * JOYSTICK/VECTOR/RIBBON/AFTERTOUCH/PEDAL/FOOTSWITCH/DAMPER below all reuse
+ * this same helper and formula and are now hardware-confirmed (see each
+ * command's own comment below for what was tested) - RIBBON's Z axis is the
+ * one remaining untested exception. */
+static int nks4_analog_write(int device_code, int value_0_127)
+{
+    int byte0 = clampi(value_0_127, 0, 127) * 2;
+    return nks4_write("ANALOG %d %d 0\n", device_code, byte0);
+}
+
+/* Tempo (device code 26) and Damper (29) tolerate the identical byte0 = V*2
+ * input every other analog control does, but a direct jump to a target value
+ * produces inconsistent, non-repeatable results on real hardware - a smooth
+ * monotonic ramp through every intermediate value does not.  Confirmed for
+ * Tempo with a full 0-127 sweep in both directions (identical BPM ascending
+ * and descending); confirmed for Damper with a 256-step ramp.  This wraps
+ * nks4_analog_write() in a step loop, 1 unit per call, so callers of TEMPO/
+ * DAMPER get the reliable behaviour without needing to know why.
+ *
+ * *state tracks the value THIS DAEMON last commanded (init -1 = unknown).  On
+ * the first call there is no known starting point to ramp from, so it jumps
+ * directly (best effort, same as before this existed).  Every call after
+ * that ramps from the last commanded value - a physical hand on the same
+ * control between calls would desync this tracking, the same caveat any
+ * absolute-position software control over a real analog input has.
+ *
+ * Blocks the calling thread for the ramp's duration (worst case ~127 steps),
+ * same tradeoff CHORD's hold_ms already makes elsewhere in this file. */
+static void nks4_analog_ramp(int device_code, int target_0_127, int *state)
+{
+    int target = clampi(target_0_127, 0, 127);
+    int step;
+
+    if (*state < 0) {
+        nks4_analog_write(device_code, target);
+        *state = target;
+        return;
+    }
+    step = (target >= *state) ? 1 : -1;
+    while (*state != target) {
+        *state += step;
+        nks4_analog_write(device_code, *state);
+        usleep(25000);   /* ~25 ms/step - matches the proven-smooth Damper ramp pace */
     }
 }
 
 static void inject_touch(int type, int x, int y)
 {
-    if (x < 0) x = 0;
-    if (x >= (int)fb_w) x = (int)fb_w - 1;
-    if (y < 0) y = 0;
-    if (y >= (int)fb_h) y = (int)fb_h - 1;
+    x = clampi(x, 0, (int)fb_w - 1);
+    y = clampi(y, 0, (int)fb_h - 1);
     int x_range = g_touch_x_range;
     int y_range = g_touch_y_range;
     int cx = x + g_touch_x_offset;
@@ -881,7 +1029,7 @@ static void inject_touch(int type, int x, int y)
                    : (uint32_t)(cx * 255 + x_range / 2) / (uint32_t)x_range);
     uint32_t v_adc = cy <= 0 ? 0u : (cy >= y_range ? 255u
                    : (uint32_t)(cy * 255 + y_range / 2) / (uint32_t)y_range);
-    send_rtf5_event(0x11u, (uint32_t)type, v_adc | (h_adc << 8u));
+    nks4_write("TOUCH %d %u\n", type, v_adc | (h_adc << 8u));
 }
 
 /* Embedded .ko / binary extraction - atomic same-dir temp + rename.
@@ -920,18 +1068,18 @@ static void extract_ko(const char *path, const unsigned char *data, unsigned int
     unlink(tmp);   /* leave the existing good file in place on any failure */
 }
 
-/* Mode button keycode - g_mode */
-static void mode_from_btn(uint32_t dev, uint32_t code)
+/* Mode button flat scan code -> g_mode.  Codes match btn_table[]'s mode-select
+ * group (SETLIST/COMBI/PROGRAM/SEQUENCE/SAMPLING/GLOBAL/DISK). */
+static void mode_from_btn(uint32_t code)
 {
-    if (dev != 0x07u) return;
     switch (code) {
-        case 0x0eu: g_mode = 1; break;  /* Setlist  */
-        case 0x08u: g_mode = 2; break;  /* Combi    */
-        case 0x09u: g_mode = 3; break;  /* Program  */
-        case 0x0au: g_mode = 4; break;  /* Sequence */
-        case 0x0bu: g_mode = 5; break;  /* Sampling */
-        case 0x0cu: g_mode = 6; break;  /* Global   */
-        case 0x0du: g_mode = 7; break;  /* Disk     */
+        case 7: g_mode = 1; break;  /* Setlist  */
+        case 1: g_mode = 2; break;  /* Combi    */
+        case 2: g_mode = 3; break;  /* Program  */
+        case 3: g_mode = 4; break;  /* Sequence */
+        case 4: g_mode = 5; break;  /* Sampling */
+        case 5: g_mode = 6; break;  /* Global   */
+        case 6: g_mode = 7; break;  /* Disk     */
     }
 }
 
@@ -1165,6 +1313,41 @@ static void resolve_kallsyms(unsigned long *recv_fn,    unsigned long *reg_fn,
         else if (!*reg_fn      && strstr(name, "RegisterMidiInPort"))          *reg_fn      = addr;
         else if (!*outport_fn  && strstr(name, "RegisterMidiOutPort"))         *outport_fn  = addr;
         if (*recv_fn && *reg_fn && *outport_fn) break;
+    }
+    fclose(f);
+}
+
+/* Resolve the 5 OA.ko-internal symbols nks4_inject.ko calls directly (see that
+ * module's own header comment for the full ABI/offset derivation).  None of
+ * these are EXPORT_SYMBOL'd, so - same convention as resolve_kallsyms() above -
+ * the operator (this daemon) resolves them from /proc/kallsyms and passes the
+ * live addresses in as insmod params, rather than the module trying
+ * kallsyms_lookup_name() itself (not confirmed exported on this kernel). */
+static void resolve_nks4_kallsyms(unsigned long *fn_switch, unsigned long *fn_touch,
+                                   unsigned long *fn_rotary, unsigned long *fn_analog,
+                                   unsigned long *fn_invert)
+{
+    FILE *f = fopen("/proc/kallsyms", "r");
+    char line[256];
+    *fn_switch = *fn_touch = *fn_rotary = *fn_analog = *fn_invert = 0;
+    if (!f) return;
+    while (fgets(line, sizeof(line), f)) {
+        unsigned long addr; char type, name[256];
+        if (sscanf(line, "%lx %c %255s", &addr, &type, name) != 3) continue;
+        if      (!*fn_switch && strstr(name, "HandleSwitchEventE14eSTGButtonCodeb"))
+            *fn_switch = addr;
+        else if (!*fn_touch  && strstr(name, "HandleTouchPanelE24eNKS4TouchPanelEventTypei"))
+            *fn_touch  = addr;
+        else if (!*fn_rotary && strstr(name, "CSTGFrontPanel12HandleRotaryEi"))
+            *fn_rotary = addr;
+        else if (!*fn_analog && strstr(name, "HandleAnalogControllerE20eSTGAnalogDeviceCodeht"))
+            *fn_analog = addr;
+        /* Must NOT match ShortInvertNkS4RawAnalogValue (a different, unrelated
+         * function) - the "Raw" variant breaks this exact substring, so plain
+         * strstr is already safe here without an extra length/suffix check. */
+        else if (!*fn_invert && strstr(name, "ShortInvertNkS4AnalogValue"))
+            *fn_invert = addr;
+        if (*fn_switch && *fn_touch && *fn_rotary && *fn_analog && *fn_invert) break;
     }
     fclose(f);
 }
@@ -1552,44 +1735,60 @@ static void process_ctrl_cmd(const char *line, int fd)
         REPLY("OK\n", 3);
 
     } else if (strncmp(line, "TOUCH ", 6) == 0) {
+        /* x/y out of framebuffer bounds are snapped to the nearest edge inside
+         * inject_touch() itself; only an unparsable line is rejected. */
         int x = 0, y = 0;
+        if (!g_nks4_loaded) { REPLY("ERR NKS4_NOT_LOADED\n", 21); return; }
         if (sscanf(line + 6, "%d %d", &x, &y) == 2) {
             inject_touch(1, x, y);  /* pen-down */
             inject_touch(2, x, y);  /* pen-up */
             REPLY("OK\n", 3);
+        } else {
+            REPLY("ERR\n", 4);
         }
 
     } else if (strncmp(line, "TOUCH_DOWN ", 11) == 0) {
         int x = 0, y = 0;
+        if (!g_nks4_loaded) { REPLY("ERR NKS4_NOT_LOADED\n", 21); return; }
         if (sscanf(line + 11, "%d %d", &x, &y) == 2) {
             inject_touch(1, x, y);
             REPLY("OK\n", 3);
+        } else {
+            REPLY("ERR\n", 4);
         }
 
     } else if (strncmp(line, "TOUCH_MOVE ", 11) == 0) {
         int x = 0, y = 0;
+        if (!g_nks4_loaded) { REPLY("ERR NKS4_NOT_LOADED\n", 21); return; }
         if (sscanf(line + 11, "%d %d", &x, &y) == 2) {
             inject_touch(3, x, y);
             REPLY("OK\n", 3);
+        } else {
+            REPLY("ERR\n", 4);
         }
 
     } else if (strncmp(line, "TOUCH_UP ", 9) == 0) {
         int x = 0, y = 0;
+        if (!g_nks4_loaded) { REPLY("ERR NKS4_NOT_LOADED\n", 21); return; }
         if (sscanf(line + 9, "%d %d", &x, &y) == 2) {
             inject_touch(2, x, y);
             REPLY("OK\n", 3);
+        } else {
+            REPLY("ERR\n", 4);
         }
 
     } else if (strncmp(line, "BUTTON ", 7) == 0) {
         const char *bname = line + 7;
         const struct btn_def *b;
+        if (!g_nks4_loaded) { REPLY("ERR NKS4_NOT_LOADED\n", 21); return; }
         for (b = btn_table; b->name; b++) {
             if (strcmp(bname, b->name) == 0) break;
         }
+        /* Unknown button name: nothing sensible to snap to, so reject outright
+         * rather than silently pick some other button. */
         if (b->name) {
-            send_rtf5_event(b->dev, b->code, 0x7fu);
-            send_rtf5_event(b->dev, b->code, 0x00u);
-            mode_from_btn(b->dev, b->code);
+            nks4_write("BTN %u\n", b->code);
+            mode_from_btn(b->code);
             REPLY("OK\n", 3);
         } else {
             REPLY("ERR\n", 4);
@@ -1600,11 +1799,13 @@ static void process_ctrl_cmd(const char *line, int fd)
         const struct btn_def *btns[8];
         int count = 0, hold_ms = 0;
         const char *p = line + 6;
+        if (!g_nks4_loaded) { REPLY("ERR NKS4_NOT_LOADED\n", 21); return; }
         while (*p == ' ') p++;
-        /* Optional leading number = hold duration in ms (max 5000) */
+        /* Optional leading number = hold duration in ms; clamp into [0,5000]
+         * rather than reject (a client sending "-50" or "999999" almost
+         * certainly means "as short/long as allowed", not a malformed request). */
         if (*p >= '0' && *p <= '9') {
-            hold_ms = atoi(p);
-            if (hold_ms > 5000) hold_ms = 5000;
+            hold_ms = clampi(atoi(p), 0, 5000);
             while (*p && *p != ' ') p++;
         }
         while (count < 8) {
@@ -1625,50 +1826,214 @@ static void process_ctrl_cmd(const char *line, int fd)
             for (int i = 0; i < count; i++) { if (!btns[i]) { ok = 0; break; } }
             if (ok) {
                 for (int i = 0; i < count; i++)
-                    send_rtf5_event(btns[i]->dev, btns[i]->code, 0x7fu);
+                    nks4_write("BTN_DOWN %u\n", btns[i]->code);
                 if (hold_ms > 0) usleep(hold_ms * 1000);
                 for (int i = count - 1; i >= 0; i--)
-                    send_rtf5_event(btns[i]->dev, btns[i]->code, 0x00u);
+                    nks4_write("BTN_UP %u\n", btns[i]->code);
                 REPLY("OK\n", 3);
             } else {
-                REPLY("ERR\n", 4);
+                REPLY("ERR\n", 4);   /* one or more unknown button names */
             }
+        } else {
+            REPLY("ERR\n", 4);       /* fewer than 2 buttons is not a chord */
         }
 
     } else if (strncmp(line, "WHEEL ", 6) == 0) {
-        /* Data wheel: 16-byte packet, device=0x0d, field3=0x0100(CW) or 0xFF00(CCW) */
+        /* CW/CCW are the only two valid directions - no numeric value to snap,
+         * so anything else is rejected outright.  Delta is the exact 32-bit
+         * value ground-truthed from a real hardware capture (HandleRotary's
+         * EDX is zero-extended from the raw 16-bit NKS4 field, NOT a signed
+         * -256 - that distinction is load-bearing, do not "simplify" this to
+         * a negative literal). */
         const char *dir = line + 6;
-        uint32_t field3;
-        if (strcmp(dir, "CW") == 0)       field3 = 0x00000100u;
-        else if (strcmp(dir, "CCW") == 0) field3 = 0x0000FF00u;
+        int delta;
+        if (!g_nks4_loaded) { REPLY("ERR NKS4_NOT_LOADED\n", 21); return; }
+        if (strcmp(dir, "CW") == 0)       delta = 0x00000100;
+        else if (strcmp(dir, "CCW") == 0) delta = 0x0000FF00;
         else { REPLY("ERR\n", 4); return; }
-
-        if (touch_fd < 0)
-            touch_fd = open("/dev/rtf5", O_WRONLY);
-        if (touch_fd >= 0) {
-            uint32_t pkt[4];
-            pkt[0] = 0x00010010u;
-            pkt[1] = 0x00000000u;
-            pkt[2] = 0x0000000du;
-            pkt[3] = field3;
-            (void)write(touch_fd, pkt, 16);
-        }
+        nks4_write("ROT %d\n", delta);
         REPLY("OK\n", 3);
 
     } else if (strncmp(line, "SLIDER ", 7) == 0) {
+        /* Physical Slider n, device code 16 + (n-1).  idx and val are each
+         * snapped into their valid range rather than rejected - only a
+         * genuinely malformed line (sscanf fails to find two integers at
+         * all) is treated as an error. */
         int idx = 0, val = 0;
-        if (sscanf(line + 7, "%d %d", &idx, &val) == 2 &&
-                idx >= 1 && idx <= 8 && val >= 0 && val <= 127) {
-            send_rtf5_event(0x0eu, (uint32_t)(idx - 1), (uint32_t)val);
+        if (!g_nks4_loaded) { REPLY("ERR NKS4_NOT_LOADED\n", 21); return; }
+        if (sscanf(line + 7, "%d %d", &idx, &val) == 2) {
+            idx = clampi(idx, 1, 8);
+            nks4_analog_write(16 + (idx - 1), val);
+            REPLY("OK\n", 3);
+        } else {
+            REPLY("ERR\n", 4);
+        }
+
+    } else if (strncmp(line, "KNOB ", 5) == 0) {
+        /* Physical RT Knob n, device code 8 + (n-1). Same snap-not-reject
+         * policy as SLIDER. */
+        int idx = 0, val = 0;
+        if (!g_nks4_loaded) { REPLY("ERR NKS4_NOT_LOADED\n", 21); return; }
+        if (sscanf(line + 5, "%d %d", &idx, &val) == 2) {
+            idx = clampi(idx, 1, 8);
+            nks4_analog_write(8 + (idx - 1), val);
             REPLY("OK\n", 3);
         } else {
             REPLY("ERR\n", 4);
         }
 
     } else if (strncmp(line, "VSLIDER ", 8) == 0) {
+        /* Value slider, device code 25.  val is snapped into [0,127]; only a
+         * line with no parsable integer at all is rejected. */
         int val = 0;
-        if (sscanf(line + 8, "%d", &val) == 1 && val >= 0 && val <= 127) {
-            send_rtf5_event(0x0fu, 0x09u, (uint32_t)val);
+        if (!g_nks4_loaded) { REPLY("ERR NKS4_NOT_LOADED\n", 21); return; }
+        if (sscanf(line + 8, "%d", &val) == 1) {
+            nks4_analog_write(25, val);
+            REPLY("OK\n", 3);
+        } else {
+            REPLY("ERR\n", 4);
+        }
+
+    /* --- JOYSTICK / VECTOR / RIBBON / AFTERTOUCH / PEDAL / FOOTSWITCH / DAMPER ---
+     * Device codes identified from OA.ko's own AnalogControllerHandler dispatch
+     * tables and cross-checked against the Kronos Operation Guide's front-panel
+     * control list (see docs/api.md Section 10) - all real, standard controls.
+     * Wired through the SAME validated call path as SLIDER/KNOB/VSLIDER
+     * (ShortInvertNkS4AnalogValue -> HandleAnalogController, byte0 = value*2).
+     * Hardware-confirmed by live testing: JOYSTICK and VECTOR (full-radius CW
+     * circular sweep, then half-radius CCW), RIBBON X axis (center/max/min
+     * sweep - Z axis untested), AFTERTOUCH, PEDAL, and FOOTSWITCH all track
+     * large single-step jumps correctly, same as the knob/slider group.
+     * DAMPER also confirmed working but is a real, documented exception: large
+     * jumps produced inconsistent results across otherwise-identical runs; a
+     * slow many-step ramp was smooth and repeatable. Send DAMPER as a gradual
+     * ramp only - see that command's own comment below. */
+
+    } else if (strncmp(line, "JOYSTICK ", 9) == 0) {
+        /* Standard pitch/mod Joystick (Kronos manual item 12). Hardware-
+         * confirmed via a full-radius clockwise circular sweep then a
+         * half-radius counter-clockwise sweep, same as VECTOR below. */
+        char axis = 0; int val = 0;
+        if (!g_nks4_loaded) { REPLY("ERR NKS4_NOT_LOADED\n", 21); return; }
+        if (sscanf(line + 9, "%c %d", &axis, &val) == 2 && (axis == 'X' || axis == 'Y')) {
+            nks4_analog_write(axis == 'X' ? 1 : 2, val);
+            REPLY("OK\n", 3);
+        } else {
+            REPLY("ERR\n", 4);   /* unrecognised axis - no sensible value to snap to */
+        }
+
+    } else if (strncmp(line, "VECTOR ", 7) == 0) {
+        /* Vector Joystick (Kronos manual item 9) - a separate physical control
+         * from JOYSTICK above, used for Vector Synthesis, not pitch/mod.
+         * Hardware-confirmed via a full-radius clockwise circular sweep then a
+         * half-radius counter-clockwise sweep. */
+        char axis = 0; int val = 0;
+        if (!g_nks4_loaded) { REPLY("ERR NKS4_NOT_LOADED\n", 21); return; }
+        if (sscanf(line + 7, "%c %d", &axis, &val) == 2 && (axis == 'X' || axis == 'Y')) {
+            nks4_analog_write(axis == 'X' ? 5 : 6, val);
+            REPLY("OK\n", 3);
+        } else {
+            REPLY("ERR\n", 4);
+        }
+
+    } else if (strncmp(line, "RIBBON ", 7) == 0) {
+        /* X axis (finger position) hardware-confirmed via a center/max/center/
+         * min/center sweep. Z axis's exact meaning (commonly touch pressure on
+         * a ribbon strip) is real (confirmed dispatch entry) but untested -
+         * see docs/api.md Section 10. */
+        char axis = 0; int val = 0;
+        if (!g_nks4_loaded) { REPLY("ERR NKS4_NOT_LOADED\n", 21); return; }
+        if (sscanf(line + 7, "%c %d", &axis, &val) == 2 && (axis == 'X' || axis == 'Z')) {
+            nks4_analog_write(axis == 'X' ? 3 : 4, val);
+            REPLY("OK\n", 3);
+        } else {
+            REPLY("ERR\n", 4);
+        }
+
+    } else if (strncmp(line, "AFTERTOUCH ", 11) == 0) {
+        /* Keybed channel aftertouch. Hardware-confirmed via a 0/half/full/
+         * half/0 sweep - large single-step jumps work fine. */
+        int val = 0;
+        if (!g_nks4_loaded) { REPLY("ERR NKS4_NOT_LOADED\n", 21); return; }
+        if (sscanf(line + 11, "%d", &val) == 1) {
+            nks4_analog_write(7, val);
+            REPLY("OK\n", 3);
+        } else {
+            REPLY("ERR\n", 4);
+        }
+
+    } else if (strncmp(line, "PEDAL ", 6) == 0) {
+        /* Rear-panel assignable PEDAL jack (continuous, e.g. expression).
+         * Hardware-confirmed via a 0/half/full/half/0 sweep - large single-step
+         * jumps work fine here, unlike DAMPER below. */
+        int val = 0;
+        if (!g_nks4_loaded) { REPLY("ERR NKS4_NOT_LOADED\n", 21); return; }
+        if (sscanf(line + 6, "%d", &val) == 1) {
+            nks4_analog_write(27, val);
+            REPLY("OK\n", 3);
+        } else {
+            REPLY("ERR\n", 4);
+        }
+
+    } else if (strncmp(line, "FOOTSWITCH ", 11) == 0) {
+        /* Rear-panel assignable foot SWITCH jack. Hardware-confirmed via a
+         * single on(127)/off(0) tap, registered correctly with no polarity
+         * surprises - a simple on/off switch, unlike the other continuous
+         * controls here, but the value is still snapped into [0,127] rather
+         * than restricted to those two values - the daemon does not assume
+         * the assigned function only cares about on/off. */
+        int val = 0;
+        if (!g_nks4_loaded) { REPLY("ERR NKS4_NOT_LOADED\n", 21); return; }
+        if (sscanf(line + 11, "%d", &val) == 1) {
+            nks4_analog_write(28, val);
+            REPLY("OK\n", 3);
+        } else {
+            REPLY("ERR\n", 4);
+        }
+
+    } else if (strncmp(line, "DAMPER ", 7) == 0) {
+        /* Rear-panel DAMPER jack - sustain, or half-damper position if the
+         * current Program/Combi has half-damper response configured.
+         *
+         * Hardware-confirmed, but with a real quirk: the jack accepts either
+         * a simple on/off footswitch (Korg PS-1) or a continuous half-damper
+         * pedal (Korg DS-1H), and AnalogDamperHandler evidently uses rate-of-
+         * change to tell them apart - NOT a polarity-setting effect (a
+         * polarity change was tried first based on the odd initial symptoms
+         * and made no difference). A direct jump to a target value produces
+         * inconsistent, non-repeatable results on real hardware; a gradual
+         * ramp through every intermediate value does not - confirmed via a
+         * 256-step sweep, smooth and repeatable both directions. Routed
+         * through nks4_analog_ramp() below so callers never have to think
+         * about this - send a target value like any other command here. */
+        int val = 0;
+        if (!g_nks4_loaded) { REPLY("ERR NKS4_NOT_LOADED\n", 21); return; }
+        if (sscanf(line + 7, "%d", &val) == 1) {
+            nks4_analog_ramp(29, val, &g_damper_value);
+            REPLY("OK\n", 3);
+        } else {
+            REPLY("ERR\n", 4);
+        }
+
+    } else if (strncmp(line, "TEMPO ", 6) == 0) {
+        /* Tempo, device code 26. Same behavioural class as DAMPER above - a
+         * direct jump produces inconsistent results, a gradual ramp does not
+         * - routed through the same nks4_analog_ramp() helper.
+         *
+         * value is 0-127 like every other analog command here, NOT a direct
+         * BPM number - it maps onto the documented 40-300bpm range through a
+         * confirmed non-linear curve (more resolution at low tempos), not a
+         * straight line. Ground-truthed on hardware, identical ascending and
+         * descending:
+         *   value:  0   16   32   48   64   80   96  112  127
+         *   bpm:   40   51   68   92  120  154  196  245  297
+         * Interpolate between these points for an intermediate value if a
+         * client needs a specific BPM; no closed-form formula is exposed
+         * here since the confirmed data is the more reliable source. */
+        int val = 0;
+        if (!g_nks4_loaded) { REPLY("ERR NKS4_NOT_LOADED\n", 21); return; }
+        if (sscanf(line + 6, "%d", &val) == 1) {
+            nks4_analog_ramp(26, val, &g_tempo_value);
             REPLY("OK\n", 3);
         } else {
             REPLY("ERR\n", 4);
@@ -2002,6 +2367,55 @@ static void load_midi_bridge(void)
     }
 }
 
+/* Load nks4_inject.ko - see its own header comment for what it does and why.
+ * Unlike midi_bridge this makes pure additive calls into OA's own
+ * CSTGFrontPanel::Handle* methods; it never claims a reader slot on a live
+ * queue or touches anything EVA's USB-codec init could still be mutating, so
+ * it only needs OA to be Live (kallsyms resolvable, .text relocated) - NOT
+ * EVA's UI to be up.  Loaded early (right after vkbd, see main()), well
+ * before midi_bridge's EVA-ready gate. */
+static void load_nks4_inject(void)
+{
+    unsigned long fn_switch = 0, fn_touch = 0, fn_rotary = 0, fn_analog = 0, fn_invert = 0;
+    char params[256];
+    long ret;
+
+    if (!wait_for_oa_live(50)) {
+        fprintf(stderr, "screenremote: OA not Live at nks4_inject load - "
+                "front-panel injection disabled\n");
+        return;
+    }
+    resolve_nks4_kallsyms(&fn_switch, &fn_touch, &fn_rotary, &fn_analog, &fn_invert);
+    if (!fn_switch || !fn_touch || !fn_rotary || !fn_analog || !fn_invert) {
+        fprintf(stderr, "screenremote: missing NKS4 symbols in kallsyms "
+                "(switch=%s touch=%s rotary=%s analog=%s invert=%s) - "
+                "front-panel injection disabled\n",
+                fn_switch ? "ok" : "none", fn_touch ? "ok" : "none",
+                fn_rotary ? "ok" : "none", fn_analog ? "ok" : "none",
+                fn_invert ? "ok" : "none");
+        return;
+    }
+    snprintf(params, sizeof(params),
+             "fn_switch=0x%lx fn_touch=0x%lx fn_rotary=0x%lx fn_analog=0x%lx fn_invert=0x%lx",
+             fn_switch, fn_touch, fn_rotary, fn_analog, fn_invert);
+    extract_ko(NKS4_INJECT_KO, nks4_inject_ko, nks4_inject_ko_len);
+    ret = syscall(SYS_init_module, (void *)nks4_inject_ko,
+                  (unsigned long)nks4_inject_ko_len, params);
+    if (ret == 0 || errno == EEXIST) {
+        int _ni;
+        for (_ni = 0; _ni < 20 && nks4_fd < 0; _ni++) {
+            usleep(100000);
+            nks4_fd = open("/proc/.nks4inject", O_WRONLY);
+        }
+        g_nks4_loaded = (nks4_fd >= 0);
+        fprintf(stderr, "screenremote: nks4_inject %s (fd=%s)\n",
+                ret == 0 ? "loaded" : "already loaded",
+                nks4_fd >= 0 ? "ok" : "open failed");
+    } else {
+        fprintf(stderr, "screenremote: nks4_inject failed (%ld)\n", ret);
+    }
+}
+
 /* ---- Boot kernel-log capture (stock non-rooted diagnosis) ---------------
  * Stock (non-rooted) Kronos units have no dmesg/klogd, so a freeze during
  * early-boot module loading normally leaves no retrievable evidence - and
@@ -2216,6 +2630,12 @@ int main(void)
             usleep(100000);
             vkbd_fd = open("/proc/.vkbd", O_WRONLY);
         }
+
+        /* Front-panel injection module: safe to load this early too (see
+         * load_nks4_inject()'s own comment for why it doesn't need to wait for
+         * EVA like midi_bridge does) - BUTTON/TOUCH/WHEEL/SLIDER/KNOB/VSLIDER
+         * are unavailable (ERR NKS4_NOT_LOADED) until this succeeds. */
+        load_nks4_inject();
     }
 
     /* MIDI injection module: DEFERRED, not loaded here.
@@ -2677,7 +3097,7 @@ int main(void)
     if (stream_listen >= 0) close(stream_listen);
     if (ctrl_listen   >= 0) close(ctrl_listen);
     if (disc_fd >= 0) close(disc_fd);
-    if (touch_fd >= 0) { close(touch_fd); touch_fd = -1; }
+    if (nks4_fd >= 0) { close(nks4_fd); nks4_fd = -1; }
     if (vkbd_fd  >= 0) { close(vkbd_fd);  vkbd_fd  = -1; }
     if (kbd_fd   >= 0) { ioctl(kbd_fd, UI_DEV_DESTROY); close(kbd_fd); kbd_fd = -1; }
     if (midi_in_fd  >= 0) { close(midi_in_fd);  midi_in_fd = -1; }

@@ -1,0 +1,16 @@
+# See ../midi_module/Makefile.module and ../../project_linux_kronos_kernel_tree.md -
+# /home/build/linux-kronos is Korg's actual kernel source, verified to produce
+# byte-accurate struct/module layouts against real Korg .ko files.
+KDIR   ?= /home/build/linux-kronos
+PWD    := $(shell pwd)
+PATCH  := ../patch_init_offset.py
+KO_HDR := ../source/nks4_inject_ko.h
+
+all:
+	$(MAKE) -C $(KDIR) M=$(PWD) modules
+	python3 $(PATCH) nks4_inject.ko
+	xxd -i nks4_inject.ko $(KO_HDR)
+
+clean:
+	$(MAKE) -C $(KDIR) M=$(PWD) clean
+	rm -f $(KO_HDR)
