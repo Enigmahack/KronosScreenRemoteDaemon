@@ -302,6 +302,37 @@ class KSCRCtrlClient:
     def touch_up(self, x: int, y: int) -> str:
         return self.send_cmd(f'TOUCH_UP {x} {y}')
 
+    def padchord(self, pad_index: int, velocity: int) -> str:
+        """Play (velocity 1-127) or release (velocity 0) one of the 8
+        "Pads (touch to play)" chords. pad_index is 0-indexed (0 = on-screen
+        "Pad 1"). See docs/api.md's PADCHORD section for why this bypasses
+        TOUCH entirely."""
+        return self.send_cmd(f'PADCHORD {pad_index} {velocity}')
+
+    def padmap(self, pad_index: int, x0: int, y0: int, x1: int, y1: int) -> str:
+        """Live-set pad_index's rectangular hit region in framebuffer pixel
+        space (uncalibrated placeholders by default - see docs/api.md's
+        PADMAP section). Takes effect immediately, no daemon restart."""
+        return self.send_cmd(f'PADMAP {pad_index} {x0} {y0} {x1} {y1}')
+
+    def padmap_list(self) -> str:
+        """Return all 8 pads' current hit regions, one 'idx x0 y0 x1 y1' per line."""
+        return self.send_cmd('PADMAP_LIST')
+
+    def padmap_on(self) -> str:
+        """Enable touch->PADCHORD auto-detection using the current PADMAP regions."""
+        return self.send_cmd('PADMAP_ON')
+
+    def padmap_off(self) -> str:
+        """Disable touch->PADCHORD auto-detection (default state)."""
+        return self.send_cmd('PADMAP_OFF')
+
+    def last_touch(self) -> str:
+        """Return the most recent touch's raw framebuffer pixel coordinates
+        ('X=<x> Y=<y>') - use this to find real on-screen pad box positions
+        during PADMAP calibration."""
+        return self.send_cmd('LASTTOUCH')
+
     def wheel(self, direction: str) -> str:
         """direction: 'CW' or 'CCW'"""
         return self.send_cmd(f'WHEEL {direction}')

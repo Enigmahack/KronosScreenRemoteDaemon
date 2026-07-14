@@ -201,6 +201,44 @@ static int g_touch_x_range  = 813;  /* total pixel span -> ADC 0-255            
 static int g_touch_y_offset = 20;   /* pixels added to y before ADC scaling      */
 static int g_touch_y_range  = 638;  /* total pixel span -> ADC 0-255             */
 
+/* Pad-tap detection: touch (x,y) in framebuffer pixel space -> PADCHORD.
+ * Regions calibrated 2026-07-14 against real hardware: 32 corner taps (4 per
+ * pad) captured live with LASTTOUCH via tools/pad_calibration_monitor.py,
+ * then quantized to 8 uniform 94x335 boxes via linear regression on the pad
+ * centers (raw click widths varied 88-97px from click imprecision; centers
+ * fit a clean line, spacing ~99.8px, ~6px gaps between pads) rather than
+ * used as-is. All 8 pads share one row (Y range is constant, only X
+ * varies), in on-screen left-to-right order matching PADCHORD's pad_index.
+ * Detection still stays off by default (g_padmap_enabled=0) - flip
+ * PADMAP_ON once ready. See docs/api.md's PADMAP section. */
+#define NUM_PAD_REGIONS 8
+struct pad_region { int x0, y0, x1, y1; };
+static struct pad_region g_pad_regions[NUM_PAD_REGIONS] = {
+    {   3, 144,  96, 478 }, { 103, 144, 196, 478 },
+    { 203, 144, 296, 478 }, { 303, 144, 396, 478 },
+    { 402, 144, 495, 478 }, { 502, 144, 595, 478 },
+    { 602, 144, 695, 478 }, { 702, 144, 795, 478 },
+};
+static int g_padmap_enabled = 0;
+static int g_active_pad = -1;          /* pad currently held down, or -1 */
+static struct timespec g_chord_down_time;  /* when g_active_pad's trigger was sent */
+/* Minimum time (ms) a PADCHORD trigger must be held before its release is
+ * sent - see inject_touch()'s pen-up handler for why this exists. */
+#define PADCHORD_MIN_HOLD_MS 80
+static int g_last_touch_x = -1, g_last_touch_y = -1;   /* for LASTTOUCH calibration query */
+/* Diagnostic trail of the last type==1 (pen-down) gate evaluation, for
+ * debugging why a real client's tap doesn't fire PADCHORD when our own
+ * synthetic TOUCH_DOWN/TOUCH_UP tests do - -1 for each means "no pen-down
+ * has been evaluated yet since this daemon started". */
+static int g_last_touch_type = -1;
+static int g_last_gate_pads_page = -1, g_last_gate_pad_play = -1;
+static int g_last_gate_chord_assign = -1, g_last_gate_hit = -1;
+
+/* Minimum real wall-clock gap enforced between successive touch injections
+ * (TOUCH's own down+up pair, and each TOUCH_DOWN/TOUCH_MOVE/TOUCH_UP from a
+ * client-driven drag) - see touch_pace()'s own comment by inject_touch(). */
+#define TOUCH_MIN_INTERVAL_MS 30
+
 /* Mode state */
 static uint32_t g_mode        = 0;   /* 0=init 1=Setlist 2=Combi 3=Program
                                          4=Sequence 5=Sampling 6=Global 7=Disk */
@@ -361,6 +399,17 @@ static uint32_t g_bound_ip = INADDR_ANY;
 static int  ctrl_fd     = -1;   /* accepted persistent ctrl socket, -1 if none */
 static char ctrl_lb[2048];      /* partial line accumulation buffer */
 static int  ctrl_lb_n   = 0;    /* bytes in ctrl_lb */
+
+/* TOUCH_MOVE coalescing for handle_ctrl_persistent_data() - see its own
+ * comment for why this exists (a drag's queued TOUCH_MOVE backlog was
+ * delaying the release that follows it, each one paying touch_pace()'s
+ * blocking 30ms minimum gap before the release even got its turn). Only
+ * ever holds ONE line (not a general command queue/buffer) - every other
+ * command type still processes immediately in strict order, so nothing
+ * that can be long (MIDI_SEND's SysEx payload, CHORD's button list) or
+ * order-sensitive is ever deferred or size-truncated. */
+static char ctrl_pending_move[96];
+static int  ctrl_has_pending_move = 0;
 
 /* Signal flag */
 static volatile sig_atomic_t g_exit = 0;
@@ -952,6 +1001,103 @@ static int nks4_write(const char *fmt, ...)
     return write_all(nks4_fd, buf, (size_t)n) == 0 ? 0 : -1;
 }
 
+/* Reads onscreen_touch_pad_mode from /proc/.nks4inject_status - this is
+ * CSTGFrontPanel::sInstance[0x104], which nks4_inject.c already exposes
+ * read-only (see its own touch_pad_mode_read()). Confirmed (2026-07-14, via
+ * Eva decompilation) to be a COMBINED signal, not just "Enable Pad Play":
+ * CFormOmnimodePads::OnHide() unconditionally clears it on navigating away
+ * from the page, and OnShow() only sets it when the page is shown AND Enable
+ * Pad Play is on - so nonzero means both "on the Pads page" and "pad play
+ * enabled" at once, and zero safely covers every case PADMAP should NOT
+ * fire in (wrong page, pads disabled, or Chord Assign active - OnShow()
+ * doesn't arm the flag in that mode either). Read fresh on every touch
+ * rather than cached - this is normal-context proc I/O, not RT-context, and
+ * the flag can change between taps (mode switches, page navigation). */
+static int pad_play_active(void)
+{
+    int fd;
+    char buf[256];
+    ssize_t n;
+    const char *p;
+
+    fd = open("/proc/.nks4inject_status", O_RDONLY);
+    if (fd < 0)
+        return 0;
+    n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0)
+        return 0;
+    buf[n] = '\0';
+    p = strstr(buf, "onscreen_touch_pad_mode=");
+    if (!p)
+        return 0;
+    return atoi(p + strlen("onscreen_touch_pad_mode=")) != 0;
+}
+
+/* Framebuffer pixel fingerprint for "are we on the Pads (touch to play)
+ * page" - added after sInstance[0x104]/pad_play_active() was live-tested
+ * and disproved as a page/mode signal (2026-07-14). fb1_map is a direct
+ * mmap() onto the hardware framebuffer (see fb1 init), so this is always
+ * live with zero staleness, no polling delay. Calibrated the same way as
+ * PADMAP's regions: sampled a point 5px inset from each pad box's top-left
+ * corner while confirmed on the Pads page (all 8 read the same uniform
+ * pad-box-background value, 219) and confirmed none of the 8 read that
+ * value on a different tab (mostly 15, a couple outliers) - requiring ALL
+ * 8 to match is a strong discriminator, since another page coincidentally
+ * matching all 8 specific coordinates is very unlikely. */
+#define PAD_FINGERPRINT_VALUE 219
+#define PAD_FINGERPRINT_INSET 5
+
+static int on_pads_page(void)
+{
+    int i, matches = 0;
+    if (!fb1_map)
+        return 0;
+    for (i = 0; i < NUM_PAD_REGIONS; i++) {
+        struct pad_region *r = &g_pad_regions[i];
+        int x = r->x0 + PAD_FINGERPRINT_INSET;
+        int y = r->y0 + PAD_FINGERPRINT_INSET;
+        if (x < 0 || x >= (int)fb_w || y < 0 || y >= (int)fb_h)
+            continue;
+        if (fb1_map[y * (int)fb1_stride + x] == PAD_FINGERPRINT_VALUE)
+            matches++;
+    }
+    return matches == NUM_PAD_REGIONS;
+}
+
+/* Chord Assign / Enable Pad Play / Fixed Velocity toggle indicators -
+ * calibrated 2026-07-14 by before/after REGION diffs around each click
+ * (bulk pixel dump, since per-pixel PIXEL queries were too slow for a wide
+ * scan and the exact click coordinate turned out to be offset from the
+ * actual colored indicator). All three are a small red LED-style dot:
+ * bright red (palette idx ~50, R~246) when ON, dark/muted red (idx ~59-61,
+ * R~105-129) when OFF - confirmed against the user's live toggling of all
+ * three, both directions. Checking the palette's R channel at a threshold
+ * (not an exact index match) is more robust to minor anti-aliasing/
+ * rendering variance than requiring one specific index. Remarkably evenly
+ * spaced (399-59=340, 739-399=340) - all three are likely one shared
+ * widget template repeated at fixed intervals along the same row. */
+#define TOGGLE_BRIGHT_R_THRESHOLD 200
+#define CHORD_ASSIGN_PX      59
+#define CHORD_ASSIGN_PY     102
+#define ENABLE_PAD_PLAY_PX  399
+#define ENABLE_PAD_PLAY_PY  103
+#define FIXED_VELOCITY_PX   739
+#define FIXED_VELOCITY_PY   102
+
+static int toggle_is_on(int x, int y)
+{
+    unsigned char idx;
+    if (!fb1_map || x < 0 || x >= (int)fb_w || y < 0 || y >= (int)fb_h)
+        return 0;
+    idx = fb1_map[y * (int)fb1_stride + x];
+    return (pal_r[idx] >> 8) > TOGGLE_BRIGHT_R_THRESHOLD;
+}
+
+static int chord_assign_on(void)    { return toggle_is_on(CHORD_ASSIGN_PX, CHORD_ASSIGN_PY); }
+static int enable_pad_play_on(void) { return toggle_is_on(ENABLE_PAD_PLAY_PX, ENABLE_PAD_PLAY_PY); }
+static int fixed_velocity_on(void)  { return toggle_is_on(FIXED_VELOCITY_PX, FIXED_VELOCITY_PY); }
+
 /* eSTGAnalogDeviceCode raw byte packing, derived from ShortInvertNkS4AnalogValue's
  * own disassembly: with byte1=0, ebx = byte0*4 exactly (the AND-0x3f8-then-
  * conditionally-OR-4 sequence cancels out for every byte0 parity), and the
@@ -1017,10 +1163,142 @@ static void nks4_analog_ramp(int device_code, int target_0_127, int *state)
     }
 }
 
+/* A synthetic TOUCH_DOWN immediately followed by TOUCH_UP (or a burst of
+ * TOUCH_MOVE steps) reaches HandleTouchPanel only microseconds apart - two
+ * back-to-back write()s to /proc/.nks4inject, versus the tens-of-milliseconds
+ * a real finger's contact/scan naturally spans. Confirmed on hardware
+ * (2026-07-14): a zero-delay TOUCH_DOWN + 13x TOUCH_MOVE + TOUCH_UP dragged
+ * across the on-screen Pan knob collapsed into a single tap (selected the
+ * field, value unchanged) instead of a drag; the identical sequence paced
+ * ~30ms apart correctly scrubbed the value end to end. Same root cause class
+ * as DAMPER/TEMPO needing a real-time ramp instead of an instant jump (see
+ * nks4_analog_ramp() above) - the touch/gesture state machine on the other
+ * end evidently needs real elapsed time between samples, not just correct
+ * coordinates. This pacing is the suspected fix for Pads' chord-on-tap too
+ * (untested directly - no confirmed Pads screen coordinates yet), since a
+ * zero-dwell down+up is exactly the kind of input a debounce/contact-time
+ * filter on a small touch target would discard. */
+static void touch_pace(void)
+{
+    static struct timespec last;
+    static int have_last;
+    struct timespec now;
+    long elapsed_ms;
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (have_last) {
+        elapsed_ms = (now.tv_sec - last.tv_sec) * 1000L
+                   + (now.tv_nsec - last.tv_nsec) / 1000000L;
+        if (elapsed_ms < TOUCH_MIN_INTERVAL_MS) {
+            usleep((useconds_t)(TOUCH_MIN_INTERVAL_MS - elapsed_ms) * 1000);
+            clock_gettime(CLOCK_MONOTONIC, &now);
+        }
+    }
+    last = now;
+    have_last = 1;
+}
+
+/* Touch-Y -> velocity, calibrated 2026-07-14 against real hardware: 10
+ * paired (touch_y, resulting MIDI velocity) samples, gathered by clicking
+ * through a client and physically touching the same on-screen spot within
+ * ~1s (client-only clicks don't produce MIDI - that's the whole reason this
+ * bridge exists), captured live via pad_calibration_monitor.py. Includes
+ * both a 7-pad diagonal sweep AND 4 repeated taps on one single pad at
+ * different heights (same X) to isolate the effect - both datasets agree:
+ * velocity is a GLOBAL linear function of absolute screen Y, independent of
+ * which pad or its own box bounds (NOT relative to each pad's own y0/y1 as
+ * originally guessed). Linear regression over all 10 points: R^2=0.99. */
+#define PAD_VEL_SLOPE     -0.35148
+#define PAD_VEL_INTERCEPT  163.771
+
+static int velocity_for_touch_y(int y)
+{
+    double v = PAD_VEL_SLOPE * (double)y + PAD_VEL_INTERCEPT;
+    return clampi((int)(v + (v >= 0.0 ? 0.5 : -0.5)), 1, 127);
+}
+
+/* pad_index/vel out params only valid (and only written) when this returns 1. */
+static int pad_hit_test(int x, int y, int *pad_index, int *vel)
+{
+    int i;
+    for (i = 0; i < NUM_PAD_REGIONS; i++) {
+        struct pad_region *r = &g_pad_regions[i];
+        if (x >= r->x0 && x <= r->x1 && y >= r->y0 && y <= r->y1) {
+            /* Fixed Velocity mode (toggle-gated, see fixed_velocity_on()):
+             * confirmed 2026-07-14 by physically tapping the real Kronos
+             * with Fixed Velocity on - the hardware fires every chord at
+             * 127 regardless of tap force/position, ignoring the Y-based
+             * curve entirely. */
+            *vel = fixed_velocity_on() ? 127 : velocity_for_touch_y(y);
+            *pad_index = i;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void send_padchord(int pad, int vel)
+{
+    pad = clampi(pad, 0, 7);
+    vel = clampi(vel, 0, 127);
+    nks4_write("PADCHORD %d %d %d %d\n", pad, vel, 1, 1);
+}
+
 static void inject_touch(int type, int x, int y)
 {
     x = clampi(x, 0, (int)fb_w - 1);
     y = clampi(y, 0, (int)fb_h - 1);
+    g_last_touch_x = x;
+    g_last_touch_y = y;
+    g_last_touch_type = type;
+    if (g_padmap_enabled) {
+        if (type == 1) {                       /* pen-down */
+            int pad, vel;
+            /* Gated on on_pads_page() (framebuffer pixel fingerprint) plus
+             * the Enable Pad Play / Chord Assign toggle indicators (also
+             * framebuffer-sampled, calibrated 2026-07-14) - NOT
+             * pad_play_active() (the sInstance[0x104] flag), which was
+             * live-tested and disproved as a page/mode signal: it read 0
+             * while a physical tap was actively producing sound. Still
+             * reported via PADMAP_STATE for reference only. Fixed Velocity
+             * is read but not yet acted on - see docs/api.md's known gap.
+             * Each condition recorded separately (not short-circuited) so
+             * PADMAP_STATE can show exactly which one blocked a given tap. */
+            g_last_gate_pads_page    = on_pads_page();
+            g_last_gate_pad_play     = enable_pad_play_on();
+            g_last_gate_chord_assign = chord_assign_on();
+            g_last_gate_hit = (g_last_gate_pads_page && g_last_gate_pad_play &&
+                                !g_last_gate_chord_assign)
+                              ? pad_hit_test(x, y, &pad, &vel) : 0;
+            if (g_last_gate_hit) {
+                g_active_pad = pad;
+                send_padchord(pad, vel);
+                clock_gettime(CLOCK_MONOTONIC, &g_chord_down_time);
+            }
+        } else if (type == 2 && g_active_pad != -1) {   /* pen-up */
+            /* Enforce a minimum hold before releasing - live-tested
+             * 2026-07-14: a real client's near-instantaneous tap (pen-down
+             * immediately followed by pen-up, as sent by TOUCH's own
+             * single-shot down+up pair) reached inject_touch() and passed
+             * every gate condition (confirmed via PADMAP_STATE) yet
+             * produced no MIDI at all, while our own manually-paced test
+             * (200ms between down and up) worked correctly - RT_chord_
+             * trigger's Note-On apparently needs more processing time than
+             * a zero-delay down+up pair gives it before the Note-Off
+             * cancels it. This blocks the daemon's main loop briefly
+             * (same accepted pattern as touch_pace()'s TOUCH_MIN_INTERVAL_MS
+             * sleep below) - acceptable for a rare, user-initiated tap. */
+            struct timespec now;
+            long held_ms;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            held_ms = (now.tv_sec - g_chord_down_time.tv_sec) * 1000L
+                    + (now.tv_nsec - g_chord_down_time.tv_nsec) / 1000000L;
+            if (held_ms < PADCHORD_MIN_HOLD_MS)
+                usleep((useconds_t)(PADCHORD_MIN_HOLD_MS - held_ms) * 1000);
+            send_padchord(g_active_pad, 0);
+            g_active_pad = -1;
+        }
+    }
     int x_range = g_touch_x_range;
     int y_range = g_touch_y_range;
     int cx = x + g_touch_x_offset;
@@ -1029,6 +1307,7 @@ static void inject_touch(int type, int x, int y)
                    : (uint32_t)(cx * 255 + x_range / 2) / (uint32_t)x_range);
     uint32_t v_adc = cy <= 0 ? 0u : (cy >= y_range ? 255u
                    : (uint32_t)(cy * 255 + y_range / 2) / (uint32_t)y_range);
+    touch_pace();
     nks4_write("TOUCH %d %u\n", type, v_adc | (h_adc << 8u));
 }
 
@@ -1323,13 +1602,30 @@ static void resolve_kallsyms(unsigned long *recv_fn,    unsigned long *reg_fn,
  * the operator (this daemon) resolves them from /proc/kallsyms and passes the
  * live addresses in as insmod params, rather than the module trying
  * kallsyms_lookup_name() itself (not confirmed exported on this kernel). */
+/* RT_chord_trigger(uchar,uchar,uchar,uchar) is NOT kallsyms-visible (no
+ * standalone symbol - it's a plain, non-exported function with internal
+ * linkage), unlike the class methods above. It's the real per-pad "Pads
+ * (touch to play)" trigger: reads KARMA's own chord-memory tables and calls
+ * Do_KM_note_out_chord_trig() per voice - confirmed hardware-verified,
+ * matching the on-screen NOTE/VEL grid exactly for all 8 pads (0-indexed:
+ * pad_index N = on-screen "Pad N+1"). Do_KM_note_out_chord_trig() itself
+ * IS kallsyms-visible, so we resolve RT_chord_trigger's live address via the
+ * fixed file-offset delta between the two in the reference binary (same
+ * technique already established in this project for other unexported
+ * symbols) - both live in the same .ko, so the delta survives relocation.
+ * Ground-truthed against OA_real.ko: RT_chord_trigger=0x00512842,
+ * Do_KM_note_out_chord_trig=0x0055e3fa -> delta=0x4bbb8. Re-derive both
+ * addresses with `nm` against the current OA.ko if this OS build changes. */
+#define RT_CHORD_TRIGGER_DELTA  0x4bbb8UL
+
 static void resolve_nks4_kallsyms(unsigned long *fn_switch, unsigned long *fn_touch,
                                    unsigned long *fn_rotary, unsigned long *fn_analog,
-                                   unsigned long *fn_invert)
+                                   unsigned long *fn_invert, unsigned long *fn_chord)
 {
     FILE *f = fopen("/proc/kallsyms", "r");
+    unsigned long km_note_out = 0;
     char line[256];
-    *fn_switch = *fn_touch = *fn_rotary = *fn_analog = *fn_invert = 0;
+    *fn_switch = *fn_touch = *fn_rotary = *fn_analog = *fn_invert = *fn_chord = 0;
     if (!f) return;
     while (fgets(line, sizeof(line), f)) {
         unsigned long addr; char type, name[256];
@@ -1347,9 +1643,14 @@ static void resolve_nks4_kallsyms(unsigned long *fn_switch, unsigned long *fn_to
          * strstr is already safe here without an extra length/suffix check. */
         else if (!*fn_invert && strstr(name, "ShortInvertNkS4AnalogValue"))
             *fn_invert = addr;
-        if (*fn_switch && *fn_touch && *fn_rotary && *fn_analog && *fn_invert) break;
+        else if (!km_note_out && strstr(name, "Do_KM_note_out_chord_trig"))
+            km_note_out = addr;
+        if (*fn_switch && *fn_touch && *fn_rotary && *fn_analog && *fn_invert && km_note_out)
+            break;
     }
     fclose(f);
+    if (km_note_out > RT_CHORD_TRIGGER_DELTA)
+        *fn_chord = km_note_out - RT_CHORD_TRIGGER_DELTA;
 }
 
 
@@ -1777,6 +2078,152 @@ static void process_ctrl_cmd(const char *line, int fd)
             REPLY("ERR\n", 4);
         }
 
+    } else if (strncmp(line, "PADCHORD ", 9) == 0) {
+        /* Triggers the real per-pad KARMA chord (RT_chord_trigger), the
+         * confirmed hardware-verified mechanism behind "Pads (touch to
+         * play)" - pad_index 0-7 is 0-indexed, matching on-screen "Pad N+1".
+         * velocity 0 releases the chord (Note-Off for every voice);
+         * velocity 1-127 plays it. param3=1 enables ScaleByte() proportional
+         * velocity rescaling (the incoming velocity becomes the chord's new
+         * "max" reference note, with the other voices' velocities scaled to
+         * preserve their relative balance) - confirmed correct on hardware;
+         * param4 is fixed at 1, not yet shown to need to vary. */
+        int pad = 0, vel = 0;
+        if (!g_nks4_loaded) { REPLY("ERR NKS4_NOT_LOADED\n", 21); return; }
+        if (sscanf(line + 9, "%d %d", &pad, &vel) == 2) {
+            send_padchord(pad, vel);
+            REPLY("OK\n", 3);
+        } else {
+            REPLY("ERR\n", 4);
+        }
+
+    } else if (strncmp(line, "PADMAP ", 7) == 0) {
+        /* Live-set one pad's rectangular hit region in framebuffer pixel
+         * space, for calibrating against the real on-screen "Pads (touch to
+         * play)" layout without rebuilding/redeploying the daemon - tap
+         * around with any client, read back raw coordinates via LASTTOUCH,
+         * and narrow each box down interactively. */
+        int pad = 0, x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+        if (sscanf(line + 7, "%d %d %d %d %d", &pad, &x0, &y0, &x1, &y1) == 5 &&
+            pad >= 0 && pad < NUM_PAD_REGIONS) {
+            g_pad_regions[pad].x0 = x0;
+            g_pad_regions[pad].y0 = y0;
+            g_pad_regions[pad].x1 = x1;
+            g_pad_regions[pad].y1 = y1;
+            REPLY("OK\n", 3);
+        } else {
+            REPLY("ERR\n", 4);
+        }
+
+    } else if (strcmp(line, "PADMAP_LIST") == 0) {
+        char resp[512];
+        int i, rlen = 0;
+        for (i = 0; i < NUM_PAD_REGIONS && rlen < (int)sizeof(resp) - 64; i++) {
+            struct pad_region *r = &g_pad_regions[i];
+            rlen += snprintf(resp + rlen, sizeof(resp) - (size_t)rlen,
+                              "%d %d %d %d %d\n", i, r->x0, r->y0, r->x1, r->y1);
+        }
+        REPLY(resp, (size_t)rlen);
+
+    } else if (strcmp(line, "PADMAP_ON") == 0) {
+        g_padmap_enabled = 1;
+        REPLY("OK\n", 3);
+
+    } else if (strcmp(line, "PADMAP_OFF") == 0) {
+        g_padmap_enabled = 0;
+        g_active_pad = -1;
+        REPLY("OK\n", 3);
+
+    } else if (strcmp(line, "LASTTOUCH") == 0) {
+        char resp[48];
+        int  rlen = snprintf(resp, sizeof(resp), "X=%d Y=%d\n", g_last_touch_x, g_last_touch_y);
+        REPLY(resp, (size_t)rlen);
+
+    } else if (strcmp(line, "PADMAP_STATE") == 0) {
+        /* Diagnostic: dumps the internal state pad_hit_test()/inject_touch()
+         * actually use, for debugging why PADMAP_ON isn't firing PADCHORD. */
+        char resp[320];
+        int  rlen = snprintf(resp, sizeof(resp),
+                              "ENABLED=%d ACTIVE_PAD=%d NKS4_LOADED=%d PAD_PLAY_ACTIVE=%d ON_PADS_PAGE=%d "
+                              "ENABLE_PAD_PLAY=%d CHORD_ASSIGN=%d FIXED_VELOCITY=%d "
+                              "LAST_TOUCH_TYPE=%d LAST_GATE_PADS_PAGE=%d LAST_GATE_PAD_PLAY=%d "
+                              "LAST_GATE_CHORD_ASSIGN=%d LAST_GATE_HIT=%d\n",
+                              g_padmap_enabled, g_active_pad, g_nks4_loaded, pad_play_active(),
+                              on_pads_page(), enable_pad_play_on(), chord_assign_on(),
+                              fixed_velocity_on(), g_last_touch_type, g_last_gate_pads_page,
+                              g_last_gate_pad_play, g_last_gate_chord_assign, g_last_gate_hit);
+        REPLY(resp, (size_t)rlen);
+
+    } else if (strcmp(line, "PALETTE") == 0) {
+        /* Diagnostic: dumps the full 256-entry RGB palette (same table sent
+         * to stream clients at handshake) so a raw fb1 index found via
+         * PIXEL/REGION can be translated to an actual color - e.g. to
+         * confirm a toggle indicator is really "red" and find its on/off
+         * palette indices without guessing. */
+        static char resp[256 * 6 + 16];
+        int i, rlen = 0;
+        for (i = 0; i < PAL_ENTRIES; i++) {
+            rlen += snprintf(resp + rlen, sizeof(resp) - (size_t)rlen, "%02x%02x%02x",
+                              (unsigned)(pal_r[i] >> 8), (unsigned)(pal_g[i] >> 8),
+                              (unsigned)(pal_b[i] >> 8));
+        }
+        rlen += snprintf(resp + rlen, sizeof(resp) - (size_t)rlen, "\n");
+        REPLY(resp, (size_t)rlen);
+
+    } else if (strncmp(line, "REGION ", 7) == 0) {
+        /* Diagnostic/calibration: hex-dump of a rectangle of raw fb1
+         * palette-index bytes in one round trip - for diffing a before/
+         * after snapshot around a UI toggle to find exactly which pixels
+         * change color, since per-pixel PIXEL queries are too slow for a
+         * wide-area scan (one round trip per pixel). Capped at 8192 pixels
+         * total to keep the response buffer bounded. */
+        int rx0 = 0, ry0 = 0, rx1 = 0, ry1 = 0;
+        if (sscanf(line + 7, "%d %d %d %d", &rx0, &ry0, &rx1, &ry1) == 4) {
+            int rw, rh, x, y;
+            rx0 = clampi(rx0, 0, (int)fb_w - 1);
+            rx1 = clampi(rx1, 0, (int)fb_w - 1);
+            ry0 = clampi(ry0, 0, (int)fb_h - 1);
+            ry1 = clampi(ry1, 0, (int)fb_h - 1);
+            if (rx1 < rx0) { int t = rx0; rx0 = rx1; rx1 = t; }
+            if (ry1 < ry0) { int t = ry0; ry0 = ry1; ry1 = t; }
+            rw = rx1 - rx0 + 1;
+            rh = ry1 - ry0 + 1;
+            if (fb1_map && (long)rw * (long)rh <= 8192) {
+                static char resp[8192 * 2 + 64];
+                int rlen = snprintf(resp, sizeof(resp), "W=%d H=%d ", rw, rh);
+                for (y = 0; y < rh; y++) {
+                    for (x = 0; x < rw; x++) {
+                        rlen += snprintf(resp + rlen, sizeof(resp) - (size_t)rlen, "%02x",
+                                          (unsigned)fb1_map[(ry0 + y) * (int)fb1_stride + (rx0 + x)]);
+                    }
+                }
+                rlen += snprintf(resp + rlen, sizeof(resp) - (size_t)rlen, "\n");
+                REPLY(resp, (size_t)rlen);
+            } else {
+                REPLY("ERR\n", 4);
+            }
+        } else {
+            REPLY("ERR\n", 4);
+        }
+
+    } else if (strncmp(line, "PIXEL ", 6) == 0) {
+        /* Diagnostic/calibration: raw palette-index byte at (x,y) in the
+         * current fb1 capture - for finding a page-identifying pixel (e.g.
+         * something unique to the Pads (touch to play) screen) the same way
+         * PADMAP's regions were calibrated, since the sInstance[0x104] flag
+         * approach was live-tested and disproved (2026-07-14) - it doesn't
+         * track page/mode the way the OnShow/OnHide call pattern suggested. */
+        int px = 0, py = 0;
+        if (sscanf(line + 6, "%d %d", &px, &py) == 2 &&
+            px >= 0 && px < (int)fb_w && py >= 0 && py < (int)fb_h && fb1_map) {
+            char resp[24];
+            int rlen = snprintf(resp, sizeof(resp), "V=%u\n",
+                                 (unsigned)fb1_map[py * (int)fb1_stride + px]);
+            REPLY(resp, (size_t)rlen);
+        } else {
+            REPLY("ERR\n", 4);
+        }
+
     } else if (strncmp(line, "BUTTON ", 7) == 0) {
         const char *bname = line + 7;
         const struct btn_def *b;
@@ -2128,7 +2575,18 @@ static void process_ctrl_cmd(const char *line, int fd)
 }
 
 /* Called when ctrl_fd (O_NONBLOCK) has data.  Reads available bytes, processes
- * complete lines.  Returns -1 if the connection closed. */
+ * complete lines.  Returns -1 if the connection closed.
+ *
+ * TOUCH_MOVE coalescing: a queued backlog of TOUCH_MOVE commands from a fast
+ * drag was delaying the release that follows it - each queued move pays
+ * touch_pace()'s blocking 30ms minimum gap before the release even gets its
+ * turn, so a 20-move backlog meant ~600ms before the note actually let go
+ * (confirmed 2026-07-14). A completed TOUCH_MOVE line is held in
+ * ctrl_pending_move instead of processed immediately; any other command
+ * (including a later TOUCH_MOVE, which simply overwrites the pending one)
+ * flushes it first. This drops stale intermediate positions during a fast
+ * drag but never reorders or delays anything else, and TOUCH_DOWN/TOUCH_UP
+ * always process immediately in full - only same-type backlog is collapsed. */
 static int handle_ctrl_persistent_data(void)
 {
     char buf[2048];
@@ -2147,8 +2605,19 @@ static int handle_ctrl_persistent_data(void)
                     ctrl_lb[ctrl_lb_n++] = c;
                 if (c == '\n') {
                     ctrl_lb[ctrl_lb_n - 1] = '\0';
-                    if (ctrl_lb_n > 1)
-                        process_ctrl_cmd(ctrl_lb, ctrl_fd);
+                    if (ctrl_lb_n > 1) {
+                        if (strncmp(ctrl_lb, "TOUCH_MOVE ", 11) == 0 &&
+                            ctrl_lb_n - 1 < (int)sizeof(ctrl_pending_move)) {
+                            memcpy(ctrl_pending_move, ctrl_lb, (size_t)ctrl_lb_n);
+                            ctrl_has_pending_move = 1;
+                        } else {
+                            if (ctrl_has_pending_move) {
+                                process_ctrl_cmd(ctrl_pending_move, -1);
+                                ctrl_has_pending_move = 0;
+                            }
+                            process_ctrl_cmd(ctrl_lb, ctrl_fd);
+                        }
+                    }
                     ctrl_lb_n = 0;
                 }
             }
@@ -2161,6 +2630,12 @@ static int handle_ctrl_persistent_data(void)
                 break;                      /* nothing left to read */
             return -1;                      /* real error */
         }
+    }
+    /* Flush a still-pending move once the socket is fully drained - it's
+     * the latest known position and there's nothing newer to supersede it. */
+    if (ctrl_has_pending_move) {
+        process_ctrl_cmd(ctrl_pending_move, ctrl_fd);
+        ctrl_has_pending_move = 0;
     }
     return 0;
 }
@@ -2377,7 +2852,8 @@ static void load_midi_bridge(void)
 static void load_nks4_inject(void)
 {
     unsigned long fn_switch = 0, fn_touch = 0, fn_rotary = 0, fn_analog = 0, fn_invert = 0;
-    char params[256];
+    unsigned long fn_chord = 0;
+    char params[320];
     long ret;
 
     if (!wait_for_oa_live(50)) {
@@ -2385,7 +2861,7 @@ static void load_nks4_inject(void)
                 "front-panel injection disabled\n");
         return;
     }
-    resolve_nks4_kallsyms(&fn_switch, &fn_touch, &fn_rotary, &fn_analog, &fn_invert);
+    resolve_nks4_kallsyms(&fn_switch, &fn_touch, &fn_rotary, &fn_analog, &fn_invert, &fn_chord);
     if (!fn_switch || !fn_touch || !fn_rotary || !fn_analog || !fn_invert) {
         fprintf(stderr, "screenremote: missing NKS4 symbols in kallsyms "
                 "(switch=%s touch=%s rotary=%s analog=%s invert=%s) - "
@@ -2395,9 +2871,17 @@ static void load_nks4_inject(void)
                 fn_invert ? "ok" : "none");
         return;
     }
+    /* fn_chord (PADCHORD/RT_chord_trigger) is best-effort: derived via a
+     * fixed-offset delta from Do_KM_note_out_chord_trig rather than a direct
+     * kallsyms symbol, so it can legitimately come back 0 if that anchor
+     * symbol is ever renamed/missing. PADCHORD just won't work in that case
+     * (inject_chord() checks fn_chord itself) - doesn't block the other 5. */
     snprintf(params, sizeof(params),
-             "fn_switch=0x%lx fn_touch=0x%lx fn_rotary=0x%lx fn_analog=0x%lx fn_invert=0x%lx",
-             fn_switch, fn_touch, fn_rotary, fn_analog, fn_invert);
+             "fn_switch=0x%lx fn_touch=0x%lx fn_rotary=0x%lx fn_analog=0x%lx fn_invert=0x%lx "
+             "fn_chord=0x%lx",
+             fn_switch, fn_touch, fn_rotary, fn_analog, fn_invert, fn_chord);
+    if (!fn_chord)
+        fprintf(stderr, "screenremote: fn_chord not resolved - PADCHORD will be unavailable\n");
     extract_ko(NKS4_INJECT_KO, nks4_inject_ko, nks4_inject_ko_len);
     ret = syscall(SYS_init_module, (void *)nks4_inject_ko,
                   (unsigned long)nks4_inject_ko_len, params);
@@ -2988,32 +3472,57 @@ int main(void)
             }
         }
 
-        /* Control command - only accept from the authenticated stream client's IP. */
+        /* Control command - normally only accepted from the authenticated stream
+         * client's IP (g_ctrl_allowed_ip is a single global "owner" slot: a new
+         * stream connection replaces the old one and reassigns it, which silently
+         * invalidates any other ctrl session - by design, so only whoever is
+         * currently watching the mirror can also control it). A short allowlist
+         * of read-only, one-shot diagnostic queries is exempted from that check
+         * (accepted from any IP, regardless of who currently owns ctrl) so a
+         * separate observer (e.g. a calibration monitor) can read live state
+         * concurrently with the owning client's own session - mutating commands
+         * (TOUCH, PADMAP, BUTTON, etc.) still require ownership as before. */
         if (ctrl_listen >= 0 && FD_ISSET(ctrl_listen, &rfds)) {
             struct sockaddr_in cpeer;
             socklen_t cplen = sizeof(cpeer);
             int cfd = accept(ctrl_listen, (struct sockaddr *)&cpeer, &cplen);
             if (cfd >= 0) {
-                if (g_ctrl_allowed_ip != 0 &&
-                    cpeer.sin_addr.s_addr == g_ctrl_allowed_ip) {
-                    /* Read the first line to decide: "CTRL_PERSIST" -> persistent
-                     * connection (replaces any previous ctrl_fd); anything else ->
-                     * one-shot command+response then close (used by QueryAsync). */
-                    char firstline[2048]; int fl = 0;
-                    struct timeval rto = {0, 200000};  /* 200 ms read timeout */
-                    setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &rto, sizeof(rto));
-                    while (fl < (int)sizeof(firstline) - 1) {
-                        char c;
-                        if (recv(cfd, &c, 1, 0) != 1) { close(cfd); cfd = -1; break; }
-                        if (c == '\n') break;
-                        firstline[fl++] = c;
-                    }
-                    if (cfd >= 0) {
-                        firstline[fl] = '\0';
-                        /* clear the receive timeout now */
-                        struct timeval zero = {0, 0};
-                        setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &zero, sizeof(zero));
+                /* Read the first line up front (needed either way: to check
+                 * against the read-only allowlist, or to decide CTRL_PERSIST
+                 * vs one-shot for an owned connection). */
+                char firstline[2048]; int fl = 0;
+                struct timeval rto = {0, 200000};  /* 200 ms read timeout */
+                setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &rto, sizeof(rto));
+                while (fl < (int)sizeof(firstline) - 1) {
+                    char c;
+                    if (recv(cfd, &c, 1, 0) != 1) { close(cfd); cfd = -1; break; }
+                    if (c == '\n') break;
+                    firstline[fl++] = c;
+                }
+                if (cfd >= 0) {
+                    firstline[fl] = '\0';
+                    struct timeval zero = {0, 0};
+                    setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &zero, sizeof(zero));
 
+                    int is_readonly = (strcmp(firstline, "LASTTOUCH") == 0 ||
+                                        strcmp(firstline, "PADMAP_LIST") == 0 ||
+                                        strcmp(firstline, "PADMAP_STATE") == 0 ||
+                                        strncmp(firstline, "PIXEL ", 6) == 0 ||
+                                        strncmp(firstline, "REGION ", 7) == 0 ||
+                                        strcmp(firstline, "PALETTE") == 0 ||
+                                        strcmp(firstline, "STATE") == 0 ||
+                                        strcmp(firstline, "VERSION") == 0 ||
+                                        strcmp(firstline, "SYSINFO") == 0);
+                    int owned = (g_ctrl_allowed_ip != 0 &&
+                                 cpeer.sin_addr.s_addr == g_ctrl_allowed_ip);
+
+                    if (is_readonly) {
+                        /* Always one-shot regardless of ownership - never
+                         * upgrades to CTRL_PERSIST, so it can't steal ctrl_fd
+                         * from the owning client. */
+                        process_ctrl_cmd(firstline, cfd);
+                        close(cfd);
+                    } else if (owned) {
                         if (strcmp(firstline, "CTRL_PERSIST") == 0) {
                             /* Persistent connection: replace any previous ctrl_fd */
                             if (ctrl_fd >= 0) close(ctrl_fd);
@@ -3032,11 +3541,11 @@ int main(void)
                             if (!(sysex_pending && sysex_resp_fd == cfd))
                                 close(cfd);
                         }
+                    } else {
+                        fprintf(stderr, "screenremote: ctrl rejected from %s\n",
+                                inet_ntoa(cpeer.sin_addr));
+                        close(cfd);
                     }
-                } else {
-                    fprintf(stderr, "screenremote: ctrl rejected from %s\n",
-                            inet_ntoa(cpeer.sin_addr));
-                    close(cfd);
                 }
             }
         }

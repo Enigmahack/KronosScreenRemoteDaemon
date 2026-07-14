@@ -197,6 +197,19 @@ module_param(fn_analog, ulong, 0444);
 static unsigned long fn_invert = 0;        /* ShortInvertNkS4AnalogValue */
 module_param(fn_invert, ulong, 0444);
 
+static unsigned long fn_chord = 0;         /* RT_chord_trigger(uchar,uchar,uchar,uchar) -
+                                             * NOT kallsyms-visible (no separate symbol),
+                                             * resolved via the fixed file-offset delta from
+                                             * Do_KM_note_out_chord_trig (which IS visible) -
+                                             * see project notes. EXPERIMENTAL: reads directly
+                                             * from KARMA's chord-memory tables and calls
+                                             * Do_KM_note_out_chord_trig() per voice - this is
+                                             * the real per-pad "Pads (touch to play)" trigger,
+                                             * confirmed via CESProgTask::GetPad1-8 calling
+                                             * ESCommonKarmaCommon_GetChordMemory with the same
+                                             * slot-index convention. */
+module_param(fn_chord, ulong, 0444);
+
 /* ------------------------------------------------------------------ */
 /*  Function pointer types - regparm(3) reproduces the confirmed ABI   */
 /*  exactly: GCC assigns the first 3 int/pointer args to EAX,EDX,ECX   */
@@ -215,6 +228,9 @@ typedef void (*handle_analog_controller_t)(void *this_, int device_code,
 typedef void (*short_invert_t)(unsigned char byte0, unsigned char byte1,
                                 unsigned short *out_hi, unsigned short *out_lo)
     __attribute__((regparm(3)));
+typedef void (*rt_chord_trigger_t)(unsigned char pad_index, unsigned char velocity,
+                                    unsigned char param3, unsigned char param4)
+    __attribute__((regparm(3)));
 
 /* ------------------------------------------------------------------ */
 /*  State                                                              */
@@ -228,6 +244,9 @@ static struct proc_dir_entry *proc_status;
 static struct work_struct     setup_work;
 
 static uint32_t cnt_btn, cnt_touch, cnt_rot, cnt_analog, cnt_gated, cnt_badcmd;
+static uint32_t cnt_chord;
+static int last_chord_pad = -1, last_chord_vel = -1, last_chord_p3 = -1, last_chord_p4 = -1;
+static int last_chord_rc = -2;   /* -2 = never called since load */
 static char last_cmd[64];
 
 /* Byte offset, from HandleSwitchEvent's own entry point, of the 4-byte
@@ -325,6 +344,24 @@ static int inject_analog(int dev, unsigned char b0, unsigned char b1)
     return 0;
 }
 
+/* EXPERIMENTAL: RT_chord_trigger is a plain (non-member) function - no "this"
+ * pointer, no frontpanel_this() gate. pad_index 0-7 selects the KARMA chord-
+ * memory slot (confirmed via CESProgTask::GetPad1-8 -> ESCommonKarmaCommon_
+ * GetChordMemory using the same 0-based slot convention). velocity!=0 plays
+ * the chord (per-voice Do_KM_note_out_chord_trig calls); velocity==0 releases
+ * it. param3/param4 mirror the real caller's own (bank-flag, this!=0) args -
+ * best-effort guess (0, 1), not yet hardware-confirmed to matter. */
+static int inject_chord(int pad_index, int velocity, int param3, int param4)
+{
+    rt_chord_trigger_t f = (rt_chord_trigger_t)fn_chord;
+
+    if (oa_dead || !fn_chord || pad_index < 0 || pad_index > 7)
+        return -1;
+    f((unsigned char)pad_index, (unsigned char)velocity,
+      (unsigned char)param3, (unsigned char)param4);
+    return 0;
+}
+
 /* ------------------------------------------------------------------ */
 /*  /proc/.nks4inject write handler                                    */
 /* ------------------------------------------------------------------ */
@@ -334,7 +371,7 @@ static int inject_write_proc(struct file *file, const char __user *buf,
 {
     char kbuf[64];
     size_t n = count < sizeof(kbuf) - 1 ? count : sizeof(kbuf) - 1;
-    int a = 0, b = 0, c = 0;
+    int a = 0, b = 0, c = 0, d = 0;
     unsigned long flags;
     int rc = -EINVAL;
 
@@ -364,6 +401,26 @@ static int inject_write_proc(struct file *file, const char __user *buf,
         rc = inject_rotary(a); cnt_rot++;
     } else if (sscanf(kbuf, "ANALOG %d %d %d", &a, &b, &c) == 3) {
         rc = inject_analog(a, (unsigned char)b, (unsigned char)c); cnt_analog++;
+    } else if (sscanf(kbuf, "PADMODE %d", &a) == 1) {
+        /* Diagnostic/experimental: directly force CSTGFrontPanel::sInstance[0x104],
+         * the same flag CSTGControlMsgHandler::EnableOnScreenTouchPads() sets from
+         * Eva's side (CFormOmnimodePads::OnShow(), confirmed via Eva decompilation)
+         * and the same flag HandleTouchPanel's own disassembly branches on. Not a
+         * substitute for the real Eva-driven arm sequence long-term (see project
+         * notes) - this exists purely to test whether forcing the flag alone,
+         * independent of Eva, is sufficient for TOUCH to reach the KARMA CC path. */
+        void *this_ = frontpanel_this();
+        if (this_) {
+            *(unsigned char *)((char *)this_ + 0x104) = (a != 0);
+            rc = 0;
+        } else {
+            rc = -1;
+        }
+    } else if (sscanf(kbuf, "PADCHORD %d %d %d %d", &a, &b, &c, &d) == 4) {
+        rc = inject_chord(a, b, c, d);
+        cnt_chord++;
+        last_chord_pad = a; last_chord_vel = b; last_chord_p3 = c; last_chord_p4 = d;
+        last_chord_rc = rc;
     } else {
         cnt_badcmd++;
     }
@@ -372,18 +429,48 @@ static int inject_write_proc(struct file *file, const char __user *buf,
     return rc == 0 ? (int)count : -EINVAL;
 }
 
+/* Diagnostic-only: CSTGFrontPanel's onscreen-touch-pad-mode fields, ground-
+ * truthed against HandleTouchPanel's own disassembly (offsets 0x104/0x105/
+ * 0x106 read/written right there) and CSTGControlMsgHandler::
+ * EnableOnScreenTouchPads(), which does nothing but
+ * `sInstance[0x104] = (param2 != 0)`. When this byte is 0, HandleTouchPanel
+ * takes its default branch (PushUnsolicitedMessage -> forwarded to Eva as a
+ * generic UI touch - this is the path every BUTTON/knob/slider/tab test in
+ * this project has exercised). When nonzero, it takes a completely different
+ * branch that never reaches Eva at all - it locally computes a value from
+ * the touch position and calls CSTGControllerRTData::SendKarmaCCToKGE()
+ * directly. Reading this byte tells us, without guessing, which branch a
+ * given injected TOUCH would actually take. */
+static int touch_pad_mode_read(unsigned char *flag_out, unsigned char *latch_out,
+                                unsigned char *stored_out)
+{
+    void *this_ = frontpanel_this();
+    if (!this_)
+        return -1;
+    *flag_out   = *(unsigned char *)((char *)this_ + 0x104);
+    *latch_out  = *(unsigned char *)((char *)this_ + 0x105);
+    *stored_out = *(unsigned char *)((char *)this_ + 0x106);
+    return 0;
+}
+
 static int status_read_proc(char *page, char **start, off_t off,
                              int count, int *eof, void *data)
 {
+    unsigned char pad_flag = 0xff, pad_latch = 0xff, pad_stored = 0xff;
+    int pad_rc = touch_pad_mode_read(&pad_flag, &pad_latch, &pad_stored);
     int len = snprintf(page, count,
         "sinstance=0x%lx fn_switch=0x%lx fn_touch=0x%lx fn_rotary=0x%lx "
-        "fn_analog=0x%lx fn_invert=0x%lx\n"
+        "fn_analog=0x%lx fn_invert=0x%lx fn_chord=0x%lx\n"
         "oa_dead=%d this_resolved=%d\n"
-        "counters: btn=%u touch=%u rot=%u analog=%u gated=%u badcmd=%u\n"
+        "onscreen_touch_pad_mode=%d latch=0x%02x stored=0x%02x (rc=%d)\n"
+        "counters: btn=%u touch=%u rot=%u analog=%u gated=%u badcmd=%u chord=%u\n"
+        "last_chord: pad=%d vel=%d p3=%d p4=%d rc=%d\n"
         "last_cmd=%s\n",
-        sinstance_addr, fn_switch, fn_touch, fn_rotary, fn_analog, fn_invert,
+        sinstance_addr, fn_switch, fn_touch, fn_rotary, fn_analog, fn_invert, fn_chord,
         oa_dead, frontpanel_this() != NULL,
-        cnt_btn, cnt_touch, cnt_rot, cnt_analog, cnt_gated, cnt_badcmd,
+        (int)pad_flag, pad_latch, pad_stored, pad_rc,
+        cnt_btn, cnt_touch, cnt_rot, cnt_analog, cnt_gated, cnt_badcmd, cnt_chord,
+        last_chord_pad, last_chord_vel, last_chord_p3, last_chord_p4, last_chord_rc,
         last_cmd);
     *eof = 1;
     return len;

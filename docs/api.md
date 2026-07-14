@@ -240,6 +240,8 @@ Send `CTRL_PERSIST\n` as the very first line after connecting. The server keeps 
 
 In persistent mode the server reads commands with `O_NONBLOCK` and never blocks on the control socket, so slow or stalled clients do not affect stream delivery.
 
+**TOUCH_MOVE coalescing.** Each touch injection is paced ~30ms apart (see `TOUCH`'s section below), so a fast drag gesture can enqueue `TOUCH_MOVE` commands faster than the daemon can pace them through `/proc/.nks4inject`. Processing every buffered move sequentially would delay the trailing `TOUCH_UP` (release) by the full backlog, producing a perceptible lag letting go of a note - live-confirmed 2026-07-14. To keep releases responsive, the persistent-mode reader coalesces `TOUCH_MOVE` into a single pending slot: consecutive `TOUCH_MOVE` lines overwrite the same slot instead of queuing, and the slot flushes (actually injects) as soon as a different command type arrives or the socket's read buffer is fully drained. Only `TOUCH_MOVE` is coalesced this way - every other command (including `TOUCH_UP`) is still processed in full, in order, one per line. A `TOUCH_MOVE` that gets overwritten before it flushes never gets its own `OK\n` reply (the flush that supersedes it runs with no reply socket); the move that does flush - whether because a later command interrupted it or because the buffer drained - gets a normal reply.
+
 ---
 
 ## 7. Control port - command reference
@@ -313,6 +315,8 @@ Response: OK\n
 
 Coordinates outside the framebuffer are **snapped** to the nearest edge, not rejected. The resulting ADC-space event is delivered via `/proc/.nks4inject` straight into `CSTGFrontPanel::HandleTouchPanel` (see TOUCH_DOWN/TOUCH_UP for the ADC encoding) - the same function a physical finger dispatches through, so any conditional side effect a real touch has (including ones that trigger MIDI output) fires the same way here.
 
+**Why every touch injection is paced ~30ms apart.** A zero-delay pen-down immediately followed by pen-up (or a burst of TOUCH_MOVE steps with no gap) reaches `HandleTouchPanel` only microseconds apart - two back-to-back `write()`s to `/proc/.nks4inject` - versus the tens of milliseconds a real finger's contact/scan naturally spans. Confirmed on hardware: a zero-delay drag across an on-screen knob collapsed into a single tap (the field got selected, but the value never changed) instead of scrubbing the value; the identical sequence paced ~30ms apart worked correctly end to end. This is the same behaviour class as `DAMPER`/`TEMPO` needing a real-time ramp instead of an instant jump (Section 7) - the touch/gesture state machine on the other end needs real elapsed time between samples, not just correct coordinates. The daemon now enforces a minimum ~30ms gap between every touch injection (`TOUCH`'s internal down+up pair, and each `TOUCH_DOWN`/`TOUCH_MOVE`/`TOUCH_UP` a client sends) regardless of how fast the client requests them, so `TOUCH` and multi-step drags both take slightly longer than before but land correctly. This pacing is also the suspected fix for touch-driven "Pads" chord widgets not triggering from injected taps - not yet hardware-confirmed for that specific case.
+
 ---
 
 ### TOUCH_DOWN
@@ -378,6 +382,101 @@ v_adc = clamp(round(cy * 255 / touch_y_range), 0, 255)
 With defaults (`touch_x_offset=10`, `touch_x_range=813`, `touch_y_offset=20`, `touch_y_range=638`), pixel (0,0) maps to approximately ADC (3,8) and pixel (799,599) maps to approximately ADC (254,247). The calibration parameters can be adjusted in `screenremote.cfg` if the touch response is misaligned on a particular unit.
 
 `nks4_inject.ko` calls `CSTGFrontPanel::HandleTouchPanel(this, event_type, coord)` with these exact values - `this` resolved from OA's own `CSTGFrontPanel::sInstance`, `event_type`/`coord` passed through unmodified from the values above.
+
+---
+
+### PADCHORD
+
+Play or release one of the 8 "Pads (touch to play)" chords, by pad index rather than by simulating a touch.
+
+```
+Request:  PADCHORD <pad_index> <velocity>\n
+Response: OK\n
+          ERR\n                 (line does not parse as two integers)
+          ERR NKS4_NOT_LOADED\n (nks4_inject.ko not loaded)
+```
+
+| Argument | Type | Range | Description |
+|----------|------|-------|-------------|
+| pad_index | integer | 0-7 | 0-indexed; pad_index 0 is on-screen "Pad 1", pad_index 7 is "Pad 8" |
+| velocity | integer | 0-127 | 0 releases the chord (Note-Off for every voice); 1-127 plays it at that velocity |
+
+Out-of-range values are **clamped**, not rejected, matching this API's usual convention.
+
+**Why this exists instead of just simulating a touch.** Tapping the on-screen Pads grid does *not* go through `CSTGFrontPanel::HandleTouchPanel` the way every other touch-driven widget does - Eva's `CFormOmnimodePads::OnShow()` only arms `CSTGFrontPanel::sInstance`'s on-screen-touch-pad flag when the page is shown with "Enable Pad Play" on, and even then the touch-coordinate math in `HandleTouchPanel` turns out to feed a *different*, single shared KARMA CC trigger - not the per-pad chord table shown on screen. The real per-pad mechanism is `RT_chord_trigger(pad_index, velocity, param3, param4)`, a plain OA.ko function that reads directly from KARMA's own chord-memory tables and calls `Do_KM_note_out_chord_trig()` once per chord voice - confirmed hardware-verified against the on-screen NOTE/VEL grid for all 8 pads. `PADCHORD` calls it directly, bypassing touch/Eva entirely. `param3` is fixed at `1`, which enables `ScaleByte()` proportional velocity rescaling (the incoming velocity becomes the chord's new "max" reference note, with the other voices scaled to preserve their relative balance) - confirmed correct on hardware. `param4` is fixed at `1` - not yet shown to need to vary.
+
+**Address resolution.** `RT_chord_trigger` has no standalone `/proc/kallsyms` entry (internal linkage, unlike the four `CSTGFrontPanel::Handle*` methods above). Its live address is derived from a fixed file-offset delta against `Do_KM_note_out_chord_trig`, which *is* kallsyms-visible - both live in the same `OA.ko`, so the delta survives relocation. If `Do_KM_note_out_chord_trig` is ever renamed or the delta goes stale (OS update changing `OA.ko`'s layout), `PADCHORD` fails gracefully with `ERR NKS4_NOT_LOADED`-style unavailability (screenremote logs `fn_chord not resolved` at startup) while every other command keeps working - re-derive both addresses with `nm` against the current `OA.ko` if that happens (see `resolve_nks4_kallsyms()`'s own comment in `screenremote.c`).
+
+---
+
+### PADMAP / PADMAP_LIST / PADMAP_ON / PADMAP_OFF / LASTTOUCH
+
+Bridges real taps on the on-screen "Pads (touch to play)" grid straight to `PADCHORD`, so a client doesn't need to know about `PADCHORD` at all - tapping the grid through any existing touch client (`TOUCH`, `TOUCH_DOWN`/`TOUCH_UP`) just plays the right chord. Detection stays off by default (`PADMAP_OFF`) even though the regions below are calibrated - flip `PADMAP_ON` once ready.
+
+**Region calibration (2026-07-14).** All 8 pads sit in a single row spanning the full width of the screen, calibrated from 32 real corner taps (4 per pad, captured live via `LASTTOUCH` through `tools/pad_calibration_monitor.py`) then quantized to uniform 94x335 boxes by linear regression on the pad centers (raw click widths varied 88-97px purely from click imprecision - centers fit a clean line, ~99.8px spacing, ~6px gaps):
+
+| pad_index | x0 | y0 | x1 | y1 |
+|---|---|---|---|---|
+| 0 | 3 | 144 | 96 | 478 |
+| 1 | 103 | 144 | 196 | 478 |
+| 2 | 203 | 144 | 296 | 478 |
+| 3 | 303 | 144 | 396 | 478 |
+| 4 | 402 | 144 | 495 | 478 |
+| 5 | 502 | 144 | 595 | 478 |
+| 6 | 602 | 144 | 695 | 478 |
+| 7 | 702 | 144 | 795 | 478 |
+
+```
+Request:  PADMAP <pad_index> <x0> <y0> <x1> <y1>\n
+Response: OK\n
+          ERR\n   (line doesn't parse as 5 integers, or pad_index out of 0-7)
+```
+Live-sets `pad_index`'s rectangular hit box (inclusive, framebuffer pixel space) in memory - no daemon restart needed.
+
+```
+Request:  PADMAP_LIST\n
+Response: <idx> <x0> <y0> <x1> <y1>\n   (one line per pad, 8 lines)
+```
+
+```
+Request:  PADMAP_ON\n / PADMAP_OFF\n
+Response: OK\n
+```
+Toggles auto-detection. `PADMAP_OFF` also releases whatever pad is currently held (if any).
+
+```
+Request:  LASTTOUCH\n
+Response: X=<x> Y=<y>\n
+```
+Returns the most recent touch's raw framebuffer pixel coordinates (updated by every `TOUCH`/`TOUCH_DOWN`/`TOUCH_MOVE`/`TOUCH_UP`, regardless of `PADMAP_ON`/`OFF`) - the calibration primitive: tap a real on-screen pad through any client, then read back where that tap actually landed to narrow down its true box with `PADMAP`.
+
+**How detection works.** On pen-down (`TOUCH`'s implicit down, or `TOUCH_DOWN`), if `PADMAP_ON`, `(x, y)` falls inside a configured pad's box, AND `pad_play_active()` is true (see below), that pad's index is remembered and `PADCHORD <pad> <velocity>` fires immediately. On the matching pen-up, `PADCHORD <pad> 0` releases it unconditionally (not re-gated - if a chord was started, it always gets cleanly released even if the page/mode changed mid-hold). The underlying `TOUCH` event is still forwarded to Eva as normal either way - this is additive, not a replacement, since Eva's own touch handling is otherwise unaffected by any of this.
+
+**Page/mode gating.** The Pads page has real modal state that changes what a tap even means: "Enable Pad Play" must be on for taps to produce sound at all, and while "Chord Assign" is active a tap instead *assigns* whatever chord is currently held on the keybed to that pad rather than playing it - firing `PADCHORD` in either wrong state would be surprising or actively disruptive.
+
+The first approach tried - reading `onscreen_touch_pad_mode` from `/proc/.nks4inject_status` (`CSTGFrontPanel::sInstance[0x104]`, already exposed by `nks4_inject.c`) - looked promising statically (`CFormOmnimodePads::OnHide()` unconditionally clears it on navigating away, `OnShow()` only sets it with Enable Pad Play on) but was **live-tested and disproved** (2026-07-14): the flag read 0 while a physical tap was actively producing sound. It most likely gates the separate, already-confirmed-unrelated single-shared-KARMA-CC touch path (see `PADCHORD`'s "why this exists" note above), not per-pad triggering or page state. `pad_play_active()` and `PADMAP_STATE`'s `PAD_PLAY_ACTIVE` field still exist for reference but do **not** gate firing.
+
+What actually gates firing now is `on_pads_page()`, a **framebuffer pixel fingerprint**: a point 5px inset from each of the 8 pad boxes' top-left corners (`fb1_map`, a direct `mmap()` onto the hardware framebuffer, so always live with zero staleness) all read the same uniform pad-box-background palette value (`219`) while confirmed on the Pads page, and none of the 8 read that value on a different tab (live-tested, mostly `15` with a couple outliers) - requiring all 8 to match is a strong discriminator, since another page coincidentally matching all 8 specific coordinates is very unlikely. `PADMAP_STATE`'s `ON_PADS_PAGE` field reports this live.
+
+**Enable Pad Play / Chord Assign / Fixed Velocity - calibrated (2026-07-14).** All three have a dedicated on-screen LED-style toggle indicator: a small red dot, bright red (palette index ~50, R≈246) when ON, dark/muted red (index ~59-61, R≈105-129) when OFF - found by capturing a `REGION` snapshot before and after the user toggled each one live and diffing to find exactly which pixels changed (the click coordinate itself is offset from the actual indicator - `PIXEL` sampling at the click point alone showed no change). `toggle_is_on(x, y)` checks the palette's R channel against a threshold (200) rather than requiring an exact index match, for tolerance to minor rendering variance. Calibrated pixel coordinates, remarkably evenly spaced (340px apart, likely one shared widget template repeated along the row):
+
+| Toggle | Pixel (x, y) |
+|---|---|
+| Chord Assign | (59, 102) |
+| Enable Pad Play | (399, 103) |
+| Fixed Velocity | (739, 102) |
+
+`PADCHORD` now only fires when `on_pads_page() && enable_pad_play_on() && !chord_assign_on()`. `PADMAP_STATE` reports all three (`ENABLE_PAD_PLAY`, `CHORD_ASSIGN`, `FIXED_VELOCITY`).
+
+**Fixed Velocity - resolved (2026-07-14).** Confirmed by physically tapping the real Kronos with Fixed Velocity on: the hardware fires every chord at velocity 127 regardless of tap force or position, ignoring the Y-based curve entirely - not a separately-configured number as originally assumed. `pad_hit_test()` now sends 127 whenever `fixed_velocity_on()` is true, bypassing `velocity_for_touch_y()` for that tap.
+
+**Fragility note.** All of this (pad regions, page fingerprint, toggle indicators) is calibrated against exact pixel coordinates and colors on the current Kronos OS version's rendering of this page. A Korg firmware update that changes this page's layout, colors, or widget positions would silently break some or all of it - there's no way to detect that from here short of noticing PADCHORD stops firing (or fires on the wrong page/pad). Re-run the same before/after `REGION`-diff calibration process if that ever happens.
+
+**Minimum hold duration.** A near-instantaneous tap (pen-down immediately followed by pen-up - e.g. `TOUCH`'s own single-shot down+up pair with no delay) passed every gate condition (confirmed via `PADMAP_STATE`'s `LAST_GATE_*` fields) yet produced no MIDI at all, live-tested 2026-07-14, while a manually-paced test (200ms between down and up) worked correctly - `RT_chord_trigger`'s Note-On apparently needs more processing time than a zero-delay down+up pair gives it before the Note-Off cancels it. `inject_touch()`'s pen-up handler now enforces `PADCHORD_MIN_HOLD_MS` (80ms) between trigger and release, blocking the daemon's main loop briefly if needed (same accepted pattern as `touch_pace()`'s existing `TOUCH_MIN_INTERVAL_MS` sleep) - acceptable for a rare, user-initiated tap.
+
+**Debugging a tap that doesn't fire.** `PADMAP_STATE`'s `LAST_TOUCH_TYPE` (1=down, 2=up, 3=move) and `LAST_GATE_*` fields (`PADS_PAGE`, `PAD_PLAY`, `CHORD_ASSIGN`, `HIT`) record the most recent pen-down's gate evaluation, each condition captured separately rather than short-circuited - read it right after a failed tap to see exactly which condition blocked it (or confirm they all passed, pointing at a downstream/timing issue instead).
+
+**Velocity curve - calibrated against real hardware (2026-07-14).** `velocity = clamp(round(-0.35148 * touch_y + 163.771), 1, 127)` - a **global** linear function of absolute framebuffer Y, independent of which pad or that pad's own box bounds (not relative to each pad's own top/bottom as an earlier version guessed). Derived from 10 paired (touch_y, resulting MIDI velocity) samples captured live with `tools/pad_calibration_monitor.py`: a 7-pad diagonal sweep plus 4 repeated taps on one single pad at different heights (same X, to isolate Y from pad identity) - both datasets agree, R²=0.99. Method: click through a client *and* physically touch the same on-screen spot within ~1s (client-only clicks don't produce MIDI - confirming that gap is exactly why this bridge exists), and watch `LASTTOUCH` alongside the live MIDI-out feed. Pad hit-box boundaries (the `PADMAP` X/Y ranges themselves) are still uncalibrated placeholders - the diagonal sweep hints pads are ordered left-to-right by X (spanning most/all of the screen height each), but a horizontal sweep at fixed Y is needed to pin down real X boundaries.
 
 ---
 
