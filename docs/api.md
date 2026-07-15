@@ -450,6 +450,91 @@ Response: X=<x> Y=<y>\n
 ```
 Returns the most recent touch's raw framebuffer pixel coordinates (updated by every `TOUCH`/`TOUCH_DOWN`/`TOUCH_MOVE`/`TOUCH_UP`, regardless of `PADMAP_ON`/`OFF`) - the calibration primitive: tap a real on-screen pad through any client, then read back where that tap actually landed to narrow down its true box with `PADMAP`.
 
+---
+
+### PADMAP_STATE
+
+Diagnostic dump of the internal state `pad_hit_test()`/`inject_touch()` actually use, for debugging why `PADMAP_ON` isn't firing `PADCHORD`. See "How detection works" and "Debugging a tap that doesn't fire" below for how to read the fields.
+
+```
+Request:  PADMAP_STATE\n
+Response: ENABLED=<0|1> ACTIVE_PAD=<n> NKS4_LOADED=<0|1> PAD_PLAY_ACTIVE=<0|1> ON_PADS_PAGE=<0|1>
+          ENABLE_PAD_PLAY=<0|1> CHORD_ASSIGN=<0|1> FIXED_VELOCITY=<0|1>
+          LAST_TOUCH_TYPE=<0-3> LAST_GATE_PADS_PAGE=<0|1> LAST_GATE_PAD_PLAY=<0|1>
+          LAST_GATE_CHORD_ASSIGN=<0|1> LAST_GATE_HIT=<0|1>\n
+```
+
+| Field | Description |
+|-------|-------------|
+| `ENABLED` | Current `PADMAP_ON`/`PADMAP_OFF` state |
+| `ACTIVE_PAD` | Index of the pad currently held via detected-tap bridging, or -1 if none |
+| `NKS4_LOADED` | 1 if `nks4_inject.ko` loaded successfully |
+| `PAD_PLAY_ACTIVE` | `pad_play_active()` - retained for reference; does **not** gate firing (see prose above) |
+| `ON_PADS_PAGE` | Live result of the `on_pads_page()` framebuffer pixel fingerprint |
+| `ENABLE_PAD_PLAY` | Live state of the "Enable Pad Play" on-screen toggle |
+| `CHORD_ASSIGN` | Live state of the "Chord Assign" on-screen toggle |
+| `FIXED_VELOCITY` | Live state of the "Fixed Velocity" on-screen toggle |
+| `LAST_TOUCH_TYPE` | Most recent touch event type: 1=down, 2=up, 3=move |
+| `LAST_GATE_PADS_PAGE` | `on_pads_page()` result at the most recent pen-down gate evaluation |
+| `LAST_GATE_PAD_PLAY` | `enable_pad_play_on()` result at the most recent pen-down gate evaluation |
+| `LAST_GATE_CHORD_ASSIGN` | `chord_assign_on()` result at the most recent pen-down gate evaluation |
+| `LAST_GATE_HIT` | Whether `(x, y)` fell inside a configured pad box at the most recent pen-down |
+
+Each `LAST_GATE_*` field is captured independently rather than short-circuited, so a failed tap can be diagnosed by seeing exactly which condition blocked it.
+
+---
+
+### PALETTE
+
+Dump the full 256-entry RGB palette (the same table sent to stream clients at handshake) as a single hex string - a calibration aid for translating a raw `fb1` palette index (from `PIXEL`/`REGION`) into an actual color, e.g. to confirm a toggle indicator is really "red" and find its on/off palette indices.
+
+```
+Request:  PALETTE\n
+Response: <768 hex chars>\n   (256 entries x 3 bytes RGB, no separators)
+```
+
+Byte `3*i`..`3*i+2` of the decoded response is the `(R, G, B)` triple for palette index `i` - the same layout and values as the 768-byte palette block in the stream handshake (Section 3.3).
+
+---
+
+### REGION
+
+Hex-dump a rectangle of raw `fb1` palette-index bytes in one round trip - for diffing a before/after snapshot around a UI change (e.g. a toggle) to find exactly which pixels changed, since per-pixel `PIXEL` queries are too slow for a wide-area scan.
+
+```
+Request:  REGION <x0> <y0> <x1> <y1>\n
+Response: W=<w> H=<h> <hex bytes>\n
+          ERR\n   (line doesn't parse as 4 integers, or the rectangle exceeds 8192 pixels)
+```
+
+| Argument | Type | Description |
+|----------|------|-------------|
+| x0, y0 | integer | One corner of the rectangle, **clamped** into the framebuffer bounds |
+| x1, y1 | integer | The opposite corner, **clamped** into the framebuffer bounds; corners are normalised (swapped if given in the wrong order) |
+
+`w = x1 - x0 + 1`, `h = y1 - y0 + 1` after clamping/normalising. The response body is `w * h` hex-encoded bytes (2 hex chars per pixel), row-major starting at `(x0, y0)`, each byte a raw palette index into the table returned by `PALETTE`. Capped at 8192 pixels total (see [Section 14](#14-implementation-limits)) to keep the response buffer bounded; a request exceeding that returns `ERR\n` rather than truncating.
+
+---
+
+### PIXEL
+
+Read the raw `fb1` palette-index byte at a single pixel - a calibration aid for finding a page-identifying pixel (e.g. something unique to one Kronos screen) the same way `PADMAP`'s regions and the on-screen toggle indicators were calibrated.
+
+```
+Request:  PIXEL <x> <y>\n
+Response: V=<n>\n
+          ERR\n   (line doesn't parse as two integers, or (x, y) is outside the framebuffer)
+```
+
+| Argument | Type | Range | Description |
+|----------|------|-------|-------------|
+| x | integer | 0 to width-1 | Horizontal pixel coordinate; out-of-range is **rejected**, not clamped |
+| y | integer | 0 to height-1 | Vertical pixel coordinate; out-of-range is **rejected**, not clamped |
+
+`n` is the same raw palette index space as `REGION` and the stream's pixel data - look it up in `PALETTE`'s response to get an actual RGB color.
+
+---
+
 **How detection works.** On pen-down (`TOUCH`'s implicit down, or `TOUCH_DOWN`), if `PADMAP_ON`, `(x, y)` falls inside a configured pad's box, AND `pad_play_active()` is true (see below), that pad's index is remembered and `PADCHORD <pad> <velocity>` fires immediately. On the matching pen-up, `PADCHORD <pad> 0` releases it unconditionally (not re-gated - if a chord was started, it always gets cleanly released even if the page/mode changed mid-hold). The underlying `TOUCH` event is still forwarded to Eva as normal either way - this is additive, not a replacement, since Eva's own touch handling is otherwise unaffected by any of this.
 
 **Page/mode gating.** The Pads page has real modal state that changes what a tap even means: "Enable Pad Play" must be on for taps to produce sound at all, and while "Chord Assign" is active a tap instead *assigns* whatever chord is currently held on the keybed to that pad rather than playing it - firing `PADCHORD` in either wrong state would be surprising or actively disruptive.
@@ -1164,7 +1249,7 @@ OK\n
 
 Authentication is attempted in priority order. The first backend that recognises the username determines the result.
 
-### 10.1 KronosNet.conf
+### 12.1 KronosNet.conf
 
 File: `/korg/rw/Startup/KronosNet.conf`
 
@@ -1173,7 +1258,7 @@ Line 2: password (plain text)
 
 This is the credential store managed by the Kronos UI (the network/FTP user). If the submitted username matches line 1, authentication either succeeds (passwords match) or fails (passwords differ) and no further backends are tried.
 
-### 10.2 PublicID fallback
+### 12.2 PublicID fallback
 
 If `KronosNet.conf` is missing or does not contain the submitted username, the daemon accepts username `kronos` with the device's PublicID as the password. The PublicID is the dashed form shown in the Kronos UI (Global > Basic, Menu > Display Public ID), e.g. `AA-BB-CC-DD-EE-FF-00-11`. Dashes are optional - the daemon strips them before comparing, so both `AA-BB-CC-DD-EE-FF-00-11` and `AABBCCDDEEFF0011` are accepted. Any other username or password is rejected.
 
@@ -1181,7 +1266,7 @@ The PublicID is read from `/proc/id` (created by `GetPubIdMod.ko` at boot) and i
 
 This fallback is intended as an emergency recovery path for screen connect only. It does not grant FTP access. It covers cases where `KronosNet.conf` is absent - for example on a Nautilus where the file may not exist or may be named differently. No directory flag or configuration is required to enable it.
 
-### 10.3 Access log
+### 12.3 Access log
 
 Every authentication attempt (success or failure) is appended to `/korg/rw/screenremote/access.log` with a timestamp, client IP, and outcome:
 
@@ -1237,6 +1322,11 @@ Every authentication attempt (success or failure) is appended to `/korg/rw/scree
 | CHORD hold_ms range | 0 - 5000 ms | Snapped, not rejected - see Section 7.0 |
 | SLIDER / KNOB index range | 1 - 8 | Snapped, not rejected |
 | SLIDER / KNOB / VSLIDER value range | 0 - 127 | Snapped, not rejected |
+| Touch injection minimum spacing | 30 ms | `TOUCH_MIN_INTERVAL_MS`; enforced between every `TOUCH`/`TOUCH_DOWN`/`TOUCH_MOVE`/`TOUCH_UP` injection - see `TOUCH`'s pacing note in Section 7 |
+| PADCHORD minimum hold duration | 80 ms | `PADCHORD_MIN_HOLD_MS`; minimum time between a bridged pad trigger and its release - see `PADMAP`'s "Minimum hold duration" note in Section 7 |
+| PADMAP pad count | 8 | `pad_index` 0-7; `PADMAP`/`PADCHORD` reject/clamp outside this range |
+| REGION rectangle size | 8192 pixels | `(x1-x0+1) * (y1-y0+1)`; larger requests return `ERR\n` rather than truncating - see `REGION` in Section 7 |
+| PALETTE response size | 768 bytes decoded (1536 hex chars) | 256 palette entries x 3 bytes RGB |
 | MIDI_SEND max message size | 4096 bytes | Limited by the kernel module's static buffer |
 | MIDI_SEND CC throttle interval | 7 ms | Minimum spacing between injected Control Change messages sharing the same (status, controller) |
 | MIDI_SEND CC throttle tracked controllers | 32 | Concurrent (status, controller) pairs tracked; a 33rd distinct controller bypasses throttling |

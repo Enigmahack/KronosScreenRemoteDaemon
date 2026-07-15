@@ -22,11 +22,12 @@ source/
   screenremote.c            - main daemon source (C99, i686, static)
   midi_tcp.c                - TCP MIDI bridge subprocess (injected into screenremote as embedded binary)
   screenremote.cfg.example  - example config file
-  Makefile                  - builds the screenremote binary (including midi_bridge_ko.h and midi_tcp_bin.h)
+  Makefile                  - builds the screenremote binary (including the generated *_ko.h / *_bin.h headers below)
   palette_data.h            - Kronos display palette table
   no_tracepoints.h          - stub header for kernel tracepoint macros
   vkbd_ko.h                 - generated: embedded vkbd.ko as a C array (do not edit; not committed)
   midi_bridge_ko.h          - generated: embedded midi_bridge.ko as a C array (do not edit; not committed)
+  nks4_inject_ko.h          - generated: embedded nks4_inject.ko as a C array (do not edit; not committed)
   midi_tcp_bin.h             - generated: embedded midi_tcp binary as a C array (do not edit; not committed)
 
 vkbd_module/
@@ -39,8 +40,16 @@ midi_module/
   midi_bridge.c             - MIDI injection kernel module source (/proc/.midi_in write, /proc/.midi_ring read)
   Kbuild                    - kernel build descriptor
   Makefile.module            - builds midi_bridge.ko, patches it, then generates midi_bridge_ko.h
+  archive/                  - superseded midi_inject.c (predecessor of midi_bridge.c) kept for reference only; not built
+
+nks4_inject_module/
+  nks4_inject.c              - front-panel injection kernel module source (/proc/.nks4inject write, /proc/.nks4inject_status read)
+  Kbuild                    - kernel build descriptor
+  Makefile.module            - builds nks4_inject.ko, patches it, then generates nks4_inject_ko.h
 
 tools/
+  kscr_client.py             - Python 3 reference client (stream, control, and MIDI-bridge protocols)
+  mock_kscr_server.py         - host-side mock KSCR server for testing kscr_client.py without hardware
   PackageMaker/
     payload/                 - Build dependencies and user payload files
       DisplayUpdaterMessage/ - Kronos updater UI binary (required by package builder)
@@ -95,13 +104,31 @@ TOUCH nx ny            - touchscreen tap (press + release) at pixel coords
 TOUCH_DOWN nx ny       - pen-down only
 TOUCH_MOVE nx ny       - pen-move
 TOUCH_UP nx ny         - pen-up only
+PADCHORD pad velocity  - play/release one of the 8 "Pads (touch to play)" chords by index (0-7), bypassing touch
+PADMAP pad x0 y0 x1 y1 - live-set a pad's rectangular hit box (framebuffer pixel space)
+PADMAP_LIST            - list all 8 configured pad hit boxes
+PADMAP_ON / PADMAP_OFF - enable/disable auto-bridging real Pads-page taps to PADCHORD
+LASTTOUCH               - reply: X=x Y=y\n  (most recent touch's raw pixel coords; calibration aid)
+PADMAP_STATE            - diagnostic dump of PADMAP gating state (page/mode detection, last-gate results)
 BUTTON name            - press + release a named front-panel button
 CHORD [ms] n1 n2 [..n8] - press n1..nN left-to-right, hold ms (default 0), release right-to-left
 WHEEL CW|CCW           - one data-wheel tick
-SLIDER n value         - set CC slider/knob n (1-8) to value (0-127)
+SLIDER n value         - set physical Slider n (1-8) to value (0-127)
+KNOB n value           - set physical RT Knob n (1-8) to value (0-127)
 VSLIDER value          - set the value slider position (0-127)
+JOYSTICK X|Y value     - set Joystick axis (0-127)
+VECTOR X|Y value       - set Vector Joystick axis (0-127)
+RIBBON X|Z value       - set Ribbon controller axis (0-127); Z axis unverified
+AFTERTOUCH value       - set keybed channel aftertouch (0-127)
+PEDAL value            - set assignable rear-panel PEDAL jack (0-127)
+FOOTSWITCH value       - set assignable rear-panel foot SWITCH jack (0-127)
+DAMPER value           - set DAMPER jack (0-127), ramped internally
+TEMPO value            - set tempo (0-127, maps to ~40-300bpm non-linearly), ramped internally
 KEY code val           - raw key inject: code 1-511, val 0=release 1=press
 REFRESH                - force full-frame resend on next tick
+PALETTE                 - reply: 256-entry RGB hex dump of the current palette (calibration aid)
+REGION x0 y0 x1 y1      - reply: hex dump of a fb1 pixel rectangle, up to 8192 pixels (calibration aid)
+PIXEL x y               - reply: V=n\n  (raw fb1 palette index at a pixel; calibration aid)
 MIDI_SEND hex          - inject raw MIDI bytes (hex pairs, spaces allowed)
 SYSEX hex              - send SysEx (must start F0), capture response (up to 5 s)
                          reply: SYSEX_RESP hex\n  or  ERR TIMEOUT\n
@@ -111,6 +138,8 @@ STATE                  - reply: MODE=N\n  (0=init 1=Setlist 2=Combi 3=Program 4=
 VERSION                - reply: VER=x.x.x BUILD=xxx\n
 SYSINFO                - reply: multi-line block of uptime, load, memory, CPU, audio, disk, USB, temperature, fan, mode
 ```
+
+Front-panel commands (`TOUCH*`, `BUTTON`, `CHORD`, `WHEEL`, `SLIDER`, `KNOB`, `VSLIDER`, `JOYSTICK`, `VECTOR`, `RIBBON`, `AFTERTOUCH`, `PEDAL`, `FOOTSWITCH`, `DAMPER`, `TEMPO`, `PADCHORD`, `PADMAP`) return `ERR NKS4_NOT_LOADED\n` if `nks4_inject.ko` failed to load. See api.md §7 for full argument ranges, snapping/rejection rules, and internal encodings.
 
 ### UDP discovery
 
@@ -130,6 +159,16 @@ When `/korg/rw/screenremote/.mirror_enable` exists, the daemon opens `/dev/fb0` 
 ### Virtual keyboard
 
 At startup the daemon extracts `vkbd.ko` from the binary (embedded as a C array in `vkbd_ko.h`) and loads it with `init_module(2)`. The module registers a virtual input device with the kernel input subsystem so Kronos's EVA process discovers it like a physical USB keyboard. Key injection is then done by writing `"code value\n"` to `/proc/.vkbd`. If the module is unavailable, injection falls back to `/dev/uinput`.
+
+### Front-panel injection
+
+`TOUCH*`, `BUTTON`, `CHORD`, `WHEEL`, `SLIDER`, `KNOB`, `VSLIDER`, `JOYSTICK`, `VECTOR`, `RIBBON`, `AFTERTOUCH`, `PEDAL`, `FOOTSWITCH`, `DAMPER`, `TEMPO`, and `PADCHORD` are injected through `nks4_inject.ko` (extracted from `nks4_inject_ko.h` and loaded with `init_module(2)` early at startup, right after `vkbd.ko`, well before EVA has drawn its UI — unlike `midi_bridge.ko` below, it does not need to wait). The module exposes `/proc/.nks4inject` (write) and `/proc/.nks4inject_status` (read) and calls OA's real `CSTGFrontPanel::HandleSwitchEvent` / `HandleTouchPanel` / `HandleRotary` / `HandleAnalogController` directly — the exact functions a physical press/touch/turn dispatches through — so injected events get bit-for-bit the same response as hardware, independent of whatever mode Eva is currently in. This replaced an earlier approach that wrote synthetic packets to `/dev/rtf5` (OA's own *outbound* notification FIFO to Eva, not an input path), which only ever fooled Eva's UI-mirroring logic and never reached transport, tempo, or KARMA control-surface state.
+
+If `nks4_inject.ko` fails to load (symbol resolution failure against `/proc/kallsyms`, the boot-safety kill-switch present, OA not yet at the Live module state, etc.), every command in this list returns `ERR NKS4_NOT_LOADED\n` rather than silently falling back to the old `/dev/rtf5` path.
+
+`PADCHORD` (and the `PADMAP`/`PADMAP_LIST`/`PADMAP_ON`/`PADMAP_OFF`/`LASTTOUCH`/`PADMAP_STATE` bridge built on top of it) plays or releases one of the 8 "Pads (touch to play)" chords directly via OA's `RT_chord_trigger`, bypassing Eva/touch entirely — the on-screen Pads grid doesn't dispatch through `HandleTouchPanel` the way every other touch widget does, so it needed its own path. With `PADMAP_ON`, real taps on the calibrated on-screen pad regions are bridged to `PADCHORD` automatically, gated by a framebuffer pixel fingerprint that detects the Pads page and the Enable Pad Play / Chord Assign toggle states. See api.md §7 (`PADCHORD` and `PADMAP*`) for the full calibration and gating details.
+
+`PALETTE`, `REGION`, and `PIXEL` are framebuffer-read diagnostic/calibration commands used to derive the pixel fingerprints and hit boxes above; they have no dependency on `nks4_inject.ko`.
 
 ### MIDI injection
 
@@ -151,7 +190,7 @@ Continuous controllers (e.g. mod wheel, breath) sent via `MIDI_SEND` are rate-li
 
 ### Boot safety and recovery
 
-Kernel module loading (`vkbd.ko`, `midi_bridge.ko`) is inherently risky on the Kronos's RTAI kernel, so startup is guarded by three independent mechanisms, all living under the FTP-visible `/korg/rw/HD` folder so they are reachable even on a non-rooted unit with no shell access:
+Kernel module loading (`vkbd.ko`, `nks4_inject.ko`, `midi_bridge.ko`) is inherently risky on the Kronos's RTAI kernel, so startup is guarded by three independent mechanisms, all living under the FTP-visible `/korg/rw/HD` folder so they are reachable even on a non-rooted unit with no shell access:
 
 - **Boot flag** (`/korg/rw/HD/ScreenRemote/.boot`) - written at the start of every boot and deleted only once the framebuffer, network, and both listeners are confirmed up. If it is still present when the daemon starts, the previous boot did not finish cleanly, so no kernel modules are loaded that boot. Delete the file over FTP to re-enable module loading on the next boot.
 - **Kill switch** (`/korg/rw/HD/_nomod`) - if this folder exists, the daemon loads no kernel modules at all, regardless of the boot flag. Create it over FTP (`mkdir _nomod`) and reboot to bring the unit up with no kernel modules at all - useful before running a Korg OS update or the Factory State Restore cleaner, and for recovering a wedged unit. (`midi_bridge.ko` no longer patches OA `.text`, so the old teardown freeze at "Preparing to Install" is gone; this kill-switch remains as defense-in-depth.)
@@ -167,7 +206,7 @@ Kernel module loading (`vkbd.ko`, `midi_bridge.ko`) is inherently risky on the K
 - `make`
 - `xxd` - used to convert `vkbd.ko` into the `vkbd_ko.h` C array
 
-**To rebuild `vkbd.ko` / `midi_bridge.ko` from source** (not required if you use the pre-built modules):
+**To rebuild `vkbd.ko` / `nks4_inject.ko` / `midi_bridge.ko` from source** (not required if you use the pre-built modules):
 
 - **[`cgudrian/linux-kronos`](https://github.com/cgudrian/linux-kronos)** (branch `v2.6.32.11-kronos`), built with Korg's own `arch/x86/configs/korg_kronos_defconfig` and prepared for out-of-tree module builds (`make ARCH=i386 oldconfig && make ARCH=i386 prepare scripts modules_prepare`). This is Korg's actual kernel source, not a vanilla 2.6.32.11 tree - modules must be built against it to match the real kernel's `struct module` ABI (see `patch_init_offset.py` below for what goes wrong otherwise, and `../project_linux_kronos_kernel_tree.md` for how this tree was found/validated and exactly how to (re)prepare it).
   - `Makefile.module` in each module dir defaults `KDIR` to `/home/build/linux-kronos`; override with `make KDIR=/path/to/linux-kronos` if yours lives elsewhere. **Build it on a filesystem that supports real symlinks** - `modules_prepare` creates `include/asm -> include/asm-x86`, which fails on CIFS/SMB mounts even with `symlink=native` set.
@@ -178,10 +217,11 @@ Kernel module loading (`vkbd.ko`, `midi_bridge.ko`) is inherently risky on the K
 
 ```sh
 make -C vkbd_module -f Makefile.module
+make -C nks4_inject_module -f Makefile.module
 make -C midi_module -f Makefile.module
 ```
 
-Each runs `make modules` against the 2.6.32.11 kernel tree, runs `patch_init_offset.py` on the resulting `.ko`, and then uses `xxd -i` to regenerate the corresponding C header (`source/vkbd_ko.h`, `source/midi_bridge_ko.h`).
+Each runs `make modules` against the 2.6.32.11 kernel tree, runs `patch_init_offset.py` on the resulting `.ko`, and then uses `xxd -i` to regenerate the corresponding C header (`source/vkbd_ko.h`, `source/nks4_inject_ko.h`, `source/midi_bridge_ko.h`).
 
 Step 1 is required - the `.ko` files and their generated headers are not committed and must be built before Step 2.
 
@@ -199,7 +239,7 @@ Output: `build/screenremote` - a statically linked i686 ELF binary.
 
 The Kronos kernel's `struct module` places the `init` function pointer at offset `0xd4`. A module built against a vanilla Linux 2.6.32 tree (mismatched CONFIG options relative to Korg's real kernel) places it at `0xbc` instead. If such a module is loaded unpatched, the kernel writes the `init_module` address to the wrong offset and the module's init function is never called - and, worse, if that module's init ever needs to signal failure, the kernel's stock error-cleanup path (`module_put()` on the misshapen module) reads other kernel-populated fields like the percpu `refptr` from the wrong offset too, which oopses the kernel rather than just failing the load.
 
-Building against `linux-kronos` (see Prerequisites above) avoids this at the source: `init` naturally lands at `0xd4` with no patching, verified byte-for-byte against real Korg-shipped `.ko` files (not just that one field - the whole `.gnu.linkonce.this_module` section matches in size). `patch_init_offset.py` still runs automatically after every module build as a cheap defensive check - it detects the offset is already correct and no-ops - so it also still fixes the one symptom it knows about if someone builds against a mismatched tree. It finds the `.rel.gnu.linkonce.this_module` section, locates the `init_module` relocation entry, and changes its `r_offset` from `0xbc` to `0xd4`. It applies to both `vkbd.ko` and `midi_bridge.ko`.
+Building against `linux-kronos` (see Prerequisites above) avoids this at the source: `init` naturally lands at `0xd4` with no patching, verified byte-for-byte against real Korg-shipped `.ko` files (not just that one field - the whole `.gnu.linkonce.this_module` section matches in size). `patch_init_offset.py` still runs automatically after every module build as a cheap defensive check - it detects the offset is already correct and no-ops - so it also still fixes the one symptom it knows about if someone builds against a mismatched tree. It finds the `.rel.gnu.linkonce.this_module` section, locates the `init_module` relocation entry, and changes its `r_offset` from `0xbc` to `0xd4`. It applies to `vkbd.ko`, `nks4_inject.ko`, and `midi_bridge.ko`.
 
 **Requirements:** Python 3 (standard library only - `struct`, `sys`, `os`).
 
@@ -207,6 +247,7 @@ Building against `linux-kronos` (see Prerequisites above) avoids this at the sou
 
 ```sh
 python3 patch_init_offset.py vkbd_module/vkbd.ko
+python3 patch_init_offset.py nks4_inject_module/nks4_inject.ko
 python3 patch_init_offset.py midi_module/midi_bridge.ko
 ```
 
@@ -217,6 +258,16 @@ python3 patch_init_offset.py midi_module/midi_bridge.ko
 An earlier approach (`vusb_midi/`, since removed) attempted to use `dummy_hcd` to inject MIDI messages via a virtual USB gadget interface. This was abandoned because `dummy_hcd` is incompatible with the Kronos's RTAI real-time kernel - the URB completion tasklets conflict with RTAI scheduling and cause kernel panics. The current approach calls the Kronos MIDI receive function directly from a kernel module (`midi_module/midi_bridge.c`) and bridges SysEx request/response via an embedded TCP subprocess.
 
 **1.9.0 → 1.9.2.** 1.9.0 replaced the old `.text` trampoline hook with the hook-free reader-slot tap. 1.9.1 added fast USB-routed dump replies but proved unstable: it intermittently froze the Kronos (EVA/OA) in the first few seconds after boot. The cause turned out to be **CPU-core contention**, not the MIDI logic — the OS was scheduling framebuffer streaming onto the same physical core as the RTAI audio engine and the boot-time PCM sample loader, and during the boot-settling window that starved the real-time engine. 1.9.2 fixes it by pinning the daemon and `midi_tcp` off the audio core and deferring the module load until the UI is up. With the contention gone, the full generic capture (live performance **and** dumps, continuous) runs stably alongside screen mirroring; a `tap_shared=0` option remains for a minimal-footprint dump-only build. *(During the hunt the tap was also hardened — claim-on-demand slots, injection-gated draining — before the real cause was found; those paths survive as the `tap_shared=0` mode.)*
+
+---
+
+## Front-panel injection history
+
+Earlier versions injected `TOUCH*`/`BUTTON`/`CHORD`/`WHEEL`/`SLIDER`/`VSLIDER` events by writing synthetic packets to `/dev/rtf5`. That worked for touch and mode-select buttons but never reliably drove sequencer transport, tempo, or some MIDI-triggering touch actions, because `/dev/rtf5` is actually OA.ko's own **outbound** notification channel to Eva, not an input path — a synthetic packet only ever fooled Eva's UI-mirroring logic, never the real OA-side action.
+
+**1.10.0** replaced this with `nks4_inject.ko`, a small companion kernel module that calls OA's real `CSTGFrontPanel::HandleSwitchEvent` / `HandleTouchPanel` / `HandleRotary` / `HandleAnalogController` directly via `/proc/.nks4inject` — the exact functions a physical press/touch/turn dispatches through. This also enabled a batch of previously-unavailable controls: `KNOB`, `JOYSTICK`, `VECTOR`, `RIBBON`, `AFTERTOUCH`, `PEDAL`, `FOOTSWITCH`, `DAMPER`, and `TEMPO`, all hardware-confirmed against a real unit (see api.md §7 and §10).
+
+**Pads (touch to play) bridge.** The on-screen Pads grid turned out not to dispatch through `HandleTouchPanel` like every other touch widget — tapping it instead feeds a separate, single shared KARMA CC trigger. The real per-pad mechanism, `RT_chord_trigger`, was found via a one-shot diagnostic `.text` hook (`chord_probe.c`, not part of the shipped daemon) and is now called directly by the `PADCHORD` command. `PADMAP`/`PADMAP_ON` bridges real taps on the Pads page to `PADCHORD` automatically, gated by a framebuffer pixel fingerprint (`PALETTE`/`REGION`/`PIXEL` were added as general-purpose calibration commands to derive it) plus the Enable Pad Play / Chord Assign / Fixed Velocity toggle states. See api.md §7 (`PADCHORD` and `PADMAP*`) for the full calibration history and gating logic.
 
 ---
 
@@ -312,11 +363,11 @@ Covers every wire format, all control commands and their arguments, the button n
 
 Some online file-scanning services and cloud storage providers (including Google Drive) may flag the `screenremote` binary or `vkbd.ko` as suspicious or malicious. These are **false positives**. Nothing in this software is harmful; the detections are purely heuristic and stem from several legitimate implementation choices that happen to match patterns that generic scanners look for:
 
-**Embedded binary blobs.** The daemon contains three binaries compiled into it as raw byte arrays (`vkbd_ko.h`, `midi_bridge_ko.h`, `midi_tcp_bin.h`) and extracts and loads them at runtime - the kernel modules via the `init_module(2)` syscall directly, and the MIDI bridge via `fork()`/`execl()`. Self-extracting executables that carry and load additional binaries are a well-known malware distribution technique; heuristic scanners flag the pattern regardless of intent. The reason for doing this here is that `system()` and `/bin/sh` are unavailable on non-rooted Kronos units.
+**Embedded binary blobs.** The daemon contains four binaries compiled into it as raw byte arrays (`vkbd_ko.h`, `nks4_inject_ko.h`, `midi_bridge_ko.h`, `midi_tcp_bin.h`) and extracts and loads them at runtime - the kernel modules via the `init_module(2)` syscall directly, and the MIDI bridge via `fork()`/`execl()`. Self-extracting executables that carry and load additional binaries are a well-known malware distribution technique; heuristic scanners flag the pattern regardless of intent. The reason for doing this here is that `system()` and `/bin/sh` are unavailable on non-rooted Kronos units.
 
-**Direct kernel module loading.** Calling `init_module(2)` to load kernel modules without going through `/sbin/insmod` is unusual enough to be a trigger on its own. Rootkits use the same syscall to load modules that hide processes or intercept system calls. The modules here only register a virtual keyboard with the input subsystem and provide a MIDI injection interface.
+**Direct kernel module loading.** Calling `init_module(2)` to load kernel modules without going through `/sbin/insmod` is unusual enough to be a trigger on its own. Rootkits use the same syscall to load modules that hide processes or intercept system calls. The modules here only register a virtual keyboard with the input subsystem and provide front-panel and MIDI injection interfaces.
 
-**Input event injection.** Writing to `/dev/uinput` and `/dev/rtf5` to inject keystrokes and touchscreen events is a behavioral signature of keyloggers and Remote Access Tools. This is exactly the intended use here - remote control of the Kronos UI from a client application.
+**Input event injection.** Writing to `/dev/uinput` and `/proc/.nks4inject` to inject keystrokes, touchscreen, and front-panel control events is a behavioral signature of keyloggers and Remote Access Tools. This is exactly the intended use here - remote control of the Kronos UI from a client application.
 
 **Statically linked binary.** The binary has no shared library dependencies. Statically linking is common for embedded targets (the Kronos has a minimal filesystem), but it is also a common malware technique for portability and to avoid detection via library monitoring.
 
