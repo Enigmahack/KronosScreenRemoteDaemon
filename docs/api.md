@@ -214,13 +214,15 @@ The control port accepts text-line commands (newline-terminated, `\n`) that inje
 
 ### 5.2 Access control
 
-The daemon enforces a strict IP-based access control rule:
+The daemon enforces a strict IP-based access control rule for commands that mutate state or inject input:
 
-- After a stream client successfully authenticates, **only connections from that client's IP address** are accepted on the control port.
-- If no stream client is connected, **all control connections are rejected**.
-- A control connection from a disallowed IP is immediately closed with no response.
+- After a stream client successfully authenticates, **only connections from that client's IP address** are accepted for these commands on the control port.
+- If no stream client is connected, these commands are rejected from every IP (there is no owner to match against).
+- A rejected connection is immediately closed with no response.
 
-A client must authenticate on the stream port before it can use the control port.
+A client must authenticate on the stream port before it can use ownership-gated control commands.
+
+**Read-only allowlist exception.** A short list of read-only, informational commands - `LASTTOUCH`, `PADMAP_LIST`, `PADMAP_STATE`, `PIXEL`, `REGION`, `PALETTE`, `STATE`, `VERSION`, `SYSINFO` - is answered from **any** IP, regardless of whether a stream client is connected or who owns it, and never upgrades to a persistent (`CTRL_PERSIST`) session. This lets a diagnostic/calibration tool (or a second observer) read live state concurrently with the owning client's own session. Every other command - anything that touches touch/button/wheel/slider/knob/MIDI injection, or `CTRL_PERSIST` itself - remains ownership-gated as above.
 
 ### 5.3 Command format
 
@@ -240,6 +242,8 @@ Send `CTRL_PERSIST\n` as the very first line after connecting. The server keeps 
 
 In persistent mode the server reads commands with `O_NONBLOCK` and never blocks on the control socket, so slow or stalled clients do not affect stream delivery.
 
+**Ownership is re-checked continuously, not just at connect time** - see Section 13's "Persistent-session ownership is re-validated continuously" note. A session can be closed by the server mid-use if the client that established it stops being the stream owner.
+
 **TOUCH_MOVE coalescing.** Each touch injection is paced ~30ms apart (see `TOUCH`'s section below), so a fast drag gesture can enqueue `TOUCH_MOVE` commands faster than the daemon can pace them through `/proc/.nks4inject`. Processing every buffered move sequentially would delay the trailing `TOUCH_UP` (release) by the full backlog, producing a perceptible lag letting go of a note - live-confirmed 2026-07-14. To keep releases responsive, the persistent-mode reader coalesces `TOUCH_MOVE` into a single pending slot: consecutive `TOUCH_MOVE` lines overwrite the same slot instead of queuing, and the slot flushes (actually injects) as soon as a different command type arrives or the socket's read buffer is fully drained. Only `TOUCH_MOVE` is coalesced this way - every other command (including `TOUCH_UP`) is still processed in full, in order, one per line. A `TOUCH_MOVE` that gets overwritten before it flushes never gets its own `OK\n` reply (the flush that supersedes it runs with no reply socket); the move that does flush - whether because a later command interrupted it or because the buffer drained - gets a normal reply.
 
 ---
@@ -254,7 +258,7 @@ All commands respond with `OK\n` on success or `ERR\n` on invalid arguments, exc
 
 As of 1.10.0, these commands write to `/proc/.nks4inject`, exposed by a small companion kernel module (`nks4_inject.ko`, extracted from an embedded buffer and loaded early at startup) that calls OA's real `CSTGFrontPanel::HandleSwitchEvent` / `HandleTouchPanel` / `HandleRotary` / `HandleAnalogController` directly - the exact functions a physical press/touch/turn dispatches through. Injected events get the same response as hardware, independent of whatever mode Eva is currently in.
 
-**If `nks4_inject.ko` failed to load** (symbol resolution failure against `/proc/kallsyms`, the boot-safety kill-switch present, OA not reaching the Live module state, etc.), every command in this section returns `ERR NKS4_NOT_LOADED\n` rather than silently falling back to the old, proven-unreliable `/dev/rtf5` path.
+**If `nks4_inject.ko` is permanently given up on for this boot** (symbol resolution failure against `/proc/kallsyms`, the boot-safety kill-switch present, or OA never reaching the Live module state within the retry deadline), the daemon falls back to writing raw packets to `/dev/rtf5` - the old pre-1.10.0 path - for `TOUCH*`, `BUTTON`, `CHORD`, `WHEEL`, `SLIDER`, and `VSLIDER` only. This is a **degraded** fallback, not a substitute: it inherits every limitation described above (sequencer transport, `TAP_TEMPO`, `SMPL_REC`/`SMPL_START`, and some MIDI-triggering touch actions silently do nothing even though the daemon still replies `OK\n`, because rtf5 only reaches Eva's UI-mirroring code, never the real OA-side action). `KNOB`, `JOYSTICK`, `VECTOR`, `RIBBON`, `AFTERTOUCH`, `PEDAL`, `FOOTSWITCH`, `DAMPER`, `TEMPO`, and `PADCHORD` have no rtf5 equivalent (added after rtf5 was retired) and always return `ERR NKS4_NOT_LOADED\n` in fallback mode; a `BUTTON`/`CHORD` name with no historical rtf5 mapping returns `ERR RTF5_UNSUPPORTED\n` instead. Entering fallback is logged to stderr and appended to `/korg/rw/HD/ScreenRemote/rtf5_fallback.log` (FTP-visible) so a degraded boot is never silent - check that log (or watch for `ERR RTF5_UNSUPPORTED\n`/dead transport buttons) if front-panel control seems partially broken.
 
 **Input validation policy.** Every numeric argument below is either **snapped** into its valid range or the request is **rejected outright** - never silently passed through out-of-range or forwarded to the kernel unchecked:
 - A value with a natural nearest-valid interpretation (a slider/knob index, a 0-127 magnitude, a touch coordinate, a chord hold duration) is **clamped** to the nearest in-range value. `SLIDER 99 500` is accepted as `SLIDER 8 127`, not rejected.
@@ -442,7 +446,7 @@ Response: <idx> <x0> <y0> <x1> <y1>\n   (one line per pad, 8 lines)
 Request:  PADMAP_ON\n / PADMAP_OFF\n
 Response: OK\n
 ```
-Toggles auto-detection. `PADMAP_OFF` also releases whatever pad is currently held (if any).
+Toggles auto-detection. `PADMAP_OFF` also releases whatever pad is currently held (if any) - sends the chord's Note-Off before dropping the internal held-pad state, not after (fixed 1.11.2; earlier versions could strand a sounding chord with no release here). The same release-before-reassign fix applies to a `TOUCH_DOWN` landing on a different pad than the one currently held while no `TOUCH_UP` was ever sent for the first - the daemon releases the previous pad before starting the new one instead of overwriting the tracked state out from under a still-sounding chord. See Section 13's stuck-chord watchdog note for the backstop case (client disconnects mid-hold with no further command at all).
 
 ```
 Request:  LASTTOUCH\n
@@ -909,7 +913,7 @@ Response: OK\n                    (bytes injected)
 |----------|------|-------------|
 | hex | string | Hex-encoded MIDI bytes (pairs, spaces allowed). Example: `90 3C 7F` (Note On, middle C, velocity 127) |
 
-The hex string is decoded and written to `/proc/.midi_in` which passes the bytes directly to the Kronos MIDI receive function. Any valid MIDI message can be sent: note on/off, CC, program change, SysEx, etc. Maximum message size is 4096 bytes.
+The hex string is decoded and written to `/proc/.midi_in` which passes the bytes directly to the Kronos MIDI receive function. Any valid MIDI message can be sent: note on/off, CC, program change, SysEx, etc. Maximum message size is 4096 bytes. Always send complete hex pairs - an odd-length trailing nibble is decoded safely as of 1.11.2 (previously undefined behavior at the string boundary) but is still not a well-formed byte, so the resulting message content is unspecified; malformed hex should be avoided rather than relied on for any particular truncation behavior.
 
 **Continuous Controller throttling.** If `hex` decodes to exactly one 3-byte Control Change message (status `0xBn`), the daemon rate-limits it per `(status, controller)` pair to at most one injection every 7 ms, keeping only the latest value seen; the final value is always delivered once the controller stops moving. This prevents a fast controller sweep (e.g. many rapid `MIDI_SEND` calls moving mod wheel or breath CC) from flooding OA's MIDI queue and delaying other MIDI stuck behind it. The daemon still replies `OK\n` immediately regardless of whether the byte was injected immediately or held for coalescing. Notes, pitch bend, SysEx, and any multi-byte message are never throttled and are injected as sent.
 
@@ -1284,13 +1288,17 @@ Every authentication attempt (success or failure) is appended to `/korg/rw/scree
 ### Stream port
 
 - If any `write` on the stream socket fails, the client is dropped silently and the daemon returns to listening for new connections.
-- On client drop: `client_fd` is closed, shadow frame is invalidated, and the allowed control IP is cleared (reverting to allow-any).
+- On client drop: `client_fd` is closed, shadow frame is invalidated, and the allowed control IP is cleared to zero - this **fails closed**, not open: with no IP set, every ownership-gated control command is rejected (see Section 5.2's read-only allowlist for the commands that remain reachable regardless).
 - There is no keepalive or ping mechanism. A stale client is only detected when a write fails.
 
 ### Control port
 
 - Invalid command arguments return `ERR\n`; unrecognised command names return no response and the connection is closed (one-shot mode) or silently ignored (persistent mode).
 - A persistent control connection that closes or errors is detected on the next `select` readable event; the daemon clears `ctrl_fd` and the CPU delta baseline (`g_si_prev_valid`) is reset.
+- **First line deadline (1.11.2).** A freshly-accepted control connection must complete its first newline-terminated line within **1 second of connecting** (wall-clock, `CLOCK_MONOTONIC`), checked before every byte read - independent of the older per-byte 200 ms `recv` timeout, which by itself did not bound a client trickling bytes slowly with no newline. A connection that doesn't finish its first line in time is closed with no response.
+- **Reply send timeout (1.11.2).** The daemon sets a 2 second `SO_SNDTIMEO` on every accepted control connection. If a client stops reading and the daemon can't complete a `write()` (e.g. a large `REGION` response) within that window, the connection is closed. This timeout is not reset for a connection that upgrades to `CTRL_PERSIST` (only the read timeout is relaxed to blocking-free `O_NONBLOCK` for the persistent data path).
+- **Persistent-session ownership is re-validated continuously (1.11.2).** Previously a `CTRL_PERSIST` session's IP was checked once, at the moment `CTRL_PERSIST` was accepted; if a different stream client later took ownership (or the original client's stream connection dropped), the old persistent session kept being serviced until it happened to error out on its own. As of 1.11.2 the daemon re-checks the persistent session's owning IP against the current stream-client IP on every main-loop iteration and proactively closes it the moment they diverge - a client relying on a long-lived `CTRL_PERSIST` connection should treat an unexpected close as "ownership was superseded," not necessarily a network error, and reconnect only after re-authenticating on the stream port if it still wants control.
+- **Stuck-chord watchdog (1.11.2).** If `PADMAP_ON` bridging plays a chord via `TOUCH_DOWN` and the matching `TOUCH_UP` never arrives (client bug, or the client simply disconnects mid-hold), the daemon force-releases it (sends the chord's Note-Off) after **10 seconds** with no matching release - see Section 7's `PADMAP_OFF` note. A well-behaved client does not need to do anything differently; this is a safety backstop, not a new requirement.
 
 ### Signal handling
 
@@ -1310,6 +1318,9 @@ Every authentication attempt (success or failure) is appended to `/korg/rw/scree
 | Maximum concurrent stream clients | 1 | New connection replaces existing client |
 | Maximum concurrent control connections | 1 persistent + transient one-shots | New CTRL_PERSIST replaces previous persistent session |
 | Control line buffer | 2048 bytes | Persistent mode; lines longer than this are silently truncated |
+| Control port first-line deadline | 1 second | Wall-clock, from accept to a complete newline-terminated line; see Section 13 (1.11.2) |
+| Control port reply send timeout | 2 seconds | `SO_SNDTIMEO`; see Section 13 (1.11.2) |
+| Held-pad watchdog | 10 seconds | Force-releases a `TOUCH_DOWN`-triggered chord with no matching `TOUCH_UP`; see Section 7 `PADMAP_OFF` note (1.11.2) |
 | Handshake timeout | 5 seconds | Applied to the full client hello read |
 | Screensaver sample interval | 5 seconds | How often fb1 is sampled for change detection |
 | Screensaver sample points | 16 pixels | Evenly spaced across the framebuffer |

@@ -94,7 +94,7 @@ Two streaming modes are supported:
 
 ### Control port
 
-Control connections are accepted only from the IP address of the currently authenticated stream client. A control connection sends one newline-terminated command and receives a response, or it can open a persistent session with `CTRL_PERSIST`.
+Control connections are accepted only from the IP address of the currently authenticated stream client, with one exception: a short read-only allowlist (`LASTTOUCH`, `PADMAP_LIST`, `PADMAP_STATE`, `PIXEL`, `REGION`, `PALETTE`, `STATE`, `VERSION`, `SYSINFO`) is answered from any IP. A control connection sends one newline-terminated command and receives a response, or it can open a persistent session with `CTRL_PERSIST` - see api.md §5.2/§6.2/§13 for full access-control, ownership-revalidation, and timeout details.
 
 Supported commands:
 
@@ -269,6 +269,18 @@ Earlier versions injected `TOUCH*`/`BUTTON`/`CHORD`/`WHEEL`/`SLIDER`/`VSLIDER` e
 **1.10.0** replaced this with `nks4_inject.ko`, a small companion kernel module that calls OA's real `CSTGFrontPanel::HandleSwitchEvent` / `HandleTouchPanel` / `HandleRotary` / `HandleAnalogController` directly via `/proc/.nks4inject` — the exact functions a physical press/touch/turn dispatches through. This also enabled a batch of previously-unavailable controls: `KNOB`, `JOYSTICK`, `VECTOR`, `RIBBON`, `AFTERTOUCH`, `PEDAL`, `FOOTSWITCH`, `DAMPER`, and `TEMPO`, all hardware-confirmed against a real unit (see api.md §7 and §10).
 
 **Pads (touch to play) bridge.** The on-screen Pads grid turned out not to dispatch through `HandleTouchPanel` like every other touch widget — tapping it instead feeds a separate, single shared KARMA CC trigger. The real per-pad mechanism, `RT_chord_trigger`, was found via a one-shot diagnostic `.text` hook (`chord_probe.c`, not part of the shipped daemon) and is now called directly by the `PADCHORD` command. `PADMAP`/`PADMAP_ON` bridges real taps on the Pads page to `PADCHORD` automatically, gated by a framebuffer pixel fingerprint (`PALETTE`/`REGION`/`PIXEL` were added as general-purpose calibration commands to derive it) plus the Enable Pad Play / Chord Assign / Fixed Velocity toggle states. See api.md §7 (`PADCHORD` and `PADMAP*`) for the full calibration history and gating logic.
+
+---
+
+## Network robustness (1.11.1 → 1.11.2)
+
+A real kernel oops was captured on hardware during a Korg OS update while the daemon was running: `midi_bridge.ko`'s own OA-unload notifier dereferenced a stale pointer into OA's MIDI queue-control memory (that memory can be freed/reallocated by OA during ordinary operation, e.g. a Program/Combi load, not just at module unload — a plausible-looking-but-freed address isn't something the existing pointer sanity check can catch). Fixed by routing every touch of that memory through the kernel's fault-safe `probe_kernel_read`/`probe_kernel_write` primitives instead of raw dereferences, so a stale pointer now drops cleanly instead of oopsing. Confirmed fixed by watching the exact crash path complete cleanly live, through a real update, on real hardware.
+
+Alongside that, a module-unload-orphaning bug (`nks4_inject.ko` could be left resident with a live OA-unload notifier still registered after certain shutdown paths) and a missing `FD_CLOEXEC` on the daemon's sockets (an orphaned `midi_tcp` subprocess after a crash could hold the listen ports, blocking a restart) were both fixed — internal robustness, not visible on the wire.
+
+**Client-visible behavior changes**, all documented in their respective api.md sections above: the control port now enforces a 1-second total deadline on a connection's first command line (previously only a per-byte timeout, which a slow-trickling client with no newline could exploit to freeze the whole daemon indefinitely) and a 2-second send timeout on replies; a `CTRL_PERSIST` session's ownership is now continuously re-validated instead of only at connect time; and `PADMAP_OFF` / an overlapping `TOUCH_DOWN` now reliably send a chord's Note-Off before dropping it internally, backed by a 10-second watchdog that force-releases a held pad if a client disconnects mid-hold without ever sending `TOUCH_UP`. None of this requires a client to change how it talks to the daemon — these are robustness fixes, not new requirements.
+
+A protocol-aware fuzzing/stability regression suite (`tests/network_fuzz/`) was built to hunt for crashes across all three network surfaces — malformed handshakes, malformed control commands, malformed UDP discovery packets, plus true-concurrency and stateful-sequence attacks targeting the fixes above specifically. Ran clean (no crash, no fd leak) across ~130 test-case executions on real hardware; see its README for usage if you're extending the protocol and want to check your changes the same way.
 
 ---
 
