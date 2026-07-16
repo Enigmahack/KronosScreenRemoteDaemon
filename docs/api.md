@@ -1082,6 +1082,8 @@ Button names are case-sensitive and must be uppercase. The `code` column is the 
 
 **`INC`/`DEC`** (front-panel value +/-, codes 51/52) were captured in a dedicated follow-up pass after the main table, independently of the "PanelSW+/-" label an earlier capture pass used for the same two codes - two captures agreeing on the same codes for what both the C# and Python clients already call `INC`/`DEC` confirms it's one physical button pair with one correct name, not two.
 
+See [`nks4_firmware_crossref.md`](nks4_firmware_crossref.md) for a cross-check of this table against the panel controller's own firmware — including a naming curiosity (`SETLIST` is internally called `"Live"`), confirmed bi-color LEDs on the Sampling and Seq transport buttons, and an unconfirmed possible gap around KARMA module selection.
+
 ### Navigation
 
 | Name | code | Description |

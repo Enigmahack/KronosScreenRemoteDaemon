@@ -65,6 +65,7 @@ tools/
 
 docs/
   api.md                     - full API and wire protocol reference
+  nks4_firmware_crossref.md  - cross-checks against the panel controller's own firmware (kronosology VSB RE)
 
 patch_init_offset.py         - fixes struct module init offset mismatch (see below)
 ```
