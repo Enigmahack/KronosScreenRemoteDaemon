@@ -45,16 +45,19 @@ install_cmds = [
     for path in daemon_paths
 ]
 
-# vkbd.ko / midi_bridge.ko are embedded in the screenremote binary and loaded via
-# init_module(2).  Do NOT rmmod them here: busybox rmmod reads /proc/modules, and
-# reading /proc/modules OOPSES this kernel whenever OA is loaded — module_refcount
-# faults on OA's per-cpu refptr because OA is brought up by loadmod's custom
-# decrypting loader, not the standard module path (see the /proc/modules landmine
-# note).  Instead the daemon, killed above by _auto_detect_commands' uninstall
-# command, unloads both modules ITSELF via delete_module(2) on SIGTERM (which
-# restores OA's patched .text and frees the trampolines) — no /proc/modules
-# access.  Give it a moment to finish; any module still resident is cleared by the
-# reboot that completes the uninstall.
+# vkbd.ko / midi_bridge.ko / nks4_inject.ko are embedded in the screenremote binary
+# and loaded via init_module(2).  This script doesn't rmmod them itself — not
+# because rmmod is unsafe (corrected 2026-07-16: it isn't, once OA is LIVE, which
+# is the normal state here; earlier "OOPSES whenever OA is loaded" claims were an
+# overgeneralization of a narrower, still-real hazard — /proc/modules reads only
+# oops on a module still COMING, mid-init — see screenremote.c's wait_for_oa_live()
+# comment and the confirmed live rmmod test) — but because the daemon, killed
+# above by _auto_detect_commands' uninstall command, already unloads all three
+# modules ITSELF via delete_module(2) on SIGTERM (midi_bridge restores OA's
+# patched .text and frees its trampolines; nks4_inject/vkbd have no OA .text patch
+# to undo), covering every exit path including an early SIGTERM during boot since
+# 2026-07-16 (graceful_shutdown()).  Give it a moment to finish; any module still
+# resident is cleared by the reboot that completes the uninstall.
 uninstall_cmds += [
     "sleep 2",
 ]

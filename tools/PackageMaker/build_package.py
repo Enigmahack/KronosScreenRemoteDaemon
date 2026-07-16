@@ -735,16 +735,20 @@ def _auto_detect_commands(payload_dir: Path) -> tuple:
                                     uninstall (see below) -- cleared at reboot
       no extension, anywhere     -> ... & at boot; kill $(pidof ...) at uninstall
 
-    LANDMINE: never emit `rmmod` (or `lsmod`) in a generated uninstaller.  busybox
-    rmmod reads /proc/modules, and reading /proc/modules OOPSES this kernel
-    whenever OA is loaded: /proc/modules' m_show calls module_refcount() on every
-    module, which faults on OA's per-cpu refptr (OA is brought up by loadmod's
-    custom decrypting loader, so its refptr is not a valid standard per-cpu
-    pointer -- confirmed on hardware, both while OA is COMING and while Live).
-    An uninstall always ends in a reboot, which clears any loaded module, so we
-    simply drop the module at reboot instead of unloading it live.  A daemon that
-    owns modules should unload them itself via delete_module(2) on SIGTERM (that
-    syscall does not touch /proc/modules) -- see screenremote.
+    CORRECTED 2026-07-16 (was a misunderstanding, confirmed by live testing):
+    `rmmod`/`lsmod` do NOT oops this kernel "whenever OA is loaded" -- that
+    earlier claim was an overgeneralization of a real but much narrower hazard.
+    The actual mechanism (see screenremote.c's wait_for_oa_live() comment,
+    confirmed against a real oops in boot_kmsg.log: "module_refcount+0x25"):
+    reading /proc/modules makes m_show() call module_refcount() on every
+    module, which faults if that module is still COMING (mid-init, per-cpu
+    refptr not yet mapped) -- NOT once it has reached LIVE.  By the time an
+    uninstaller runs, OA is normally already LIVE, so rmmod is safe here; live
+    rmmod testing on real hardware on 2026-07-16 confirmed no oops.  This
+    function still doesn't emit rmmod (reboot clears the module either way,
+    and the daemon already unloads its own modules itself via delete_module(2)
+    on SIGTERM -- see screenremote.c's unload_our_modules()/graceful_shutdown())
+    -- that's a deliberate simplicity choice now, not a safety requirement.
 
     Returns (boot_cmds, uninstall_cmds, daemon_paths).
     """
@@ -771,10 +775,11 @@ def _auto_detect_commands(payload_dir: Path) -> tuple:
 
     for kpath, modname in sorted(mods):
         boot_cmds.append(f"insmod {kpath} 2>/dev/null || true")
-        # No rmmod: it reads /proc/modules and oopses while OA is loaded (see
-        # docstring).  The module is cleared by the post-uninstall reboot.
+        # No rmmod here: not a safety requirement (rmmod is fine once OA is
+        # LIVE, see docstring) -- just simplicity, since the module is cleared
+        # by the post-uninstall reboot regardless.
         uninstall_cmds.append(
-            f"# {modname}: unloaded at reboot (rmmod unsafe: reads /proc/modules)")
+            f"# {modname}: unloaded at reboot (not live-rmmod'd, see docstring)")
 
     for kpath, name in sorted(daemons):
         boot_cmds.append(f"pidof {name} > /dev/null 2>&1 || {kpath} &")

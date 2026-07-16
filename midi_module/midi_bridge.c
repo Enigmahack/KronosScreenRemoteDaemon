@@ -186,6 +186,27 @@ static int kptr_ok(unsigned long p)
     return p >= 0x40000000UL && p < 0xfffff000UL && (p & 3) == 0;
 }
 
+/* kptr_ok() only rejects obviously-garbage pointers (null, misaligned, out of
+ * kernel range) - it cannot tell a plausible pointer from one that's since gone
+ * stale.  t->ringctl/t->buf are resolved ONCE, at setup (tap_claim_reader runs a
+ * single time), and OA can free/move a queue's control structure during normal
+ * operation - e.g. a Program/Combi load's codec-MIDI reconfiguration - with no
+ * module unload involved at all.  A raw dereference of a since-freed t->ringctl
+ * oopsed on real hardware (2026-07-16): rmmod OA -> midi_module_notify ->
+ * tap_release_reader -> tap_release_slots, EIP in tap_release_slots, CR2 a
+ * plausible-looking but no-longer-mapped address.  probe_kernel_read/write use
+ * the kernel's fault exception tables to turn that into a clean failure instead
+ * of an oops - every touch of a t->ringctl-derived control-structure address in
+ * tap_claim_slots/tap_release_slots/tap_drain_one's wpos read goes through these. */
+static int tap_read32(unsigned long addr, uint32_t *out)
+{
+    return probe_kernel_read(out, (void *)addr, sizeof(*out)) == 0;
+}
+static int tap_read8(unsigned long addr, uint8_t *out)
+{
+    return probe_kernel_read(out, (void *)addr, sizeof(*out)) == 0;
+}
+
 /* ------------------------------------------------------------------ */
 /*  Unified MIDI OUT ring (SPSC: drain producer -> /proc/.midi_ring)   */
 /* ------------------------------------------------------------------ */
@@ -253,17 +274,26 @@ static void tap_claim_slots(void)
     for (i = 0; i < ntaps; i++) {
         struct tapq *t = &taps[i];
         volatile uint8_t *rcount;
-        uint8_t idx;
+        uint8_t cur_count, idx;
+        uint32_t wpos;
         if (!t->ringctl || t->reader_idx >= 0)
             continue;
         rcount = (volatile uint8_t *)(t->ringctl + RC_RCOUNT);
-        if (*rcount >= RC_MAXREADERS)
+        if (!tap_read8(t->ringctl + RC_RCOUNT, &cur_count)) {
+            t->ringctl = 0;   /* confirmed gone - stop touching this tap entirely */
+            continue;
+        }
+        if (cur_count >= RC_MAXREADERS)
             continue;
         idx = __sync_fetch_and_add(rcount, 1);
         if (idx >= RC_MAXREADERS) { __sync_fetch_and_sub(rcount, 1); continue; }
+        if (!tap_read32(t->ringctl + RC_WPOS, &wpos)) {
+            __sync_fetch_and_sub(rcount, 1);
+            continue;
+        }
         t->reader_idx = idx;
-        t->cursor     = *(uint32_t *)(t->ringctl + RC_WPOS);   /* start from now */
-        *(uint32_t *)(t->ringctl + RC_RCUR0 + idx * 4) = t->cursor;
+        t->cursor     = wpos;   /* start from now */
+        probe_kernel_write((void *)(t->ringctl + RC_RCUR0 + idx * 4), &t->cursor, sizeof(t->cursor));
     }
 }
 
@@ -276,11 +306,18 @@ static void tap_release_slots(void)
     for (i = 0; i < ntaps; i++) {
         struct tapq *t = &taps[i];
         volatile uint8_t *rcount;
+        uint8_t cur_count;
         if (!t->ringctl || t->reader_idx < 0)
             continue;
         rcount = (volatile uint8_t *)(t->ringctl + RC_RCOUNT);
-        if (*rcount == (uint8_t)(t->reader_idx + 1)) {
-            *(uint32_t *)(t->ringctl + RC_RCUR0 + t->reader_idx * 4) = 0;
+        if (!tap_read8(t->ringctl + RC_RCOUNT, &cur_count)) {
+            t->ringctl = 0;
+            t->reader_idx = -1;
+            continue;
+        }
+        if (cur_count == (uint8_t)(t->reader_idx + 1)) {
+            uint32_t zero = 0;
+            probe_kernel_write((void *)(t->ringctl + RC_RCUR0 + t->reader_idx * 4), &zero, sizeof(zero));
             __sync_fetch_and_sub(rcount, 1);
         }
         t->reader_idx = -1;
@@ -359,7 +396,13 @@ static void tap_drain_one(struct tapq *t)
     if (!t->ringctl || t->reader_idx < 0 || !t->buf)
         return;
 
-    wpos  = *(volatile uint32_t *)(t->ringctl + RC_WPOS);
+    if (!tap_read32(t->ringctl + RC_WPOS, &wpos)) {
+        /* Queue control memory is gone (see tap_read32's comment) - drop this tap
+         * so nothing else touches it again. */
+        t->ringctl = 0;
+        t->reader_idx = -1;
+        return;
+    }
     /* Idle fast-path: nothing new transmitted.  Return WITHOUT writing our cursor
      * back - the per-port queues live in the codec's ioremapped region, and a
      * cursor writeback on every 1 kHz poll (even when idle) hammers that region in
@@ -402,7 +445,7 @@ static void tap_drain_one(struct tapq *t)
         uni_overflow += wpos - t->cursor;
         t->cursor = wpos;
     }
-    *(uint32_t *)(t->ringctl + RC_RCUR0 + t->reader_idx * 4) = t->cursor;
+    probe_kernel_write((void *)(t->ringctl + RC_RCUR0 + t->reader_idx * 4), &t->cursor, sizeof(t->cursor));
 }
 
 /* Drain all tapped queues in slot order. A dump halts all other MIDI, so at most
@@ -495,10 +538,20 @@ static ssize_t ring_fops_write(struct file *file, const char __user *buf,
     if (!oa_dead)
         for (i = 0; i < ntaps; i++) {
             struct tapq *t = &taps[i];
+            uint32_t wpos;
             if (!t->ringctl || t->reader_idx < 0)
                 continue;
-            t->cursor = *(volatile uint32_t *)(t->ringctl + RC_WPOS);
-            *(uint32_t *)(t->ringctl + RC_RCUR0 + t->reader_idx * 4) = t->cursor;
+            /* Safe read/write - see tap_read32's comment. Same stale-t->ringctl
+             * class as the crash this whole safe-read/write conversion fixed;
+             * this call site (a new client resyncing) was left raw and only
+             * caught on review (2026-07-16). */
+            if (!tap_read32(t->ringctl + RC_WPOS, &wpos)) {
+                t->ringctl = 0;
+                t->reader_idx = -1;
+                continue;
+            }
+            t->cursor = wpos;
+            probe_kernel_write((void *)(t->ringctl + RC_RCUR0 + t->reader_idx * 4), &t->cursor, sizeof(t->cursor));
         }
     spin_unlock(&ring_lock);
     return (ssize_t)count;
@@ -526,8 +579,18 @@ static int ports_read_proc(char *page, char **start, off_t off,
                    time_before(jiffies, drain_until) ? 1 : 0);
     for (i = 0; i < ntaps; i++) {
         struct tapq *t = &taps[i];
-        uint8_t rc = *(volatile uint8_t *)(t->ringctl + RC_RCOUNT);
-        uint32_t wpos = *(volatile uint32_t *)(t->ringctl + RC_WPOS);
+        uint8_t rc = 0;
+        uint32_t wpos = 0;
+        /* t->ringctl can be 0 here (a prior safe-read fault cleared it - see
+         * tap_read32's comment) while ntaps is left unchanged, so this diagnostic
+         * dump must not raw-deref it unconditionally the way it used to: that
+         * would fault reading offset 0x20/0x0c off a null pointer - a NEW crash
+         * this whole safe-read conversion would otherwise have introduced here,
+         * caught only on review (2026-07-16). Missing/faulted reads just show 0. */
+        if (t->ringctl) {
+            tap_read8(t->ringctl + RC_RCOUNT, &rc);
+            tap_read32(t->ringctl + RC_WPOS, &wpos);
+        }
         len += sprintf(page + len,
                        "tap[%d] ringctl=0x%lx buf=0x%lx cap=%u readerIdx=%d wpos=%u cursor=%u readers=%u\n",
                        i, t->ringctl, t->buf, t->cap, t->reader_idx, wpos, t->cursor, rc);
