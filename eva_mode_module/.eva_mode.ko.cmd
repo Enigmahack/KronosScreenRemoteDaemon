@@ -1,0 +1,1 @@
+cmd_/home/share/KronosScreenRemoteDaemon/eva_mode_module/eva_mode.ko := ld -r -m elf_i386 -T /home/build/linux-kronos/scripts/module-common.lds --build-id -o /home/share/KronosScreenRemoteDaemon/eva_mode_module/eva_mode.ko /home/share/KronosScreenRemoteDaemon/eva_mode_module/eva_mode.o /home/share/KronosScreenRemoteDaemon/eva_mode_module/eva_mode.mod.o

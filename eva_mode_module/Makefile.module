@@ -1,0 +1,20 @@
+# /home/build/linux-kronos is Korg's actual kernel source (cgudrian/linux-kronos,
+# built with korg_kronos_defconfig) — verified to produce byte-accurate struct
+# module layouts against real Korg .ko files. See ../../project_linux_kronos_kernel_tree.md.
+# This is THE kernel tree for all module builds in this project going forward -
+# patch_init_offset.py stays below purely as a cheap defensive check (it already
+# no-ops correctly against this tree; see project_linux_kronos_kernel_tree.md's
+# "Direct binary comparison" section), not because it's actually needed here.
+KDIR   ?= /home/build/linux-kronos
+PWD    := $(shell pwd)
+PATCH  := ../patch_init_offset.py
+KO_HDR := ../source/eva_mode_ko.h
+
+all:
+	$(MAKE) -C $(KDIR) M=$(PWD) modules
+	python3 $(PATCH) eva_mode.ko
+	xxd -i eva_mode.ko $(KO_HDR)
+
+clean:
+	$(MAKE) -C $(KDIR) M=$(PWD) clean
+	rm -f $(KO_HDR)

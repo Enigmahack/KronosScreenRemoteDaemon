@@ -41,10 +41,35 @@
  *                           -> SYSEX_RESP hex\n  or  ERR TIMEOUT\n
  *   MIDI_STATUS             -> MIDI_LOADED=n\nMIDI_IN=n\nMIDI_CAPTURE=n\nOK\n
  *   SS_TIMEOUT n            - set screensaver timeout at runtime (seconds; 0 = disable)
- *   STATE                   -> MODE=N\n  (0=init 1=Setlist 2=Combi 3=Program 4=Sequence 5=Sampling 6=Global 7=Disk)
+ *   STATE                   -> MODE=N EDITCTX=E\n
+ *                            MODE (0=init/undetected 1=Setlist 2=Combi 3=Program 4=Sequence
+ *                              5=Sampling 6=Global 7=Disk) and EDITCTX (0=none 1=Program-edit-
+ *                              from-Combi 2=Program-edit-from-Sequence) are read live via
+ *                              get_mode_state() - see that function for the full priority
+ *                              order. Primary source is eva_mode.ko, a small kernel module
+ *                              loaded at startup that reads Eva's own live CModeManager state
+ *                              directly out of its process memory (exact - no thresholds, and
+ *                              the only source that can report EDITCTX=2, fully calibrated
+ *                              live against pixel ground truth 2026-07-17, see
+ *                              docs/EVA_ModeManager_probe.md). Falls back to framebuffer pixel
+ *                              detection (detect_ui_mode()/detect_program_edit_context(),
+ *                              mode_detect_refs.h) when eva_mode.ko isn't loaded or hasn't
+ *                              resolved yet (e.g. early boot before Eva has started) - pixel
+ *                              detection's own fallback to the last BUTTON-commanded mode
+ *                              applies in that path only. Either way this is the daemon's own
+ *                              source of truth, not an echo of client-side screen comparison.
+ *   MODE_DETAIL             -> SOURCE=eva|pixel MODE=N EDITCTX=E EDITSLOT=S EVA_LOADED=0|1
+ *                              EVA_RESOLVED=0|1\n
+ *                            Richer counterpart to STATE (same spirit as PADMAP_STATE
+ *                              alongside PADMAP_*): SOURCE says which of the two paths above
+ *                              actually answered MODE/EDITCTX this call; EDITSLOT is the
+ *                              timbre/track index being Program-edited (-1 if EDITCTX=0, or
+ *                              if eva_mode.ko didn't resolve); EVA_LOADED/EVA_RESOLVED let a
+ *                              caller confirm eva_mode.ko is in play rather than the pixel
+ *                              fallback without needing to infer it from SOURCE alone.
  *   VERSION                 -> VER=x.x.x BUILD=xxx\n
  *   SYSINFO                 -> multi-line key=value block terminated by OK\n
- *                            (UPTIME, LOAD, MEM_*, CPU_*, AUDIO_*, DISK_*, USB_*, TEMP*, FAN*, MODE)
+ *                            (UPTIME, LOAD, MEM_*, CPU_*, AUDIO_*, DISK_*, USB_*, TEMP*, FAN*, MODE, EDITCTX)
  *
  * UDP discovery port 7372 (fixed, never configurable):
  *   Client sends: "KSCR?" (5+ bytes)
@@ -124,14 +149,30 @@
 #include <net/if.h>
 #include <ifaddrs.h>
 #include <sys/wait.h>
+#include <dirent.h>
 #include <linux/fb.h>
 #include <linux/uinput.h>
 #include <sys/syscall.h>
 #include "palette_data.h"
+#include "mode_detect_refs.h"
 #include "vkbd_ko.h"
 #include "midi_bridge_ko.h"
 #include "midi_tcp_bin.h"
 #include "nks4_inject_ko.h"
+#include "eva_mode_ko.h"
+
+/* Optional, interim compile-time boot-splash fallback - see
+ * tools/extract_boot_splash.py's --header option and load_boot_splash()
+ * below. Unlike the other embedded-header includes above, this one is
+ * genuinely optional: a fresh checkout with no generated
+ * boot_splash_data.h (the normal case - it's gitignored, see .gitignore)
+ * builds identically to before this feature existed, just without the
+ * fallback. __has_include is a GCC extension available since GCC 5; this
+ * project already requires GCC. */
+#if __has_include("boot_splash_data.h")
+#include "boot_splash_data.h"
+#define HAVE_EMBEDDED_BOOT_SPLASH 1
+#endif
 
 /*  Keyboard injection (uinput fallback) */
 #define KBD_EV_SYN  0
@@ -149,6 +190,7 @@
 #define MIDI_BRIDGE_KO    SCREENREMOTE_DIR "/midi_bridge.ko"
 #define MIDI_TCP_BIN      SCREENREMOTE_DIR "/midi_tcp"
 #define NKS4_INJECT_KO    SCREENREMOTE_DIR "/nks4_inject.ko"
+#define EVA_MODE_KO       SCREENREMOTE_DIR "/eva_mode.ko"
 
 #define FB_SRC       "/dev/fb1"
 #define FB_DST       "/dev/fb0"
@@ -186,6 +228,16 @@ static uint8_t  *fb1_map = NULL, *fb0_map = NULL;
 static uint32_t  fb1_stride, fb0_stride;
 static uint32_t  fb_w, fb_h;           /* 800, 600 */
 static uint32_t  frame_bytes;          /* fb_w * fb_h */
+
+/* Boot-splash compositing state (see apply_boot_splash()/load_boot_splash()/
+ * send_frame(), all further down) - declared up here alongside the other
+ * framebuffer state since send_frame() (pull mode's direct sender, defined
+ * not far below) needs g_boot_splash directly, ahead of where the rest of
+ * the boot-gate machinery is declared. update_boot_state() frees
+ * g_boot_splash the moment the gate clears. */
+static uint8_t  *g_boot_splash      = NULL;
+static uint32_t  g_boot_splash_w    = 0;
+static uint32_t  g_boot_splash_rows = 0;
 
 static uint16_t  pal_r[PAL_ENTRIES];   /* raw palette - used for streaming handshake */
 static uint16_t  pal_g[PAL_ENTRIES];
@@ -265,6 +317,7 @@ static int g_last_gate_chord_assign = -1, g_last_gate_hit = -1;
 /* Mode state */
 static uint32_t g_mode        = 0;   /* 0=init 1=Setlist 2=Combi 3=Program
                                          4=Sequence 5=Sampling 6=Global 7=Disk */
+static int g_eva_mode_loaded  = 0;   /* 1 once eva_mode.ko is loaded (see load_eva_mode_module()) */
 
 /* Sysinfo CPU snapshot (populated on-demand, only while connected) */
 typedef struct {
@@ -1002,18 +1055,42 @@ static int send_frame_buf(int fd, const uint8_t *buf)
     return 0;
 }
 
-/* Pull mode: send directly from device memory fb1_map (no staging/shadow). */
+/* Forward decl - defined near the boot-splash compositing code further
+ * down (needs g_boot_active/g_boot_splash, declared later in the file);
+ * send_frame() below is this file's other frame-send path and needs the
+ * same "how many rows are splash right now" answer apply_boot_splash()
+ * uses, so the two can't disagree. */
+static uint32_t boot_splash_active_rows(void);
+
+/* Pull mode: send directly from device memory fb1_map (no staging/shadow) -
+ * this is KronosScreenRemote's own DEFAULT connection mode (AppSettings.cs
+ * PullMode=true), so unlike capture_to_staging()'s change-mode path, this
+ * one is what most clients actually see. While the boot gate is active and
+ * a splash is loaded, its rows are written from g_boot_splash instead of
+ * fb1_map - everything from there down is still a direct, uncopied read
+ * from fb1_map, so this stays zero-copy for the overwhelmingly common case
+ * (BOOT=0, splash_rows=0) and only pays an extra small write while the
+ * gate is closed. Found missing 2026-07-19: an earlier version of the
+ * splash compositing feature only patched capture_to_staging(), so change
+ * mode composited correctly but pull mode - live-tested during a real
+ * boot - still showed a plain black-and-text frame with no logo, since it
+ * never went through staging/apply_boot_splash() at all. */
 static int send_frame(int fd)
 {
     uint8_t hdr[4];
-    uint32_t y;
+    uint32_t y, splash_rows = boot_splash_active_rows();
     put_le32(hdr, frame_bytes);
     TCP_CORK_ON(fd);
     if (write_all(fd, hdr, 4) < 0) goto fail;
+    if (splash_rows > 0 &&
+            write_all(fd, g_boot_splash, (size_t)fb_w * splash_rows) < 0)
+        goto fail;
     if (fb1_stride == fb_w) {
-        if (write_all(fd, fb1_map, frame_bytes) < 0) goto fail;
+        if (write_all(fd, fb1_map + splash_rows * fb1_stride,
+                       frame_bytes - splash_rows * fb_w) < 0)
+            goto fail;
     } else {
-        for (y = 0; y < fb_h; y++)
+        for (y = splash_rows; y < fb_h; y++)
             if (write_all(fd, fb1_map + y * fb1_stride, fb_w) < 0) goto fail;
     }
     TCP_CORK_OFF(fd);
@@ -1303,6 +1380,592 @@ static int toggle_is_on(int x, int y)
 static int chord_assign_on(void)    { return toggle_is_on(CHORD_ASSIGN_PX, CHORD_ASSIGN_PY); }
 static int enable_pad_play_on(void) { return toggle_is_on(ENABLE_PAD_PLAY_PX, ENABLE_PAD_PLAY_PY); }
 static int fixed_velocity_on(void)  { return toggle_is_on(FIXED_VELOCITY_PX, FIXED_VELOCITY_PY); }
+
+/* UI mode detection - server-side port of KronosScreenRemote's
+ * Detection/ModeDetector.cs and Detection/CombiProgramEditDetector.cs, so the
+ * daemon becomes the source of truth for MODE/EDITCTX instead of every client
+ * re-deriving it from the streamed pixels on its own. Same reference pixel
+ * sets (mode_detect_refs.h, extracted from the client's own embedded PNGs),
+ * same per-channel tolerance and match-fraction thresholds - kept in lockstep
+ * deliberately so daemon and client never disagree about what "Combi mode"
+ * looks like.
+ *
+ * One deviation from the client: the client's LUT bakes in the user's
+ * brightness/contrast/gamma tone curve (MainWindow.Streaming.cs RebuildLut),
+ * which the daemon has no equivalent of. We score directly against pal_r/g/b
+ * - the raw hardware palette also used by toggle_is_on() above - i.e. the
+ * client's un-adjusted case. If a firmware/panel revision's native palette
+ * drifts enough to matter, widen MODE_MATCH_TOLERANCE rather than trying to
+ * reproduce the client's tone curve here. */
+#define MODE_MATCH_TOLERANCE   30      /* +/- per channel, matches client's ColorTolerance */
+#define MODE_MATCH_THRESHOLD   0.85    /* matches client's ModeDetector.ModeThreshold */
+#define EDIT_MATCH_THRESHOLD   0.98    /* matches client's CombiProgramEditDetector.MatchThreshold */
+
+static double mode_ref_score(const struct mode_px_ref *refs, int count)
+{
+    int i, matches = 0;
+    if (!fb1_map || !refs || count <= 0)
+        return 0.0;
+    for (i = 0; i < count; i++) {
+        const struct mode_px_ref *p = &refs[i];
+        unsigned char idx;
+        int lr, lg, lb;
+        if (p->x >= fb_w || p->y >= fb_h)
+            continue;
+        idx = fb1_map[(int)p->y * (int)fb1_stride + (int)p->x];
+        lr = pal_r[idx] >> 8;
+        lg = pal_g[idx] >> 8;
+        lb = pal_b[idx] >> 8;
+        if (abs(lr - p->r) <= MODE_MATCH_TOLERANCE &&
+                abs(lg - p->g) <= MODE_MATCH_TOLERANCE &&
+                abs(lb - p->b) <= MODE_MATCH_TOLERANCE)
+            matches++;
+    }
+    return (double)matches / (double)count;
+}
+
+/* Returns 1-7 (Setlist..Disk) for a confidently-matched mode banner, or 0 if
+ * none scores above threshold (e.g. mid-transition, or a dialog covers the
+ * top-left corner). Picks the single highest-scoring mode, same as the
+ * client's ModeDetector.Identify(). */
+static int detect_ui_mode(void)
+{
+    int m, best_mode = 0;
+    double best_score = MODE_MATCH_THRESHOLD;
+    for (m = 1; m <= 7; m++) {
+        double s = mode_ref_score(g_mode_refs[m], g_mode_ref_counts[m]);
+        if (s > best_score) { best_score = s; best_mode = m; }
+    }
+    return best_mode;
+}
+
+#define EDITCTX_NONE     0
+#define EDITCTX_COMBI    1
+#define EDITCTX_SEQUENCE 2
+
+/* Program-edit-in-context sub-state: MODE=3 (Program) but the top-right
+ * tempo-area widget at (696,39) is showing "COMBI" or "SEQ" instead of a
+ * tempo, meaning this Program is being edited from within a Combi/Song
+ * rather than standalone. See mode_detect_refs.h for why the Sequence case
+ * has no reference data yet (client-side never implemented it either) - it
+ * is wired up here so filling in g_seq_edit_ref later is a data-only change. */
+static int detect_program_edit_context(void)
+{
+    if (mode_ref_score(g_combi_edit_ref, g_combi_edit_ref_count) >= EDIT_MATCH_THRESHOLD)
+        return EDITCTX_COMBI;
+    if (g_seq_edit_ref_count > 0 &&
+            mode_ref_score(g_seq_edit_ref, g_seq_edit_ref_count) >= EDIT_MATCH_THRESHOLD)
+        return EDITCTX_SEQUENCE;
+    return EDITCTX_NONE;
+}
+
+/* Authoritative MODE= value: screen detection first, falling back to the
+ * last BUTTON-commanded mode (g_mode) only while detection is inconclusive.
+ * Keeps STATE/SYSINFO answering something sane through a brief transition
+ * frame instead of dropping back to 0/init every time the banner redraws.
+ *
+ * This is now the FALLBACK path, used only when eva_mode.ko isn't loaded or
+ * hasn't resolved yet - see get_mode_state() below, which prefers the
+ * eva_mode.ko reading (exact, no thresholds) and only calls this when that
+ * source is unavailable (e.g. early boot, before Eva has started). */
+static int current_ui_mode(void)
+{
+    int m = detect_ui_mode();
+    return m ? m : (int)g_mode;
+}
+
+/* eva_mode.ko's raw Eva ESysMode ordinal (0-6, Eva's own arbitrary C++ enum
+ * declaration order - see docs/EVA_ModeManager_probe.md) translated to this
+ * daemon's public MODE=1..7 wire numbering (see STATE's doc comment above
+ * and docs/api.md). Calibrated live against pixel ground truth 2026-07-17,
+ * every one of the 7 values independently confirmed. Index = raw SYS_MODE. */
+static const int g_eva_sysmode_to_pub[7] = {
+    3, /* 0 = Program  */
+    2, /* 1 = Combi    */
+    6, /* 2 = Global   */
+    7, /* 3 = Disk     */
+    4, /* 4 = Sequence */
+    5, /* 5 = Sampling */
+    1, /* 6 = Setlist  */
+};
+
+/* Reads eva_mode.ko's /proc/.eva_mode - a single line, read fresh every
+ * call (no caching), same live-read philosophy as on_pads_page()/
+ * toggle_is_on() against fb1_map. Returns 1 and fills *out_mode (public
+ * 1-7 numbering, already translated) / *out_editctx (0-2, no translation
+ * needed - eva_mode.ko's EDITCTX_RAW already matches this daemon's
+ * EDITCTX_NONE/COMBI/SEQUENCE numbering) on a resolved reading; returns 0
+ * (leaving both untouched) if eva_mode.ko isn't loaded, hasn't resolved yet
+ * (Eva not up), or reports a raw SYS_MODE outside the calibrated 0-6 range.
+ * out_slot is optional (pass NULL if the caller doesn't need it) - the
+ * timbre/track index being Program-edited, -1 when EDITCTX is none.
+ * out_pid is likewise optional - eva_mode.ko's EVA_PID, for callers that
+ * want to check Eva's process age (see eva_uptime_seconds()) without a
+ * second independent /proc scan. */
+static int eva_mode_read(int *out_mode, int *out_editctx, int *out_slot, int *out_pid)
+{
+    int fd, resolved = 0, sysmode = -1, editctx = 0, slot = -1, pid = -1;
+    char buf[128];
+    ssize_t n;
+
+    if (!g_eva_mode_loaded)
+        return 0;
+    fd = open("/proc/.eva_mode", O_RDONLY);
+    if (fd < 0)
+        return 0;
+    n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0)
+        return 0;
+    buf[n] = '\0';
+
+    if (sscanf(buf, "RESOLVED=%d EVA_PID=%d SYS_MODE=%d EDITCTX_RAW=%d EDITCTX_SLOT=%d",
+               &resolved, &pid, &sysmode, &editctx, &slot) != 5 || !resolved)
+        return 0;
+    if (sysmode < 0 || sysmode >= (int)(sizeof(g_eva_sysmode_to_pub) / sizeof(g_eva_sysmode_to_pub[0])))
+        return 0;
+    /* editctx gets the same treatment as sysmode above: out-of-range means
+     * something about the pointer chain read garbage, so treat the WHOLE
+     * reading as unresolved (both fields fall back to pixel detection
+     * together in get_mode_state()) rather than passing through a half-
+     * trusted value alongside a validated mode - "only lever pixel
+     * detection as a fallback if EVA fails for any reason" applies to a bad
+     * editctx exactly as much as a bad sysmode. */
+    if (editctx < EDITCTX_NONE || editctx > EDITCTX_SEQUENCE)
+        return 0;
+
+    *out_mode    = g_eva_sysmode_to_pub[sysmode];
+    *out_editctx = editctx;
+    if (out_slot)
+        *out_slot = slot;
+    if (out_pid)
+        *out_pid = pid;
+    return 1;
+}
+
+/* Single source of truth for MODE=/EDITCTX= everywhere they're reported
+ * (STATE, SYSINFO, MODE_DETAIL): prefers eva_mode.ko's direct memory read
+ * (exact - no color thresholds, and the only source that can ever report
+ * EDITCTX_SEQUENCE, since no pixel reference bitmap exists for it - see
+ * mode_detect_refs.h), falling back to framebuffer pixel detection when
+ * eva_mode.ko isn't loaded or hasn't resolved (e.g. early boot before Eva
+ * has started, or the kill-switch at /korg/rw/HD/_nomod prevented it from
+ * loading at all). *out_source is "eva" or "pixel", for MODE_DETAIL. */
+static void get_mode_state(int *out_mode, int *out_editctx, const char **out_source)
+{
+    if (eva_mode_read(out_mode, out_editctx, NULL, NULL)) {
+        *out_source = "eva";
+        return;
+    }
+    *out_mode    = current_ui_mode();
+    *out_editctx = detect_program_edit_context();
+    *out_source  = "pixel";
+}
+
+/* ── Boot-state gate ──────────────────────────────────────────────────────
+ * Goal: never let a client send an interactive command (touch/button/wheel/
+ * MIDI/etc.) while the Kronos OS is still booting - only the read-only
+ * allowlist (see is_readonly_cmd()) is answered during that window, and the
+ * decision is made entirely server-side (a client, especially one that just
+ * connected, has no way to tell "still booting" from "genuinely idle" on its
+ * own - that determination belongs to the daemon, not something every client
+ * has to re-derive).
+ *
+ * Root cause this defends against: eva_mode.ko's RESOLVED=1 only means the
+ * sm_poMMI->CMMI::modeManager pointer chain didn't hit NULL/out-of-bounds -
+ * it does NOT mean the CModeManager C++ object has finished constructing.
+ * Freshly-allocated-but-not-yet-constructed heap memory reads back as small
+ * ints, and SYS_MODE=0/EDITCTX_RAW=1 (-> MODE=3 EDITCTX=1, "Program edit
+ * while in Combi") is exactly what that looks like - a false-confident
+ * reading, not a real one. See docs/EVA_ModeManager_probe.md.
+ *
+ * Two independent, layered signals clear the gate; either is sufficient:
+ *
+ *   1. Debounced EVA_RESOLVED - eva_mode.ko must report RESOLVED=1 with the
+ *      SAME (SYS_MODE, EDITCTX_RAW) pair continuously for EVA_DEBOUNCE_MS.
+ *      A transient/garbage reading restarts the streak on every value
+ *      change, so real construction-in-progress churn is filtered before
+ *      the gate trusts it. Fast (typically clears within a second or two of
+ *      Eva actually finishing init) but not airtight - see the header
+ *      comment for the residual risk (static garbage that happens to read
+ *      the same value across the whole window).
+ *
+ *   2. Eva process-age override - independent of eva_mode.ko entirely (a
+ *      pure /proc scan, same "lowest PID" tie-break eva_mode.ko itself uses
+ *      to dodge the documented transient-same-named-process bug - see
+ *      docs/EVA_ModeManager_probe.md's "gotcha" section). Once the real Eva
+ *      process has been alive for EVA_BOOT_UPTIME_OVERRIDE_S, force the gate
+ *      open regardless of (1) - by then any construction-in-progress window
+ *      is certainly long past. Also the ONLY path that can ever clear the
+ *      gate when eva_mode.ko isn't loaded at all (kill-switch, or a load
+ *      failure) - without it, a unit missing eva_mode.ko would stay
+ *      permanently read-only, which would be a regression, not a safety
+ *      win.
+ *
+ * g_boot_active is a one-way latch: once cleared it stays cleared for the
+ * rest of this process's life. The OS doesn't "re-boot" without restarting
+ * screenremote itself (which resets every global fresh), so there is no
+ * legitimate reason for a mode/page change during normal operation to ever
+ * re-arm it. */
+#define EVA_DEBOUNCE_MS            600   /* min continuous stable RESOLVED=1 streak before trusted */
+#define EVA_CONFIRM_DELAY_MS       500   /* extra settle time + single re-check once debounce first passes */
+#define EVA_BOOT_UPTIME_OVERRIDE_S 180   /* Eva alive this long => gate opens unconditionally */
+
+static int g_boot_active = 1;   /* fail-safe: read-only until proven otherwise */
+
+/* Debounce streak state for signal (1) above. */
+static int             g_eva_streak_mode    = -1;
+static int             g_eva_streak_editctx = -1;
+static int             g_eva_streak_active  = 0;
+static struct timespec g_eva_streak_since;
+
+/* Scans /proc for the lowest-PID process with comm=="Eva" - same tie-break
+ * eva_mode.ko's find_eva_mm() uses, for the same reason (a transient
+ * same-named forked child, e.g. from a failed execl() in one of Eva's own
+ * USB/disk housekeeping helpers, always has a strictly higher PID than the
+ * real long-lived UI process - see docs/EVA_ModeManager_probe.md). Returns
+ * -1 if no such process exists yet (Eva hasn't been exec'd, i.e. very early
+ * boot). Deliberately independent of eva_mode.ko - this is the fallback
+ * path used when that module isn't loaded at all.
+ *
+ * Reads comm out of /proc/<pid>/stat's parenthesized field 2, NOT
+ * /proc/<pid>/comm - that file doesn't exist on this kernel (added in
+ * Linux 2.6.33; the Kronos runs 2.6.32.11-korg, see CLAUDE.md). Matches
+ * the FIRST '(' to the LAST ')' rather than splitting on whitespace, since
+ * comm can itself contain spaces/parens - same technique eva_uptime_seconds()
+ * below uses for the fields *after* comm, and what proc(5) itself
+ * recommends. */
+static int find_eva_pid(void)
+{
+    DIR *d = opendir("/proc");
+    struct dirent *de;
+    int best = -1;
+
+    if (!d)
+        return -1;
+    while ((de = readdir(d)) != NULL) {
+        int pid;
+        char path[64], buf[256], *lp, *rp;
+        FILE *f;
+
+        if (de->d_name[0] < '0' || de->d_name[0] > '9')
+            continue;
+        pid = atoi(de->d_name);
+        if (best >= 0 && pid >= best)
+            continue;   /* already have a lower candidate */
+        snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+        f = fopen(path, "r");
+        if (!f)
+            continue;
+        buf[0] = '\0';
+        fgets(buf, sizeof(buf), f);
+        fclose(f);
+        lp = strchr(buf, '(');
+        rp = strrchr(buf, ')');
+        if (!lp || !rp || rp <= lp)
+            continue;
+        if ((size_t)(rp - lp - 1) == 3 && strncmp(lp + 1, "Eva", 3) == 0)
+            best = pid;
+    }
+    closedir(d);
+    return best;
+}
+
+/* Seconds the given pid has been alive, via /proc/<pid>/stat field 22
+ * (starttime, in USER_HZ ticks since boot per proc(5) - sysconf(_SC_CLK_TCK)
+ * is always 100 on Linux regardless of the kernel's internal HZ, so no
+ * kernel-version-specific constant is needed) against /proc/uptime. Returns
+ * -1 if the process doesn't exist or either file can't be read/parsed. */
+static long eva_uptime_seconds(int pid)
+{
+    char path[64], buf[512];
+    FILE *f;
+    ssize_t n;
+    int fd;
+    char *rparen;
+    unsigned long long starttime = 0;
+    double sys_uptime = 0;
+    long clk_tck;
+    int i;
+    char *p;
+
+    if (pid <= 0)
+        return -1;
+
+    snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+    fd = open(path, O_RDONLY);
+    if (fd < 0)
+        return -1;
+    n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0)
+        return -1;
+    buf[n] = '\0';
+
+    /* comm (field 2) is inside parens and may itself contain spaces/parens -
+     * skip to the LAST ')' before splitting on whitespace, same technique
+     * proc(5) itself recommends. */
+    rparen = strrchr(buf, ')');
+    if (!rparen)
+        return -1;
+    p = rparen + 1;
+    /* Fields after comm, 1-indexed from field 3 (state) at *p: starttime is
+     * field 22, i.e. the 20th whitespace-separated token starting from p. */
+    for (i = 3; i < 22; i++) {
+        p = strchr(p, ' ');
+        if (!p)
+            return -1;
+        p++;
+    }
+    if (sscanf(p, "%llu", &starttime) != 1)
+        return -1;
+
+    f = fopen("/proc/uptime", "r");
+    if (!f)
+        return -1;
+    if (fscanf(f, "%lf", &sys_uptime) != 1) {
+        fclose(f);
+        return -1;
+    }
+    fclose(f);
+
+    clk_tck = sysconf(_SC_CLK_TCK);
+    if (clk_tck <= 0)
+        clk_tck = 100;
+
+    {
+        double eva_start_s = (double)starttime / (double)clk_tck;
+        double up = sys_uptime - eva_start_s;
+        return (up < 0) ? 0 : (long)up;
+    }
+}
+
+/* Called once per main-loop iteration (see main()) - cheap once latched
+ * (g_boot_active == 0 short-circuits immediately), so no throttling needed
+ * even though this runs far more often than eva_mode.ko's own /proc/.eva_mode
+ * changes. See the block comment above for the two signals and why either
+ * clears the gate. */
+static void update_boot_state(void)
+{
+    int mode = 0, editctx = 0, pid = -1, resolved;
+    struct timespec now;
+
+    if (!g_boot_active)
+        return;   /* one-way latch - nothing left to do */
+
+    resolved = eva_mode_read(&mode, &editctx, NULL, &pid);
+    clock_gettime(CLOCK_MONOTONIC, &now);
+
+    if (resolved) {
+        if (!g_eva_streak_active || mode != g_eva_streak_mode || editctx != g_eva_streak_editctx) {
+            g_eva_streak_active  = 1;
+            g_eva_streak_mode    = mode;
+            g_eva_streak_editctx = editctx;
+            g_eva_streak_since   = now;
+        } else {
+            long elapsed_ms = (now.tv_sec  - g_eva_streak_since.tv_sec)  * 1000 +
+                               (now.tv_nsec - g_eva_streak_since.tv_nsec) / 1000000;
+            if (elapsed_ms >= EVA_DEBOUNCE_MS) {
+                /* Debounce just passed - one more deliberate pause-and-recheck
+                 * before committing, on top of the debounce window itself.
+                 * Blocks the main loop for EVA_CONFIRM_DELAY_MS, but this
+                 * fires exactly once per boot and nothing interactive is
+                 * being served yet anyway (that's the whole point of the
+                 * gate still being closed) - a one-time, boot-only stall,
+                 * not a recurring cost. */
+                int cmode = 0, ceditctx = 0, cresolved;
+                fprintf(stderr, "screenremote: boot gate: eva_mode.ko debounced stable "
+                                 "(MODE=%d EDITCTX=%d), confirming after %dms...\n",
+                                 mode, editctx, EVA_CONFIRM_DELAY_MS);
+                usleep(EVA_CONFIRM_DELAY_MS * 1000);
+                cresolved = eva_mode_read(&cmode, &ceditctx, NULL, NULL);
+                if (cresolved && cmode == mode && ceditctx == editctx) {
+                    g_boot_active = 0;
+                    free(g_boot_splash); g_boot_splash = NULL;   /* no longer needed - see apply_boot_splash() */
+                    fprintf(stderr, "screenremote: boot gate cleared (eva_mode.ko confirmed stable, "
+                                     "MODE=%d EDITCTX=%d)\n", mode, editctx);
+                    return;
+                }
+                fprintf(stderr, "screenremote: boot gate: confirmation check failed (RESOLVED=%d "
+                                 "MODE=%d EDITCTX=%d) - resetting streak\n", cresolved, cmode, ceditctx);
+                g_eva_streak_active = 0;
+            }
+        }
+    } else {
+        g_eva_streak_active = 0;
+    }
+
+    /* Fallback/safety-net signal - independent of eva_mode.ko and of the
+     * debounce state above. */
+    if (pid < 0)
+        pid = find_eva_pid();
+    if (pid > 0) {
+        long up = eva_uptime_seconds(pid);
+        if (up >= EVA_BOOT_UPTIME_OVERRIDE_S) {
+            g_boot_active = 0;
+            free(g_boot_splash); g_boot_splash = NULL;
+            fprintf(stderr, "screenremote: boot gate cleared (Eva pid=%d alive %lds)\n", pid, up);
+        }
+    }
+}
+
+/* Commands answered regardless of ctrl ownership AND regardless of the boot
+ * gate above - see docs/api.md's "Read-only allowlist exception". Shared by
+ * the ctrl-accept path (ownership bypass) and process_ctrl_cmd() (boot-gate
+ * bypass) so the two can never drift apart. */
+static int is_readonly_cmd(const char *line)
+{
+    return strcmp(line, "LASTTOUCH") == 0 ||
+           strcmp(line, "PADMAP_LIST") == 0 ||
+           strcmp(line, "PADMAP_STATE") == 0 ||
+           strncmp(line, "PIXEL ", 6) == 0 ||
+           strncmp(line, "REGION ", 7) == 0 ||
+           strcmp(line, "PALETTE") == 0 ||
+           strcmp(line, "STATE") == 0 ||
+           strcmp(line, "MODE_DETAIL") == 0 ||
+           strcmp(line, "VERSION") == 0 ||
+           strcmp(line, "SYSINFO") == 0;
+}
+
+/* ── Boot splash compositing ──────────────────────────────────────────────
+ * During boot, /dev/fb1 itself only ever contains the green footer band's
+ * loading text (rows ~527-540) - the KORG wordmark, engine badges, and
+ * "KRONOS / MUSIC WORKSTATION" title lockup above it are rendered by the
+ * touch panel's OWN separate firmware/MCU directly onto the LCD, never
+ * written to fb1 at all (confirmed against OmapNKS4Module's video.cpp -
+ * SendFillData, the panel-local progress-bar opcode, never carries pixel
+ * data, and SendPixelDataRegion, the only opcode that does, only ever
+ * forwards whatever fb1 actually contains). So a client watching the raw
+ * fb1 stream during boot sees only scattered text on an otherwise-black
+ * frame - nothing like what's really on the physical screen.
+ *
+ * This composites a static copy of that background (extracted once, by
+ * hand, from a local KRONOS_Vxxxxx.VSB firmware image via
+ * tools/extract_boot_splash.py - see that script's own header for why it's
+ * neither run at build time nor committed anywhere: the bitmap is Korg's
+ * copyrighted artwork, not a protocol fact, matching kronosology's own
+ * stance in docs/modules/KRONOS_V06R06.VSB.md) under the live fb1 capture's
+ * top rows (row count comes from the asset file's own header, extracted as
+ * ~526 - up to but not including the green footer band), leaving every row
+ * from there down (the footer band and anything else) exactly as fb1
+ * itself reports it. Purely
+ * cosmetic - has no bearing on the BOOT= gate itself (see
+ * update_boot_state() above), which is what actually decides whether
+ * commands are accepted; this only affects what the video stream looks
+ * like while that gate is closed. */
+#define BOOT_SPLASH_PATH  LOG_DIR "/boot_splash.bin"   /* FTP-visible - user deploys by hand, see docs/api.md */
+#define BOOT_SPLASH_MAGIC "KSPL"
+#define BOOT_SPLASH_VERSION 1
+#define BOOT_SPLASH_MAX_ROWS 600   /* sanity cap - never more than a full frame */
+
+/* Validates a complete in-memory boot-splash asset - KSPL header followed
+ * immediately by its pixel bytes, exactly BOOT_SPLASH_PATH's own on-disk
+ * layout (see docs/api.md's "Boot splash" section) - and, if it checks
+ * out, mallocs a copy of just the pixel portion into g_boot_splash/_w/
+ * _rows. Shared by both sources load_boot_splash() below tries (the
+ * on-device file, and the optional compile-time embedded fallback) so
+ * validation can never drift between the two - a caller only needs to
+ * hand it bytes+length, regardless of where they came from. `source` is
+ * just for the log line. Returns 1 on success, 0 on any rejection
+ * (already logged to stderr). */
+static int parse_boot_splash_buf(const uint8_t *buf, size_t len, const char *source)
+{
+    uint32_t w, rows, pixels;
+    uint8_t *copy;
+
+    if (len < 9) {
+        fprintf(stderr, "screenremote: %s too short for a boot-splash header, ignoring\n", source);
+        return 0;
+    }
+    if (memcmp(buf, BOOT_SPLASH_MAGIC, 4) != 0 || buf[4] != BOOT_SPLASH_VERSION) {
+        fprintf(stderr, "screenremote: %s has wrong magic/version, ignoring\n", source);
+        return 0;
+    }
+    w    = buf[5] | (buf[6] << 8);
+    rows = buf[7] | (buf[8] << 8);
+    if (w != fb_w || rows == 0 || rows > BOOT_SPLASH_MAX_ROWS || rows > fb_h) {
+        fprintf(stderr, "screenremote: %s dimensions %ux%u don't match fb1 %ux%u, ignoring\n",
+                source, w, rows, fb_w, fb_h);
+        return 0;
+    }
+    pixels = w * rows;
+    if (len != 9 + (size_t)pixels) {
+        fprintf(stderr, "screenremote: %s size doesn't match its own header, ignoring\n", source);
+        return 0;
+    }
+    copy = malloc(pixels);
+    if (!copy)
+        return 0;
+    memcpy(copy, buf + 9, pixels);
+
+    g_boot_splash      = copy;
+    g_boot_splash_w    = w;
+    g_boot_splash_rows = rows;
+    fprintf(stderr, "screenremote: boot splash loaded from %s (%ux%u)\n", source, w, rows);
+    return 1;
+}
+
+/* Called once at startup, after fb1_open() has established fb_w/fb_h.
+ * Prefers the on-device file (BOOT_SPLASH_PATH) so it can be swapped out
+ * live during calibration without a daemon rebuild; falls back to the
+ * compile-time embedded copy (if this build has one - see
+ * HAVE_EMBEDDED_BOOT_SPLASH above) when that file is missing or fails
+ * validation. Neither source available is not an error - compositing
+ * simply stays off and the client sees the plain (mostly-black) live fb1
+ * capture during boot, same as before this feature existed. */
+static void load_boot_splash(void)
+{
+    int fd;
+    struct stat st;
+    uint8_t *filebuf;
+
+    fd = open(BOOT_SPLASH_PATH, O_RDONLY);
+    if (fd >= 0) {
+        if (fstat(fd, &st) == 0 && st.st_size > 0 && st.st_size <= 8 * 1024 * 1024) {
+            filebuf = malloc((size_t)st.st_size);
+            if (filebuf) {
+                if (read(fd, filebuf, (size_t)st.st_size) == st.st_size &&
+                        parse_boot_splash_buf(filebuf, (size_t)st.st_size, BOOT_SPLASH_PATH)) {
+                    free(filebuf);
+                    close(fd);
+                    return;
+                }
+                free(filebuf);
+            }
+        }
+        close(fd);
+    }
+
+#ifdef HAVE_EMBEDDED_BOOT_SPLASH
+    parse_boot_splash_buf(boot_splash_data, boot_splash_data_len, "<embedded boot_splash_data.h>");
+#endif
+}
+
+/* How many leading rows of an outgoing frame should come from the boot
+ * splash instead of live fb1 right now - shared by every frame-send path
+ * (capture_to_staging()'s change-mode compositor below, AND send_frame()'s
+ * pull-mode direct sender - see its own comment for why it needs this too)
+ * so none of them can independently disagree about whether/how much to
+ * substitute. 0 means "use fb1 for every row", the steady-state case once
+ * the boot gate clears. Never touches fb1_map itself - eva_mode.ko/
+ * pixel-based mode detection (both of which read fb1_map directly) keep
+ * seeing the real, truthful capture regardless of what any outgoing
+ * stream shows. */
+static uint32_t boot_splash_active_rows(void)
+{
+    if (!g_boot_active || !g_boot_splash || g_boot_splash_w != fb_w)
+        return 0;
+    return g_boot_splash_rows;
+}
+
+/* Composites the loaded splash (if any) into the top rows of an already-
+ * fb1-filled staging buffer. Called from capture_to_staging() only. */
+static void apply_boot_splash(uint8_t *buf)
+{
+    uint32_t rows = boot_splash_active_rows();
+    if (rows)
+        memcpy(buf, g_boot_splash, (size_t)g_boot_splash_w * rows);
+}
 
 /* eSTGAnalogDeviceCode raw byte packing, derived from ShortInvertNkS4AnalogValue's
  * own disassembly: with byte1=0, ebx = byte0*4 exactly (the AND-0x3f8-then-
@@ -1842,8 +2505,18 @@ static int sysinfo_collect(char *out, int outsz)
         }
     }
 
-    /* Mode */
-    SI_APPEND("MODE=%u\n", (unsigned)g_mode);
+    /* Mode - forced to the safe 0/0 "unknown"/"none" sentinels during boot,
+     * same reasoning as STATE/MODE_DETAIL's own boot handling. */
+    {
+        int _mode, _editctx; const char *_src;
+        get_mode_state(&_mode, &_editctx, &_src);
+        if (g_boot_active) { _mode = 0; _editctx = 0; }
+        SI_APPEND("MODE=%u\n", (unsigned)_mode);
+        SI_APPEND("EDITCTX=%d\n", _editctx);
+    }
+
+    /* Boot gate - see update_boot_state() */
+    SI_APPEND("BOOT=%d\n", g_boot_active);
 
     SI_APPEND("OK\n");
 #undef SI_APPEND
@@ -2370,6 +3043,40 @@ static void process_ctrl_cmd(const char *line, int fd)
 {
 #define REPLY(msg, len) do { if (fd >= 0) write_all(fd, (msg), (len)); } while (0)
 
+    /* Hard read-only enforcement during boot (see update_boot_state()'s block
+     * comment) - every mutating command is rejected here, uniformly, whether
+     * it arrived through the one-shot accept path or an already-established
+     * CTRL_PERSIST session. The read-only allowlist itself still answers
+     * normally (STATE/MODE_DETAIL/SYSINFO in particular are how a client
+     * finds out BOOT= cleared). */
+    if (g_boot_active && !is_readonly_cmd(line)) {
+        REPLY("ERR BOOTING\n", 12);
+        return;
+    }
+
+    /* The rest of the read-only allowlist doesn't need to stay answerable
+     * during boot the way STATE/MODE_DETAIL/SYSINFO do (those three are
+     * how a client polls for BOOT to clear, and null out their synth-state
+     * fields individually instead - see their own handlers below).
+     * LASTTOUCH/PADMAP_LIST/PADMAP_STATE/PIXEL/REGION all report on touch/
+     * pad/pixel activity that's either meaningless (no legitimate touch
+     * input exists while BOOT=1, since that's mutating and already
+     * rejected above) or, for PIXEL/REGION, could otherwise be read as a
+     * claim about live UI content that isn't trustworthy yet. PALETTE and
+     * VERSION are deliberately exempt - PALETTE is a fixed lookup table a
+     * client needs just to decode the video stream at all (boot splash
+     * included), and VERSION is static build metadata, neither is synth
+     * state. */
+    if (g_boot_active &&
+            (strcmp(line, "LASTTOUCH") == 0 ||
+             strcmp(line, "PADMAP_LIST") == 0 ||
+             strcmp(line, "PADMAP_STATE") == 0 ||
+             strncmp(line, "PIXEL ", 6) == 0 ||
+             strncmp(line, "REGION ", 7) == 0)) {
+        REPLY("ERR BOOTING\n", 12);
+        return;
+    }
+
     if (strcmp(line, "MIRROR_ON") == 0) {
         int f = open(MIRROR_FLAG, O_CREAT | O_WRONLY, 0644);
         if (f >= 0) close(f);
@@ -2894,8 +3601,48 @@ static void process_ctrl_cmd(const char *line, int fd)
         REPLY("OK\n", 3);
 
     } else if (strcmp(line, "STATE") == 0) {
-        char resp[16];
-        int  rlen = snprintf(resp, sizeof(resp), "MODE=%u\n", (unsigned)g_mode);
+        char resp[48];
+        int  rlen, mode, editctx; const char *src;
+        get_mode_state(&mode, &editctx, &src);
+        /* Don't report synth state we don't trust yet - see update_boot_state()'s
+         * block comment for exactly why a raw eva_mode.ko/pixel reading can look
+         * confidently wrong during this window (this is the false MODE=3
+         * EDITCTX=1 "Program edit while in Combi" a client would otherwise see
+         * on every boot). MODE=0/EDITCTX=0 reuse this wire format's own
+         * pre-existing "unknown"/"none" sentinels - not new values, just forced
+         * regardless of what was actually read. BOOT itself always stays
+         * accurate - it's how a client knows to stop trusting 0/0 as a real
+         * reading and start polling again. */
+        if (g_boot_active) { mode = 0; editctx = 0; }
+        rlen = snprintf(resp, sizeof(resp), "MODE=%u EDITCTX=%d BOOT=%d\n",
+                         (unsigned)mode, editctx, g_boot_active);
+        REPLY(resp, (size_t)rlen);
+
+    } else if (strcmp(line, "MODE_DETAIL") == 0) {
+        /* Richer counterpart to STATE, same spirit as PADMAP_STATE alongside
+         * PADMAP_* - exposes which source answered (eva_mode.ko's direct
+         * memory read vs. framebuffer pixel fallback) and the edit-context
+         * timbre/track slot, for callers that want to know more than just
+         * the two STATE fields, or want to confirm eva_mode.ko is actually
+         * in play rather than the pixel fallback. BOOT is the same
+         * server-side boot gate STATE reports - see update_boot_state(). */
+        char resp[128];
+        int  rlen, mode, editctx, eva_mode2 = 0, eva_editctx2 = 0, eva_slot = -1;
+        const char *src;
+        int eva_resolved = eva_mode_read(&eva_mode2, &eva_editctx2, &eva_slot, NULL);
+        get_mode_state(&mode, &editctx, &src);
+        /* Same reasoning as STATE above - MODE/EDITCTX/EDITSLOT/SOURCE are
+         * the fields that describe synth state a client could act on, so
+         * they're forced to safe values during boot. EVA_LOADED/EVA_RESOLVED
+         * are left as real live values on purpose - they describe the boot
+         * gate's OWN progress (is eva_mode.ko loaded, has it resolved a
+         * reading at all), which is exactly what this command exists to let
+         * a caller watch, not synth state the client could mistakenly act on. */
+        if (g_boot_active) { mode = 0; editctx = 0; src = "none"; eva_slot = -1; }
+        rlen = snprintf(resp, sizeof(resp),
+                         "SOURCE=%s MODE=%u EDITCTX=%d EDITSLOT=%d EVA_LOADED=%d EVA_RESOLVED=%d BOOT=%d\n",
+                         src, (unsigned)mode, editctx,
+                         eva_resolved ? eva_slot : -1, g_eva_mode_loaded, eva_resolved, g_boot_active);
         REPLY(resp, (size_t)rlen);
 
     } else if (strcmp(line, "VERSION") == 0) {
@@ -3141,6 +3888,7 @@ static int capture_to_staging(void)
             memcpy(staging + y * fb_w,
                    fb1_map + y * fb1_stride, fb_w);
     }
+    apply_boot_splash(staging);   /* no-op once BOOT= clears or nothing loaded */
     if (!shadow_valid) return 1;
     return memcmp(staging, shadow, frame_bytes) != 0;
 }
@@ -3461,7 +4209,7 @@ int main(void)
     int stream_listen, ctrl_listen, disc_fd = -1, client_fd = -1;
     /* ctrl_fd and ctrl_lb* are file-scope globals (see top of file) */
     uint8_t client_mode = MODE_CHANGE, client_fps = FPS_MAX;
-    time_t last_mirror_chk = 0, last_net_chk = 0, last_eva_chk = 0;
+    time_t last_mirror_chk = 0, last_net_chk = 0, last_eva_chk = 0, last_boot_chk = 0;
     time_t last_nks4_chk = 0;          /* throttle deferred nks4_inject retry (1/s) */
     time_t nks4_retry_t0 = 0;          /* when deferred retry began - give-up anchor */
     time_t g_start_time = time(NULL);  /* for FBCURVE relative timestamps */
@@ -3562,6 +4310,23 @@ int main(void)
         }
         set_cloexec(vkbd_fd);
 
+        /* Eva mode-state module: safe to load this early, unlike nks4_inject/
+         * midi_bridge below it - it has no dependency on OA.ko being Live and
+         * no dependency on Eva having started either. It resolves lazily on
+         * every /proc/.eva_mode read (find_eva_mm() re-scans the process list
+         * each time - see eva_mode.c), so loading it before Eva exists just
+         * means early STATE/SYSINFO/MODE_DETAIL queries see EVA_RESOLVED=0
+         * and fall back to pixel detection (get_mode_state()) until Eva comes
+         * up - no retry/deferred-load plumbing needed here at all. */
+        {
+            extract_ko(EVA_MODE_KO, eva_mode_ko, eva_mode_ko_len);
+            long _emret = syscall(SYS_init_module, (void *)eva_mode_ko,
+                                   (unsigned long)eva_mode_ko_len, "");
+            g_eva_mode_loaded = (_emret == 0 || errno == EEXIST);
+            fprintf(stderr, "screenremote: eva_mode %s\n",
+                    g_eva_mode_loaded ? "loaded" : "load failed - falling back to pixel mode detection");
+        }
+
         /* Front-panel injection module: safe to load this early too (see
          * try_load_nks4_inject()'s own comment for why it doesn't need to wait
          * for EVA like midi_bridge does) - BUTTON/TOUCH/WHEEL/SLIDER/KNOB/
@@ -3623,6 +4388,7 @@ int main(void)
         }
     }
     if (fb1_open() < 0) { graceful_shutdown(kmsg_pid); return 1; }
+    load_boot_splash();   /* optional - missing/invalid file just leaves compositing off */
 
     shadow = malloc(frame_bytes);
     if (!shadow) { perror("malloc shadow"); graceful_shutdown(kmsg_pid); return 1; }
@@ -3701,6 +4467,16 @@ int main(void)
          * set while a controller's final value is still held, so we shorten the
          * select() timeout below to deliver it promptly. */
         int cc_pending = cc_flush();
+
+        /* Boot-state gate - see update_boot_state()'s block comment. Throttled
+         * to 1/s (plenty for its 600ms debounce window - the streak clock is
+         * wall-clock-driven via clock_gettime(), not tied to poll cadence) and
+         * self-disables once latched (g_boot_active goes 0 and this whole
+         * block stops firing). */
+        if (g_boot_active && now - last_boot_chk >= 1) {
+            update_boot_state();
+            last_boot_chk = now;
+        }
 
         /* Periodic mirror flag check */
         if (now - last_mirror_chk >= 1) {
@@ -4059,15 +4835,7 @@ int main(void)
                     struct timeval zero = {0, 0};
                     setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &zero, sizeof(zero));
 
-                    int is_readonly = (strcmp(firstline, "LASTTOUCH") == 0 ||
-                                        strcmp(firstline, "PADMAP_LIST") == 0 ||
-                                        strcmp(firstline, "PADMAP_STATE") == 0 ||
-                                        strncmp(firstline, "PIXEL ", 6) == 0 ||
-                                        strncmp(firstline, "REGION ", 7) == 0 ||
-                                        strcmp(firstline, "PALETTE") == 0 ||
-                                        strcmp(firstline, "STATE") == 0 ||
-                                        strcmp(firstline, "VERSION") == 0 ||
-                                        strcmp(firstline, "SYSINFO") == 0);
+                    int is_readonly = is_readonly_cmd(firstline);
                     int owned = (g_ctrl_allowed_ip != 0 &&
                                  cpeer.sin_addr.s_addr == g_ctrl_allowed_ip);
 

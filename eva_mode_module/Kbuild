@@ -1,0 +1,2 @@
+obj-m += eva_mode.o
+EXTRA_CFLAGS := -fno-pic -fno-PIE -fno-common -include $(src)/../source/no_tracepoints.h

@@ -222,7 +222,7 @@ The daemon enforces a strict IP-based access control rule for commands that muta
 
 A client must authenticate on the stream port before it can use ownership-gated control commands.
 
-**Read-only allowlist exception.** A short list of read-only, informational commands - `LASTTOUCH`, `PADMAP_LIST`, `PADMAP_STATE`, `PIXEL`, `REGION`, `PALETTE`, `STATE`, `VERSION`, `SYSINFO` - is answered from **any** IP, regardless of whether a stream client is connected or who owns it, and never upgrades to a persistent (`CTRL_PERSIST`) session. This lets a diagnostic/calibration tool (or a second observer) read live state concurrently with the owning client's own session. Every other command - anything that touches touch/button/wheel/slider/knob/MIDI injection, or `CTRL_PERSIST` itself - remains ownership-gated as above.
+**Read-only allowlist exception.** A short list of read-only, informational commands - `LASTTOUCH`, `PADMAP_LIST`, `PADMAP_STATE`, `PIXEL`, `REGION`, `PALETTE`, `STATE`, `MODE_DETAIL`, `VERSION`, `SYSINFO` - is answered from **any** IP, regardless of whether a stream client is connected or who owns it, and never upgrades to a persistent (`CTRL_PERSIST`) session. This lets a diagnostic/calibration tool (or a second observer) read live state concurrently with the owning client's own session. Every other command - anything that touches touch/button/wheel/slider/knob/MIDI injection, or `CTRL_PERSIST` itself - remains ownership-gated as above. Ownership-exemption and boot-time behavior are two separate things, though - see "Boot gate" below for which of these keep answering (and how) while the Kronos is still booting.
 
 ### 5.3 Command format
 
@@ -846,7 +846,7 @@ Query the current Kronos operating mode.
 
 ```
 Request:  STATE\n
-Response: MODE=<n>\n
+Response: MODE=<n> EDITCTX=<e> BOOT=<0|1>\n
 ```
 
 | Value | Mode |
@@ -860,7 +860,93 @@ Response: MODE=<n>\n
 | 6 | Global |
 | 7 | Disk |
 
-The daemon updates its mode state whenever a `BUTTON` command targets a mode-select button. It does not read mode state from the hardware directly; the value reflects the last mode change issued through the control port, defaulting to 0 (Init) on startup.
+`MODE` and `EDITCTX` are read live via a two-source priority order (see `get_mode_state()` in `screenremote.c`):
+
+1. **Primary: `eva_mode.ko`.** A small kernel module (`eva_mode_module/eva_mode.c`), loaded at startup alongside `vkbd.ko`, that reads Eva's own live `CModeManager` object directly out of its process memory (the same singleton chain the front-panel UI itself uses: `sm_poMMI -> CMMI::modeManager -> CModeManager`). This is exact - no color thresholds, no reference bitmaps, and it's the only source that can report `EDITCTX=2`. Every `SYS_MODE`/`EDITCTX_RAW` value was independently confirmed live against pixel ground truth on 2026-07-17 (see `docs/EVA_ModeManager_probe.md` for the full calibration session) before this was wired in as the primary source.
+2. **Fallback: framebuffer pixel detection.** Used only when `eva_mode.ko` isn't loaded or hasn't resolved yet (e.g. early boot, before Eva has started, or the module kill-switch prevented it loading at all) - a server-side port of the C# client's `Detection/ModeDetector.cs`/`Detection/CombiProgramEditDetector.cs` (see `mode_detect_refs.h`/`detect_ui_mode()`/`detect_program_edit_context()`), scoring the top-left 140x55 mode banner and the (696,39) tempo-area widget against reference pixel sets extracted from the same PNGs the client embeds (±30-per-channel tolerance, 85%/98% match thresholds). In this path, `MODE` additionally falls back to the last mode set via a `BUTTON` mode-select command if detection is inconclusive for a given frame.
+
+Either way, this makes the daemon itself the source of truth for mode state - no client-side screen comparison, no MIDI/SysEx dependency, and it reflects mode changes made directly on the physical hardware, not just ones issued through this control port. `MODE` only reports 0 if no source has a value yet (fresh boot, both paths not yet resolved).
+
+| Value | EDITCTX |
+|-------|---------|
+| 0 | None |
+| 1 | Program-edit-from-Combi |
+| 2 | Program-edit-from-Sequence |
+
+`EDITCTX` flags the case where `MODE=3` (Program) but the top-right tempo-area widget is showing "COMBI" or "SEQ" instead of a tempo value, meaning the Program being edited was reached from inside a Combi or a Song, not selected standalone. `EDITCTX=2` (Sequence) is fully supported via the `eva_mode.ko` primary path (confirmed live 2026-07-17) - it's only the pixel *fallback* path that can't detect it (the client never captured a reference bitmap for that case either), so `EDITCTX=2` is only unreachable if `eva_mode.ko` isn't loaded/resolved.
+
+`BOOT` is the server-side boot gate (see "Boot gate" below) - `1` means the daemon does not yet consider the OS/UI genuinely up, and every mutating command is being rejected with `ERR BOOTING`. **While `BOOT=1`, `MODE` and `EDITCTX` are always forced to `0`** (their own pre-existing "unknown"/"none" values), regardless of what `eva_mode.ko`/the pixel fallback actually read - both can report confident-looking but wrong values during this window (that's the whole reason the gate exists), so the daemon never hands that reading to a caller at all rather than trusting the caller to notice `BOOT=1` and discard it itself. Poll `STATE` again once `BOOT` reads `0` for the real value.
+
+---
+
+### MODE_DETAIL
+
+Richer counterpart to `STATE` - same relationship as `PADMAP_STATE` to `PADMAP_*`.
+
+```
+Request:  MODE_DETAIL\n
+Response: SOURCE=<eva|pixel|none> MODE=<n> EDITCTX=<e> EDITSLOT=<s> EVA_LOADED=<0|1> EVA_RESOLVED=<0|1> BOOT=<0|1>\n
+```
+
+| Field | Meaning |
+|-------|---------|
+| `SOURCE` | Which path actually answered `MODE`/`EDITCTX` this call - `eva` (the `eva_mode.ko` primary source), `pixel` (the framebuffer fallback), or `none` while `BOOT=1` (see below - neither source is trusted yet, so neither gets to claim credit for the forced `0` values) |
+| `MODE` | Same values/meaning as `STATE`'s `MODE` - forced to `0` while `BOOT=1`, same as `STATE` |
+| `EDITCTX` | Same values/meaning as `STATE`'s `EDITCTX` - forced to `0` while `BOOT=1`, same as `STATE` |
+| `EDITSLOT` | Timbre/track index being Program-edited (0-based), or `-1` if `EDITCTX=0`, `eva_mode.ko` hasn't resolved, or `BOOT=1` - only ever meaningful when `SOURCE=eva` |
+| `EVA_LOADED` | `1` if `eva_mode.ko` is loaded (regardless of whether it's currently resolved) - real value even while `BOOT=1`, see below |
+| `EVA_RESOLVED` | `1` if `eva_mode.ko` is loaded *and* successfully read Eva's mode state on this call (a single snapshot - NOT the same as `BOOT` clearing, which additionally requires that reading to hold stable for `EVA_DEBOUNCE_MS` plus survive a further confirmation check, see "Boot gate" below) - real value even while `BOOT=1`, see below |
+| `BOOT` | Same server-side boot gate `STATE` reports |
+
+Use this instead of `STATE` when a caller needs to know whether it's getting the exact `eva_mode.ko` reading or the pixel-fallback approximation - e.g. diagnosing why `EDITCTX` never shows `2`, or confirming `eva_mode.ko` came up successfully after a boot.
+
+Unlike `MODE`/`EDITCTX`/`EDITSLOT`/`SOURCE` (forced to safe values while `BOOT=1` - see "Boot gate" below), `EVA_LOADED`/`EVA_RESOLVED` are deliberately left as real live values during boot: they describe the gate's *own* progress (has the module loaded, has it managed a reading at all) rather than synth state a caller could mistakenly act on, and watching them is exactly how you'd debug the gate itself failing to clear.
+
+---
+
+### Boot gate
+
+The daemon itself decides whether the Kronos OS/UI is genuinely up, rather than leaving that determination to each client - a freshly-connected client has no way to distinguish "still booting" from "genuinely idle" on its own, and inferring it independently from `MODE`/`EDITCTX` is actively unsafe during the boot window (see below). While the gate is closed (`BOOT=1`), `process_ctrl_cmd()` rejects every command that is not on the read-only allowlist (the same list "Read-only allowlist exception" above describes) with:
+
+```
+Response: ERR BOOTING\n
+```
+
+Within the read-only allowlist itself, only `STATE`/`MODE_DETAIL`/`SYSINFO` (and `PALETTE`/`VERSION`, which aren't synth state at all - `PALETTE` in particular is what a client needs just to decode the video stream, boot splash included) stay answerable during boot - `LASTTOUCH`/`PADMAP_LIST`/`PADMAP_STATE`/`PIXEL`/`REGION` also get `ERR BOOTING` while `BOOT=1`, since none of them need to stay pollable for boot-completion detection the way `STATE` does, and PIXEL/REGION in particular could otherwise be read as a claim about live UI content that isn't trustworthy yet. `STATE`/`MODE_DETAIL`/`SYSINFO` keep answering, but with `MODE`/`EDITCTX` (and `MODE_DETAIL`'s `EDITSLOT`/`SOURCE`) forced to safe values rather than whatever was actually read - see each command's own doc above. The screen stream and these three queries are how a client discovers the moment `BOOT` clears.
+
+**Why this exists.** `eva_mode.ko`'s `RESOLVED=1` only means the `sm_poMMI->CMMI::modeManager` pointer chain didn't hit NULL/out-of-bounds - it does not mean the `CModeManager` object has finished constructing. Freshly-allocated-but-not-yet-constructed heap memory reads back as small integers, and `SYS_MODE=0`/`EDITCTX_RAW=1` decode to exactly `MODE=3 EDITCTX=1` ("Program edit while in Combi") - a false-confident reading that looks identical to a real one from the wire format alone. `BOOT` exists specifically to keep that window from ever reaching a client as if it were real state, and to keep it from accepting interactive commands (touch/button/wheel/MIDI/etc.) while nothing meaningful exists yet to receive them.
+
+**How the gate clears** (`update_boot_state()` in `screenremote.c`, polled once/sec while `BOOT=1`, not called at all once cleared - it's a one-way latch for the life of the process):
+
+1. **Debounced `eva_mode.ko` reading, plus a confirmation re-check.** `RESOLVED=1` with the same `(SYS_MODE, EDITCTX_RAW)` pair held continuously for `EVA_DEBOUNCE_MS` (600ms) - any change restarts the streak, which filters out most construction-in-progress churn. The moment that debounce window is first satisfied, the daemon doesn't clear the gate immediately: it logs the detection, sleeps `EVA_CONFIRM_DELAY_MS` (500ms - a deliberate, one-time block of the main loop, safe here since nothing interactive is being served yet anyway), then re-reads `eva_mode.ko` exactly once more. Only if that single re-check still shows the same `RESOLVED=1`/`(SYS_MODE, EDITCTX_RAW)` does the gate actually clear; otherwise the streak resets and debouncing starts over. Typically clears within a couple of seconds of Eva actually finishing initialization.
+2. **Eva process-age override.** Independent of `eva_mode.ko` entirely - a plain `/proc` scan for the lowest-PID process named `Eva` (the same tie-break `eva_mode.ko`'s own `find_eva_mm()` uses, to dodge the transient-same-named-process bug documented in `docs/EVA_ModeManager_probe.md`), checked against `/proc/<pid>/stat`'s `starttime`. Once that process has been alive for `EVA_BOOT_UPTIME_OVERRIDE_S` (180s), the gate opens unconditionally regardless of (1). This is also the *only* path that can clear the gate when `eva_mode.ko` isn't loaded at all (kill-switch, or a load failure) - without it, a unit missing that module would stay permanently read-only.
+
+Either signal is sufficient. Both are heuristics, not a true "construction complete" signal from Eva itself (no such signal exists anywhere in the driver/OS stack - see `docs/EVA_ModeManager_probe.md` and the OmapNKS4 driver research it links) - but layering a fast content-based check with a slow, content-independent wall-clock backstop keeps the window where either could be fooled very small.
+
+---
+
+### Boot splash
+
+Purely cosmetic, and entirely separate from the safety-critical `BOOT` gate above (this affects only what the video stream *looks like* while `BOOT=1`; it has no bearing on which commands are accepted).
+
+**The problem.** `/dev/fb1` genuinely doesn't contain the boot background during boot - only the green footer band's loading text (rows ~527-540). The KORG wordmark, engine badges, and "KRONOS / MUSIC WORKSTATION" title lockup are rendered by the touch panel's own separate firmware/MCU directly onto the physical LCD, never written to fb1 at all - confirmed against the reconstructed `OmapNKS4Module` driver (`kronosology/reconstructed/OmapNKS4Module/video.cpp`): the panel-local progress-bar opcode (`SendFillData`) never carries pixel data, and the only opcode that does (`SendPixelDataRegion`) only ever forwards whatever fb1 actually contains. So a client watching the raw stream during boot sees scattered text on an otherwise-black frame, nothing like the real screen.
+
+**The fix.** `screenremote.c` composites a static copy of that background under the live fb1 capture's top rows (`apply_boot_splash()`, called from `capture_to_staging()`) whenever `BOOT=1` and the asset is loaded - every row from there down (the footer band and anything else) is left exactly as fb1 itself reports it, so the real live loading text still comes through correctly. This never touches `fb1_map` itself, only the outgoing copy - `eva_mode.ko`/pixel-based mode detection keep reading the real, unmodified capture regardless.
+
+**The asset is never committed to git**, matching `kronosology`'s own stance on this bitmap (see `kronosology/docs/modules/KRONOS_V06R06.VSB.md`'s "Boot splash resource" section) - it's Korg's copyrighted artwork, not a protocol fact. The daemon reads it at startup from a file the user deploys onto the Kronos's own filesystem by hand:
+
+| | |
+|---|---|
+| Path | `/korg/rw/HD/ScreenRemote/boot_splash.bin` (FTP-visible, same directory as the other user-managed files like `.boot`) |
+| Format | 9-byte header (`"KSPL"` magic, 1-byte version, width/height as LE u16) followed by raw 8bpp palette-index pixel bytes, width×height of them, indexed against this daemon's own live-captured palette (`source/palette_data.h`) - no separate palette ships with it |
+| Generated by | `tools/extract_boot_splash.py <path-to-VSB> <output.bin> [rows]` - run by hand against your own local `KRONOS_Vxxxxx.VSB` firmware image, not part of the build |
+| Missing/invalid file | Not an error - `load_boot_splash()`/`parse_boot_splash_buf()` log to stderr and compositing simply stays off; the client sees the plain live fb1 capture during boot, same as before this feature existed |
+
+**Interim compile-time embedded fallback.** While the extraction offset/alignment is still being calibrated (see the correction history below - it took two rounds to get right), re-deploying a separate `boot_splash.bin` after every tweak is slower than it needs to be. `tools/extract_boot_splash.py --header <path>` emits the identical bytes as a plain C byte array instead (or as well - `--bmp`/`--header` both stack with the required `.bin` output), for `#include`-ing directly into `screenremote.c` as `source/boot_splash_data.h` - same `xxd -i`-style embedding convention as this project's other generated headers (`vkbd_ko.h`, `midi_bridge_ko.h`, etc), and still gitignored, still never committed, for the same copyright reason as the on-device file. `load_boot_splash()` tries the on-device file first (so a quick recalibration only needs a file swap, no rebuild) and falls back to this embedded copy only if that file is missing or fails validation - so a build with `source/boot_splash_data.h` present composites correctly straight out of a single `scp screenremote` deploy, with no separate asset file needed at all. Guarded by `__has_include("boot_splash_data.h")` (a GCC extension, available since GCC 5), so a fresh checkout with no generated header builds identically to before this feature existed. Once the offset is fully settled this fallback can be dropped again in favor of the on-device file exclusively.
+
+`extract_boot_splash.py` also remaps the source firmware's own embedded palette (a 768-byte table sitting immediately before the bitmap in the VSB) onto `kronos_palette`'s indices via nearest-RGB matching, so the composited region renders correctly through the exact same `PALETTE`-derived LUT every client already uses - no client-side changes needed. The two palettes are 229/256 byte-identical in practice (per `KRONOS_V06R06.VSB.md`'s own cross-check), so only a couple dozen indices ever need real remapping.
+
+**A note on the VSB's splash offset.** `KRONOS_V06R06.VSB.md` originally documented the splash bitmap at payload offset `0x32800`. That offset renders as a horizontally-rolled image - every row starts partway into its true content and wraps, so the badge row and title lockup each appear as two swapped half-width copies side by side (e.g. `AL-1` wrapping around to sit next to `MS-20ex` instead of ending against a black margin). Fixing that (checking that the KORG wordmark and the KRONOS/MUSIC WORKSTATION title lockup both land within a pixel of dead-center against a real device photo, `BootScreen/Main.png`) landed on `0x326b5` (`0x32800 - 331`) - correct horizontally, but it placed the top of the KORG lettering flush against row 0, when on the real screen it sits 68px down. Row alignment is independent of column alignment for a flat row-major image (a shift of a whole number of rows, i.e. a multiple of 800 bytes, only changes which row content lands in), so shifting 68 more rows earlier fixes that without disturbing the horizontal centering already confirmed: `0x326b5 - 68*800 = 0x25235`, the final correct offset - the KORG glyph's first non-black row lands at exactly row 68 of the result. `extract_boot_splash.py` uses this value; `kronosology`'s `KRONOS_V06R06.VSB.md` has been corrected too (2026-07-19).
 
 ---
 
@@ -1242,6 +1328,7 @@ All fields are plain ASCII decimal unless otherwise noted. Fields that cannot be
 | `TEMP1` - `TEMP3` | integer | Hardware temperature sensor readings in degrees Celsius |
 | `FAN1_RPM` | integer | Fan speed in RPM |
 | `MODE` | integer | Current Kronos mode (same values as STATE command) |
+| `EDITCTX` | integer | Program-edit-in-context sub-state (same values as STATE command) |
 
 The response is terminated with:
 

@@ -1,0 +1,13 @@
+# ONE-SHOT diagnostic module - not embedded in the daemon, just insmod'd
+# directly during investigation/calibration. Read-only, no hooking. See
+# eva_mode_peek.c's own header comment, especially its CALIBRATION STATUS
+# note - this is NOT yet confirmed against real hardware and NOT wired into
+# screenremote.c.
+KDIR ?= /home/build/linux-kronos
+PWD  := $(shell pwd)
+
+all:
+	$(MAKE) -C $(KDIR) M=$(PWD) modules
+
+clean:
+	$(MAKE) -C $(KDIR) M=$(PWD) clean
