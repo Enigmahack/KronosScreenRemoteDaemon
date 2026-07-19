@@ -1062,6 +1062,23 @@ static int send_frame_buf(int fd, const uint8_t *buf)
  * uses, so the two can't disagree. */
 static uint32_t boot_splash_active_rows(void);
 
+/* Forward decl, same reasoning as boot_splash_active_rows() above - the
+ * boot-progress-bar's own geometry+percent state, shared by
+ * capture_to_staging()'s apply_boot_progress_bar() and send_frame()'s own
+ * inline compositing below so the two can't disagree either. Defined near
+ * apply_boot_splash() further down (needs nks4_progress_read(), declared
+ * earlier in the file, plus g_boot_active/fb_w/fb_h). */
+struct boot_bar_geom { uint32_t row, col, max_width; };
+static int boot_progress_bar_state(struct boot_bar_geom *g, int *out_filled);
+
+/* Widest real fb_w this daemon has ever seen (800, the Kronos's native
+ * panel width) - generously doubled as a sanity cap for send_frame()'s
+ * stack-allocated bar-row scratch buffers below, so a corrupt/future
+ * resolution can't blow the stack instead of just skipping the bar (see
+ * boot_progress_bar_state()'s own "doesn't fit this resolution" bounds
+ * check, which this cap backs up defensively). */
+#define BOOT_BAR_MAX_FB_W 1600
+
 /* Pull mode: send directly from device memory fb1_map (no staging/shadow) -
  * this is KronosScreenRemote's own DEFAULT connection mode (AppSettings.cs
  * PullMode=true), so unlike capture_to_staging()'s change-mode path, this
@@ -1075,24 +1092,95 @@ static uint32_t boot_splash_active_rows(void);
  * mode composited correctly but pull mode - live-tested during a real
  * boot - still showed a plain black-and-text frame with no logo, since it
  * never went through staging/apply_boot_splash() at all. */
+/* Writes rows [start, end) of an outgoing pull-mode frame, splitting at the same
+ * splash/fb1 boundary boot_splash_active_rows() itself defines - shared by
+ * send_frame()'s no-bar fast path (as [splash_rows, fb_h), same as before this
+ * function existed) and its bar-compositing path below (as the two sub-ranges
+ * either side of the bar's own two rows), so neither can disagree about where
+ * that boundary falls. */
+static int send_row_range(int fd, uint32_t start, uint32_t end, uint32_t splash_rows)
+{
+    uint32_t split = splash_rows;
+    uint32_t y;
+    if (split < start) split = start;
+    if (split > end)   split = end;
+
+    if (split > start &&
+            write_all(fd, g_boot_splash + (size_t)start * fb_w,
+                       (size_t)(split - start) * fb_w) < 0)
+        return -1;
+    if (end > split) {
+        if (fb1_stride == fb_w) {
+            if (write_all(fd, fb1_map + (size_t)split * fb1_stride,
+                           (size_t)(end - split) * fb_w) < 0)
+                return -1;
+        } else {
+            for (y = split; y < end; y++)
+                if (write_all(fd, fb1_map + (size_t)y * fb1_stride, fb_w) < 0)
+                    return -1;
+        }
+    }
+    return 0;
+}
+
 static int send_frame(int fd)
 {
-    uint8_t hdr[4];
+    uint8_t  hdr[4];
     uint32_t y, splash_rows = boot_splash_active_rows();
+    struct boot_bar_geom bg;
+    int      filled = 0;
+    int      have_bar = fb_w <= BOOT_BAR_MAX_FB_W && boot_progress_bar_state(&bg, &filled);
+    uint8_t  bar_row0[BOOT_BAR_MAX_FB_W], bar_row1[BOOT_BAR_MAX_FB_W];
+
     put_le32(hdr, frame_bytes);
     TCP_CORK_ON(fd);
     if (write_all(fd, hdr, 4) < 0) goto fail;
-    if (splash_rows > 0 &&
-            write_all(fd, g_boot_splash, (size_t)fb_w * splash_rows) < 0)
-        goto fail;
-    if (fb1_stride == fb_w) {
-        if (write_all(fd, fb1_map + splash_rows * fb1_stride,
-                       frame_bytes - splash_rows * fb_w) < 0)
+
+    if (!have_bar) {
+        /* Unchanged fast path - see this function's own header comment for why
+         * it stays a plain splash-block + fb1-block send in the overwhelmingly
+         * common case (BOOT=0, splash_rows=0: this is a single zero-copy write
+         * straight from fb1_map). */
+        if (splash_rows > 0 &&
+                write_all(fd, g_boot_splash, (size_t)fb_w * splash_rows) < 0)
             goto fail;
+        if (fb1_stride == fb_w) {
+            if (write_all(fd, fb1_map + splash_rows * fb1_stride,
+                           frame_bytes - splash_rows * fb_w) < 0)
+                goto fail;
+        } else {
+            for (y = splash_rows; y < fb_h; y++)
+                if (write_all(fd, fb1_map + y * fb1_stride, fb_w) < 0) goto fail;
+        }
     } else {
-        for (y = splash_rows; y < fb_h; y++)
-            if (write_all(fd, fb1_map + y * fb1_stride, fb_w) < 0) goto fail;
+        /* Boot progress bar active - see apply_boot_progress_bar()'s own header
+         * comment for the geometry/colour reconstruction this mirrors. Seed the
+         * two affected rows from whatever would normally be sent for them
+         * (splash if it reaches this far, else live fb1) so the columns either
+         * side of the bar still show correct content, THEN paint the bar over
+         * just its own [col, col+max_width) column range. Only pays for two
+         * extra row-sized copies + a handful of extra write()s, and only while
+         * BOOT=1 - the no-bar branch above is completely untouched. */
+        uint32_t row1 = bg.row + 1;
+        memcpy(bar_row0,
+               bg.row < splash_rows ? g_boot_splash + (size_t)bg.row * fb_w
+                                     : fb1_map       + (size_t)bg.row * fb1_stride,
+               fb_w);
+        memcpy(bar_row1,
+               row1 < splash_rows ? g_boot_splash + (size_t)row1 * fb_w
+                                   : fb1_map       + (size_t)row1 * fb1_stride,
+               fb_w);
+        memset(bar_row0 + bg.col,          9,    (size_t)filled);
+        memset(bar_row0 + bg.col + filled, 0xC0, (size_t)(bg.max_width - filled));
+        memset(bar_row1 + bg.col,          1,    (size_t)filled);
+        memset(bar_row1 + bg.col + filled, 0xC0, (size_t)(bg.max_width - filled));
+
+        if (send_row_range(fd, 0, bg.row, splash_rows) < 0) goto fail;
+        if (write_all(fd, bar_row0, fb_w) < 0) goto fail;
+        if (write_all(fd, bar_row1, fb_w) < 0) goto fail;
+        if (send_row_range(fd, row1 + 1, fb_h, splash_rows) < 0) goto fail;
     }
+
     TCP_CORK_OFF(fd);
     return 0;
 
@@ -1562,6 +1650,53 @@ static void get_mode_state(int *out_mode, int *out_editctx, const char **out_sou
     *out_source  = "pixel";
 }
 
+/* Reads the front-panel NKS4 driver's own live boot-progress-bar percentage from
+ * /proc/OmapNKS4ProgressBar (format "%3d", see kronosology's
+ * reconstructed/OmapNKS4Module/procfs.cpp) and its hardware-version byte from
+ * /proc/OmapNKS4HardwareVersion (format "%02u"). This is the state a client needs
+ * to redraw that bar itself: the panel board draws it directly over USB to its own
+ * LCD, so - same underlying fact apply_boot_splash() documents above - it never
+ * touches /dev/fb1 and can never be captured from this daemon's own video stream.
+ *
+ * Percent is read fresh every call (no caching - matches this file's existing
+ * live-read philosophy for small /proc scalars, e.g. eva_mode_read() above); left
+ * at -1 if the file is missing/unreadable (module not loaded, or not real
+ * hardware) or reports something outside 0-100. Hardware version IS cached after
+ * the first successful read - it's a fixed board-identification byte for the life
+ * of the process, not live state - so a caller can poll this every tick without
+ * paying for the extra open()/read() once it's known. Returns 1 if pct was read
+ * successfully, 0 otherwise (pct is still set to -1 either way, so a caller can
+ * always format it directly). */
+static int nks4_progress_read(int *out_pct, int *out_hwver)
+{
+    static int hwver_cached = -1;
+    FILE *f;
+    int   pct = -1;
+
+    f = fopen("/proc/OmapNKS4ProgressBar", "r");
+    if (f) {
+        if (fscanf(f, "%d", &pct) != 1)
+            pct = -1;
+        fclose(f);
+    }
+    if (pct < 0 || pct > 100)
+        pct = -1;
+
+    if (hwver_cached < 0) {
+        f = fopen("/proc/OmapNKS4HardwareVersion", "r");
+        if (f) {
+            int v;
+            if (fscanf(f, "%d", &v) == 1 && v >= 0)
+                hwver_cached = v;
+            fclose(f);
+        }
+    }
+
+    *out_pct   = pct;
+    *out_hwver = hwver_cached;
+    return pct >= 0;
+}
+
 /* ── Boot-state gate ──────────────────────────────────────────────────────
  * Goal: never let a client send an interactive command (touch/button/wheel/
  * MIDI/etc.) while the Kronos OS is still booting - only the read-only
@@ -1965,6 +2100,83 @@ static void apply_boot_splash(uint8_t *buf)
     uint32_t rows = boot_splash_active_rows();
     if (rows)
         memcpy(buf, g_boot_splash, (size_t)g_boot_splash_w * rows);
+}
+
+/* Real definition - see the forward decl (near send_frame(), earlier in this
+ * file) for the full contract. Fills *g with this hardware's boot-bar geometry
+ * and *out_filled with the live fill width in pixels (already reduced from the
+ * raw 0-100 percent to a [0, g->max_width] pixel count) if the front panel's
+ * boot progress bar should be composited into the outgoing frame right now.
+ * Returns 0 (nothing to draw, *g / *out_filled untouched) if the boot gate is
+ * closed, OmapNKS4Module.ko's own /proc interface is unavailable, this
+ * hardware revision draws no bar at all, or the reconstructed geometry
+ * doesn't fit the live framebuffer's resolution.
+ *
+ * Geometry/colours reconstructed from two independent disassemblies that land
+ * on the same numbers: the host driver
+ * (kronosology/reconstructed/OmapNKS4Module/driver.cpp,
+ * COmapNKS4Driver::SetProgressBarPercent) and the panel firmware itself
+ * (kronosology/reconstructed/K1_V06R06/clcdc.c, clcdc_progress_bar). The real
+ * bar is exactly 2 scanlines tall - palette index 9 (bright red "highlight")
+ * on the top row, index 1 (dim red "base") on the bottom row, for the filled
+ * portion; the unfilled remainder is index 0xC0 (dark neutral grey) on both
+ * rows - see apply_boot_progress_bar() below for where those indices actually
+ * get written. Geometry forks on the panel's hardware-version byte - see
+ * nks4_progress_read()'s own header comment for the Kronos-1-vs-2 mapping. */
+static int boot_progress_bar_state(struct boot_bar_geom *g, int *out_filled)
+{
+    int pct, hwver;
+
+    if (!g_boot_active)
+        return 0;
+    if (!nks4_progress_read(&pct, &hwver))
+        return 0;
+
+    if (hwver == 2)
+        return 0;   /* this hw rev draws no bar at all */
+    if (hwver == 1 || hwver == 3) {
+        /* Kronos 2 / D2550. row=434/col=75 are the raw reconstructed constants
+         * (driver.cpp's SetProgressBarPercent); EMPIRICALLY CORRECTED 2026-07-19
+         * against a real D2550 unit (HWVER=01) - the raw constants rendered 3px
+         * too far left and 1px too far down versus the real physical bar, so
+         * col is nudged +3 and row -1 here. Not re-derived from a fresh
+         * disassembly - this is a live-hardware fix layered on top of the
+         * reconstruction, kept as an explicit offset from the documented raw
+         * values rather than silently overwriting them, so the discrepancy
+         * stays visible. The Kronos 1 branch below has NOT been verified
+         * against real hardware and may need the same kind of correction. */
+        g->row = 433; g->col = 78;  g->max_width = 650;   /* Kronos 2 / D2550 */
+    } else {
+        g->row = 348; g->col = 146; g->max_width = 512;   /* Kronos 1 (v06R06) and unknown/default - UNVERIFIED against real hardware */
+    }
+    if (g->row + 1 >= fb_h || g->col + g->max_width > fb_w)
+        return 0;   /* doesn't fit this resolution - skip rather than write out of bounds */
+
+    if (pct < 0) pct = 0; else if (pct > 100) pct = 100;
+    *out_filled = (int)((uint32_t)pct * g->max_width / 100);
+    return 1;
+}
+
+/* Paints the boot progress bar into an already-fb1-filled (and boot-splash-
+ * composited) staging buffer - called from capture_to_staging() only, AFTER
+ * apply_boot_splash() so the bar overrides whatever the static splash bitmap
+ * has at those two rows (that resource predates any live percent - see
+ * KRONOS_V06R06.VSB.md's "Boot splash resource" section, which documents no
+ * such line as part of its own content). send_frame()'s pull-mode path can't
+ * reuse this directly (no full-frame buffer to write into - see that
+ * function's own header comment on why), so it composites the same two rows
+ * inline instead, sharing boot_progress_bar_state() for the geometry/percent
+ * so the two paths can't disagree. */
+static void apply_boot_progress_bar(uint8_t *buf)
+{
+    struct boot_bar_geom g;
+    int filled;
+    if (!boot_progress_bar_state(&g, &filled))
+        return;
+    memset(buf + g.row       * fb_w + g.col,          9,    (size_t)filled);
+    memset(buf + g.row       * fb_w + g.col + filled, 0xC0, (size_t)(g.max_width - filled));
+    memset(buf + (g.row + 1) * fb_w + g.col,          1,    (size_t)filled);
+    memset(buf + (g.row + 1) * fb_w + g.col + filled, 0xC0, (size_t)(g.max_width - filled));
 }
 
 /* eSTGAnalogDeviceCode raw byte packing, derived from ShortInvertNkS4AnalogValue's
@@ -3888,7 +4100,8 @@ static int capture_to_staging(void)
             memcpy(staging + y * fb_w,
                    fb1_map + y * fb1_stride, fb_w);
     }
-    apply_boot_splash(staging);   /* no-op once BOOT= clears or nothing loaded */
+    apply_boot_splash(staging);         /* no-op once BOOT= clears or nothing loaded */
+    apply_boot_progress_bar(staging);   /* no-op once BOOT= clears or the proc interface is unavailable */
     if (!shadow_valid) return 1;
     return memcmp(staging, shadow, frame_bytes) != 0;
 }
