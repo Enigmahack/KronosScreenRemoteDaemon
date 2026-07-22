@@ -13,6 +13,15 @@
 
 Kronos Screen Remote Daemon: A framebuffer streaming daemon with virtual keyboard and MIDI injection kernel modules for the **Korg Kronos** synthesizer. It streams the Kronos display (`/dev/fb1`, 8bpp 800x600) over TCP, accepts remote control commands for touch, buttons, the data wheel, and keyboard input injection, and provides MIDI injection with SysEx request/response support.
 
+> **Shared context**: this daemon is the server-side counterpart to
+> [KronosScreenRemote](../KronosScreenRemote/) (C#) and
+> [KronosScreenRemotePy](../KronosScreenRemotePy/) (Python), and its kernel
+> modules build on [kronosology](../kronosology/)'s reverse-engineering.
+> Cross-project architecture, shared dev environments, credentials/access
+> pointers, and agent/tooling policy live in
+> [`/home/share/PROJECT_BRAIN/BRAIN.md`](../PROJECT_BRAIN/BRAIN.md) —
+> check there before duplicating knowledge into this repo.
+
 ---
 
 ## Repository layout
