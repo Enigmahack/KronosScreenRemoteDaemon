@@ -8,6 +8,484 @@ comparing against other environments or when setting the VM up fresh.
 
 ---
 
+## 0. 2026-07-24 update — full OA.ko/Eva integration, RE work, boot chain fixes
+
+Everything in sections 1-11 below predates this update and describes the
+**older `kronos_vm` boot stub that never loaded OA.ko/Eva at all** (fakefb +
+network + screenremote only, `-drive`-only GRUB boot). As of this session,
+`kronos_vm`'s `setup_vm.sh`/`overlay/sbin/loadoa`/`run_vm.sh` boot the full
+chain: RTAI substitute → `kronosology/reconstructed/OA/OA.ko` (with its
+hardware-stub siblings) → `reconstructed/Eva/Eva` → screenremote. Treat
+anything below that conflicts with this section as historical/superseded;
+re-verify against the current `kronos_vm/` scripts before trusting specifics.
+
+**New OA.ko reconstruction work landed** (all four independently RE'd from
+raw `objdump -dr` against the real `OA.ko`, MD5 `955636c2b11a70a1dbecefaaa7bd4f80`,
+cross-checked against this daemon's own already-ground-truthed real-hardware
+findings in `nks4_inject.c`/`midi_bridge.c`):
+- `CSTGFrontPanel::HandleSwitchEvent/HandleTouchPanel/HandleRotary/HandleAnalogController`
+  + `ShortInvertNkS4AnalogValue` — `src/engine/front_panel_handlers.cpp`.
+- `RT_chord_trigger` (KARMA pad-chord trigger) — `src/engine/karma_chord_trigger.cpp`.
+- MIDI IN: `CSTGMidiInPortGeneric::Receive` (the real function behind
+  `MidiInPortGeneric7Receive`) + `CSTGMidiInPort` fields — `src/engine/midi_in_port.cpp`.
+- MIDI OUT: `CSTGMidiPortManager::RegisterMidiOutPort` + `CSTGMidiOutPort::Activate`
+  (queue-tap plumbing `midi_bridge.ko` needs) — `src/engine/midi_out_port.cpp`.
+- 3 VM-testing-only accessor exports (`CSTGFrontPanel_GetInstanceForTest`,
+  `CSTGMidiPortManager_Get{In,Out}PortsArrayForTest`) — `src/engine/vm_test_accessors.cpp`.
+  These do **not** exist on real hardware, so they're always safe/no-op there.
+
+**Daemon-side changes to support the VM** (all strictly opt-in, zero
+real-hardware behavior change — new params default to 0/unset):
+- `nks4_inject_module/nks4_inject.c` — new optional param `fn_sinstance_get`.
+  When set, calls it directly for `CSTGFrontPanel::sInstance` instead of the
+  real-hardware-only `SINSTANCE_REL_OFFSET` byte-offset trick (which is
+  calibrated to the real OA.ko's specific GCC-4.5.0 codegen and does not
+  transfer to this from-scratch reconstruction's own compiled layout).
+- `midi_module/midi_bridge.c` — new optional params `fn_inports_get`/
+  `fn_outports_get`, same idea, bypassing the real-hardware-only
+  `RegisterMidiInPort`/`RegisterMidiOutPort` byte-pattern scan.
+- `source/screenremote.c` — `resolve_kallsyms()`/`resolve_nks4_kallsyms()`
+  now also look up the 3 `*ForTest` symbol names above and pass their
+  addresses through to the new params. On real hardware these symbols never
+  appear in `/proc/kallsyms`, so the lookup returns 0 and behavior is
+  unchanged.
+
+**`kronos_vm` boot-chain bugs found and fixed this session** (all in
+`/home/share/kronos_vm/`, not this repo):
+1. `/etc/OA.si` (the real, untouched stock rootfs's own sysinit script)
+   hardcodes `mount ... /dev/sda5 /korg/ro` / `/dev/sda6 /korg/rw` — but this
+   kernel's classic `ide-gd` driver (not libata/`ata_piix` SCSI translation)
+   enumerates the `-drive if=ide` disk as `/dev/hda*`. Both mounts silently
+   failed, leaving `/korg/rw` (and everything under it — `oa_recon/`, `Eva`,
+   `screenremote/`) empty for the entire boot. Fixed with a corrective
+   re-mount in `overlay/etc/vm_init.sh` (runs before `OA.rc`/`loadoa`).
+2. `setup_vm.sh`'s generated GRUB2 `grub.cfg` boots this exact kernel+rootfs
+   but hangs **deterministically and silently forever**, well before the
+   "Linux version" printk, at a fixed address in the kernel's own early
+   `.text` (confirmed via QEMU monitor `info registers`/`x/5i $eip` —
+   identical EIP every time, ruling out timing races). Root cause not fully
+   pinned down (likely a GRUB2 boot_params/E820/MP-table construction
+   difference this kernel's early init doesn't expect); worked around by
+   having `run_vm.sh` boot via QEMU's own `-kernel`/`-append` loader instead
+   of the disk's GRUB2/MBR, which reaches "Linux version..." immediately.
+3. The full kernel cmdline matters and is fragile: `vga=0x0303 fbcon=map:0
+   console=tty0 vmalloc=512M` must all be present. Dropping `vga=`/`fbcon=`/
+   `console=tty0` (an earlier revision of `run_vm.sh` did this, wrongly
+   theorizing they caused bug #2 above) causes a **different**, later hang:
+   boot proceeds fine through "Linux version"/VFS mount/the kernel's own
+   compiled-in RTAI I-pipe registration ("I-pipe: Domain RTAI registered"/
+   "RTAI[hal]: mounted" — unconditional kernel printks, unrelated to
+   `loadoa`'s own choice of RTAI `.ko`), then parks forever in `HLT` with
+   interrupts enabled but never firing again.
+4. Even with the correct full cmdline, RTAI I-pipe calibration under
+   QEMU/TCG shows **genuine run-to-run nondeterminism** — the identical
+   config sometimes clears this point in under 2 minutes, sometimes stalls
+   indefinitely. This matches this project's own long-documented "severe
+   run-to-run variance" for RTAI-under-TCG timing (see
+   `kronosvm_dedicated_sandbox_87` and `oa_ko_rtai_virtualization_policy`
+   auto-memory files) — not a new bug, just now observed on this specific
+   boot chain too. **If a boot seems stuck here, do not `pkill` it** —
+   repeated hard-kills mid-boot corrupt the disk image's ext2 filesystems
+   (`EXT2-fs error: deleted inode referenced`); recoverable via
+   `guestfish --rw -a kronos.img -- run : e2fsck /dev/sdaN forceall:true`,
+   but better to just let a stuck boot keep running (or retry from a fresh
+   image) than interrupt it.
+   **CORRECTED below in section 0b — this "nondeterminism" framing was
+   wrong. The real cause was a missing-device-nodes bug that made
+   `FAST_RTAI` silently fail to take effect, so genuine `rtai_hal.ko` was
+   loading (and stalling) on every boot regardless of RTAI's own timing.
+   Root-caused and fixed same day.**
+
+**Status at end of this session**: all reconstruction/wiring/build work
+(RE'd OA.ko functions, daemon kernel-module opt-in fallback paths, daemon
+binary rebuild, boot-chain fixes 1-3 above) is done and independently
+verified (OA.ko rebuilds clean with all new symbols present via `nm`, full
+OA host test suite green — 101 binaries / 4054+ checks / zero failures,
+daemon builds clean). The *specific* end-to-end boot-to-screenremote
+milestone (confirming the TCP handshake against the live VM) was not
+reached by session end due to issue #4's nondeterminism, not any known
+remaining code defect — retry `kronos_vm/run_vm.sh` (ideally on the
+dedicated `kronosvm` sandbox, 192.168.3.87, not a contended host) and
+watch `boot_console.log` past the "RTAI\[hal\]: mounted" point.
+
+## 0b. 2026-07-24 update (same day, continued) — RTAI hang root-caused and fixed; boot now clears RTAI entirely; new frontier found
+
+**The "genuine RTAI/TCG nondeterminism" framing in point #4 above was
+wrong.** Root-caused and fixed this session by digging into the actual
+RTAI 3.8.1 source (available locally at
+`/home/share/Korg_Kernel_src/rtai-3.8.1.tar.bz2`) and cross-referencing
+against a live QEMU-monitor EIP-sampling pass (`-monitor telnet:...,server`,
+now added to `run_vm.sh` permanently) and postmortem `guestfish` disk
+inspection.
+
+**Root cause**: `$ROOTFS` (`RestoreDVD_SystemMNT/mnt`, the extracted real
+Kronos install image) lives on a CIFS network share. CIFS/SMB cannot store
+Unix device/block special files — the source rootfs's own `/dev` entries
+were silently flattened to empty **regular files** at extraction time
+(confirmed: `file(1)` reports "empty", not "character special", for
+`console`/`null`/etc. in `$ROOTFS/dev` itself). `setup_vm.sh` never
+recreated real device nodes, so the built VM image's `/dev/console`,
+`/dev/ttyS0`, `/dev/ttyS1`, `/dev/kmsg`, `/dev/null`, and **every
+`/dev/hda*` block device** were also just regular files (`-rw-`, not
+`crw-`/`brw-` per `guestfish ll`).
+
+**Consequence chain**:
+1. The kernel can mount `root=/dev/hda2` via its own early boot-time
+   name-to-`dev_t` resolution with zero `/dev` entries required — so root
+   mounts fine and boot looks normal at first.
+2. But `overlay/etc/vm_init.sh`'s own `/korg/ro`/`/korg/rw` mount-fix
+   (`mount -t ext2 /dev/hda5 /korg/ro`, `mount -t ext3 /dev/hda6 /korg/rw`)
+   is a *userspace* `mount` call, which needs a real device node to open —
+   with none present, both mounts silently failed with ENOENT on **every
+   single boot**, confirmed live via `[vm_init] korg/ro mounted: no` /
+   `korg/rw mounted: no`.
+3. `/korg/rw` therefore stayed an empty, unmounted directory for the rest
+   of boot — so `overlay/sbin/loadoa`'s own
+   `[ -f /korg/rw/oa_recon/FAST_RTAI ]` check always saw nothing there and
+   always fell through to the `else` branch, loading **real**
+   `rtai_hal.ko`/`rtai_sched.ko`/etc. instead of the already-proven-working
+   `RTAIVirtualDriver.ko` substitute — confirmed live via a
+   `CONSOLE-MARKER: loadoa FAST_RTAI check: ABSENT` line.
+4. It was *this* real-RTAI fallback that stalled under QEMU/TCG on most
+   attempts (observed anywhere from ~5 to ~10+ minutes before a manual
+   kill), not a defect in RTAI's own calibration. Traced the exact hang
+   point into RTAI 3.8.1's `base/sched/sched.c` — the calibration printk
+   immediately before the stall point (`RTAI[sched]: timer setup = 999 ns,
+   resched latency = 2943 ns.`, line ~3078) prints **plausible, non-garbage
+   numbers**, proving RTAI's own timing measurement had already completed
+   successfully; the actual hang was in loading the subsequent silent
+   companion modules (`rtai_sem.ko`/`rtai_ndbg.ko`/`rtai_fifos.ko`, none of
+   which print an init banner on success).
+
+**Diagnostic methods that turned out to be unreliable** (document these so
+a future session doesn't waste time rediscovering them):
+- `kmsg()`-style `echo ... > /dev/kmsg` logging was silently going into the
+  same bogus regular-file `/dev/kmsg`, not the kernel's real printk ring
+  buffer — `printk.devkmsg=on` on the kernel cmdline was a red herring the
+  whole time; there was no real kmsg device to forward from.
+- The file-based `/root/checkpoint.log` diagnostic (written with an
+  explicit `sync` after every step) still never survived a hard
+  `pkill -9`/`kill -9` of the QEMU process even once — most likely QEMU's
+  own drive write-back caching not committing to the host-side `kronos.img`
+  file before the process died, independent of the guest's own `sync`
+  syscall succeeding.
+- The technique that actually worked: writing unique marker strings
+  directly to `/dev/ttyS0` at the top of `OA.si`/`vm_init.sh`/`loadoa` (and
+  at loadoa's `FAST_RTAI` check specifically), then reading back the
+  (at-the-time-bogus) regular file's content via postmortem `guestfish cat`
+  after a kill — this revealed the true execution state even before the
+  device-node bug itself was found and fixed. Once real device nodes exist,
+  these markers appear live in `boot_console.log` instead of needing
+  postmortem recovery.
+
+**Fix**: `setup_vm.sh` now explicitly creates real device nodes via
+guestfish's own `mknod-c`/`mknod-b`, right after the root filesystem
+`copy-in` step:
+- Char: `console` (5,1), `null` (1,3), `zero` (1,5), `random` (1,8),
+  `urandom` (1,9), `kmsg` (1,11), `ttyS0` (4,64), `ttyS1` (4,65), `tty`
+  (5,0), `tty0` (4,0), `tty1` (4,1), `ptmx` (5,2).
+- Block: `hda`, `hda1`–`hda8` (major 3, minor 0–8 — standard Linux primary
+  IDE master numbering, matching this kernel's `ide-gd` driver).
+
+**Result, confirmed live and repeatable**: `FAST_RTAI` now correctly reads
+as present; `loadoa` loads `RTAIVirtualDriver.ko`/`STGEnabler.ko`/
+`STGGmp.ko` cleanly — **zero real `RTAI[hal]`/`RTAI[sched]` console lines
+appear at all**, the entire RTAI stage is sidestepped exactly as originally
+designed, no hang. This is the furthest `kronos_vm` has ever booted.
+Also fixes the previously-mysterious "Warning: unable to open an initial
+console." boot message (the kernel's own attempt to open a real
+`/dev/console`, which now exists).
+
+**Items 1-2 below (`OA.ko` unresolved symbols, Eva) were FIXED same day —
+see the new section 0c below for the fix and confirmed live result.** Item
+3 (post-fakefb stall) remains the current, sole, still-open blocker.
+
+1. ~~`OA.ko` insmod now fails on unresolved symbols: `__fixsfsi`/
+   `__floatsisf`/`__mulsf3` (libgcc soft-float helpers pulled in by
+   floating-point code somewhere in the module) plus four C++-mangled
+   symbols — `CSTGControllerRTData::SendKarmaCCToKG`,
+   `CSTGMidiInPort::ReceiveSysEx`, `CSTGControllerInfo::ButtonPressHandler`,
+   `CSTGControllerInfo::AnalogControllerHandler`.~~ **FIXED, see 0c.**
+2. ~~`reconstructed/Eva/Eva` segfaults immediately on launch (`ip
+   080496cf`) — expected/consequential, since Eva depends on a live OA.ko
+   to read panel/mode state from.~~ **Not actually a bug — see 0c: with
+   OA.ko now loading, Eva runs its complete boot path and exits cleanly on
+   its own. It was never truly segfaulting from Eva's own logic; the
+   earlier segfault was purely a downstream consequence of OA.ko failing
+   to load at all.**
+3. Boot reaches `fakefb: init called` (prints `fb_mem`/`info`/`fbops`
+   addresses successfully) and then stalls — CPU time keeps climbing
+   (confirmed via `systemctl status`'s own cgroup CPU accounting over
+   multiple samples, i.e. **not** a frozen/halted process) but no further
+   console output appears. This exact "post-fakefb stall" was **already
+   independently found and explicitly flagged as a separate, unresolved,
+   out-of-scope issue in a prior session** — see
+   `kronosology/.claude/agent-memory/re-decompiler/rtai_virtual_driver_substitute.md`'s
+   own "Live boot test result" section. Not introduced today; still open;
+   now the sole remaining blocker to the full boot-to-screenremote
+   milestone.
+
+**Process-management note for future sessions**: launching the VM via
+`ssh kronosvm "nohup ... & disown"` is vulnerable to a real, previously-
+documented hazard (see `kronosology/.claude/agent-memory/re-decompiler/rtai_calibration_hang_diagnosis.md`
+sec 10.214) — the backgrounded qemu process gets killed when the
+*launching SSH session's own systemd login-scope* tears down, on a
+timescale unrelated to how long the launch command itself took to return.
+This recurred this session (a live, CPU-actively-climbing qemu process
+vanished with zero crash/panic evidence in its own stdout/stderr).
+**Fix**: launch via `systemd-run --unit=NAME --collect
+--working-directory=DIR -- CMD` instead — runs under `system.slice`,
+immune to session teardown, inspect with `systemctl status NAME`.
+
+**Port-reachability ground truth, for anyone tempted to test with
+`nc -zv`**: `nc -zv 127.0.0.1 21`/`7374` report "open" as soon as QEMU
+itself starts, *regardless of guest boot state* — this is only QEMU's own
+`hostfwd` listener accepting the TCP handshake on the host side, not proof
+the guest's FTP/screenremote service is actually running yet. Always test
+for a real application-level response (e.g. an actual `220 ...` FTP
+banner, via `exec 3<>/dev/tcp/host/21; cat <&3` or similar) before treating
+a port as genuinely reachable.
+
+## 0c. 2026-07-24 update (same day, continued again) — OA.ko now loads clean; Eva runs its full boot path; only the pre-existing post-fakefb stall remains
+
+**`OA.ko`'s 7 unresolved symbols, fixed** (all 4 were pre-existing
+"deliberately deferred extern" declarations from prior reconstruction
+passes, already explicitly documented as out-of-scope in `oa_global.h`/
+`oa_engine.h`'s own header comments — not a regression introduced by
+section 0's same-day work, just the first time anyone tried a live insmod
+against a build that includes their callers):
+- `__fixsfsi`/`__floatsisf`/`__mulsf3`: `front_panel_handlers.cpp` (new in
+  section 0) does genuine plain-C float arithmetic (ADC-to-CC scaling in
+  `HandleTouchPanel`) but was missing the per-file `CFLAGS_<obj>.o :=
+  -mhard-float -msse2 -mfpmath=sse` Makefile override that every one of
+  its sibling float-using files already has (this project's own
+  established, extensively-precedented pattern for avoiding the kernel
+  build's default `-msoft-float` — see `Makefile`'s own extensive comments
+  on `engine_startup_bits.o`/`wave_sample_convert.o`/etc.). Simply missed
+  when the file was added; one added `Makefile` line fixed it completely,
+  no code changes.
+- `CSTGControllerRTData::SendKarmaCCToKG`, `CSTGMidiInPort::ReceiveSysEx`,
+  `CSTGControllerInfo::ButtonPressHandler`,
+  `CSTGControllerInfo::AnalogControllerHandler`: given safe no-op stub
+  bodies in `src/stub/bar2_stubs.cpp`, this project's own established,
+  extensively-precedented location for exactly this situation ("deliberate
+  minimal, safe stub bodies for every symbol OA.ko's own call chains
+  reference that has NOT yet been individually reconstructed" — see that
+  file's own header). None of these four are reachable from kronos_vm
+  boot-testing anyway (no physical front panel to generate real button/
+  analog/touch-panel events, no physical MIDI hardware to generate real
+  SysEx traffic), so a no-op is safe and correct for this purpose; the
+  real per-button action table / analog jump tables / KARMA-CC-to-DSP path
+  remain a genuinely deferred, separate future reconstruction task if ever
+  needed for something beyond VM boot-testing.
+
+Rebuilt `OA.ko` verified clean: `nm` shows zero remaining references to
+any of the 7 symbols, and the full OA host test suite still passes
+(`make verify`: 4054 checks, 0 failures, exit code 0) — the fix is purely
+additive (a Makefile flag + 4 stub function bodies), no existing behavior
+touched.
+
+**Confirmed live in kronos_vm, for the first time in this project's
+history**:
+```
+OA_DEBUG_MARKER 15
+OA_DEBUG_MARKER 16
+OA_DEBUG_MARKER 17
+OA: init_module succeeded, tsc_lo=00000000 tsc_hi=00000000
+[loadoa] OA.ko: loaded OK
+[loadoa] OA.ko: LOADED OK
+```
+And with a live OA.ko underneath it, `reconstructed/Eva/Eva` no longer
+segfaults at all — `eva_stdout.log` shows a complete, clean run: connects
+to OA's shared memory, loads stored settings, runs its full `Mains()`
+sequence through every sub-module (`MMainPanelDriver`, `MMainHIDDriver`,
+`MMainAlphaKeybCtrl`, `MMainLinuxDriver`, `MMainEditor`, `MMainPanel`,
+`MMainBatchDiskMan`, `MMainESCommon/ESProg/ESEffect/ESCombi/ESGlobal/
+ESMOSS/ESSampling/ESSetList/ESSong/ESDisk`), starts its init/timing
+threads, then exits cleanly on its own (`Start closing` / `End closing`,
+zero errors, zero segfault line in dmesg) — matching this project's own
+previously-recorded `eva_reconstruction_project` "boots end-to-end" goal
+exactly. The earlier apparent Eva "crash" was purely a downstream
+consequence of `OA.ko` failing to load at all, not a bug in Eva itself.
+`loadoa`'s own post-launch check was also updated (previously mislabeled
+*any* Eva exit within 8s as "exited/crashed" — now distinguishes this
+known-clean `End closing` exit from a real crash by checking
+`eva_stdout.log`'s own last line).
+
+**What's left**: the pre-existing "post-fakefb stall" (section 0b, item 3)
+is now the **sole remaining blocker** to the full boot-to-screenremote-
+TCP-handshake milestone — everything upstream of it (RTAI substitute,
+AT88/KorgUsbAudio/OmapNKS4 virtual drivers, `OA.ko`, Eva) is now confirmed
+working end-to-end.
+
+---
+
+## 0d. 2026-07-25 investigation — post-fakefb stall root-caused to a
+first-time-exercised kernel console/VT lock interaction, NOT fakefb.ko's
+own code and NOT OA.ko; genuinely fatal after ~12 minutes, not infinite
+
+Reproduced live on `kronosvm` (fresh boot, `run_vm.sh` unmodified except a
+per-host `BZIMAGE`/`kronos.img` path override needed because this sandbox's
+own `/home/share` CIFS mount — see `kronos_share_migration` memory — was not
+mounted; canonical `run_vm.sh` itself was not changed). QEMU monitor added
+permanently to `run_vm.sh` in the prior session
+(`-monitor telnet:0.0.0.0:4445,server,nowait`) made this investigation
+possible.
+
+**Exactly where it hangs**: `fakefb_init()`'s own code runs to completion —
+`fb_mem=`/`info=`/`fbops@.../screen_base@...` all print correctly — and then
+calls `register_framebuffer(info)`. That call **never returns**: the very
+next `fakefb` printk (`"register_framebuffer returned %d"`) never appears,
+in this run or any prior one. `fakefb.ko`'s own source
+(`kronos_vm/fakefb/fakefb.c`) is confirmed correct up to that call; the hang
+is inside vanilla kernel code `register_framebuffer()` transitively invokes,
+specifically the framebuffer-console take-over chain:
+`register_framebuffer()` → `fb_notifier_call_chain(FB_EVENT_FB_REGISTERED)`
+→ `fbcon_event_notify()` → `fbcon_fb_registered()` → `fbcon_takeover()` →
+`take_over_console()` → `bind_con_driver()` (`drivers/char/vt.c`). This is
+architecturally significant: **fakefb is the first framebuffer this VM has
+ever registered with a live VT console attached** (the pre-OA.ko boot stub
+in sections 1-11 never ran together with the RTAI/OA.ko/Eva chain), so this
+is the first time this exact kernel code path has ever executed in this
+project.
+
+**QEMU-monitor EIP sampling across all 4 vCPUs** (`cpu N` + `info registers`
++ `x/Ni $eip` over the unix/telnet monitor socket, repeated several times
+seconds apart) during the stall showed:
+- **CPU0, CPU1, CPU3**: all three pinned at the *identical* address
+  (`0x40106c5e`) across every sample. Disassembly (against
+  `kronos_vm/rtai_investigation/vmlinux.bin`, a full but **stripped**
+  ELF — no `.symtab`, no System.map found anywhere on the DVD tree or the
+  `linux-kronos` build tree either) is an unambiguous textbook i386 ticket
+  spinlock contended-acquire path: `lock xadd` to take a ticket, then
+  `pause` / re-read / `jmp` back until "now serving" == "my ticket". The
+  lock word lives at a fixed `.bss` address (`0x405c5084`), i.e. some
+  statically-allocated kernel lock, not a heap/module one.
+- **CPU2**: at a *different*, also-fixed address (`0x4026ae2c`), inside the
+  kernel's generic `__delay`/`delay_tsc` (the TSC-based busy-wait body of
+  `udelay()`/`__const_udelay()` — confirmed by disassembling the containing
+  routine, which does `rdtsc`, computes a cycle delta, and loops with
+  `pause` until the requested count elapses, touching per-thread-info
+  preempt-count fields via `esp & 0xffffe000`). CPU2's `ESP` sat in
+  vmalloc-range memory (`0xde85xxxx`), i.e. a dynamically-allocated kernel
+  stack (kernel thread or workqueue worker), not a statically-placed idle
+  thread.
+
+**Ruled out — OA.ko's own delay/retry code**: read every `udelay`/`msleep`
+call site in `reconstructed/OA/src/` against this exact scenario.
+`CSTGKeybedInterface_Startup()` (`keybed_init.cpp`) does retry 10 rounds ×
+6 ports probing for the real hardware's W83627 Super-I/O chip (hence the
+`OA_COMPORT_DBG port N: no W83627 Super I/O chip found` spam visible in
+every boot log) — but `CSTGComPort::Initialize()`
+(`comport_init.cpp`)'s failure path (`DetectChipAt()` fails for both
+`0x2e`/`0x4e`, which is what always happens in this VM — no real chip) hits
+`port_failed` with **zero delay calls**; the loop's own `udelay()` calls are
+only reached on the (unreachable-here) ACK-received path. `OA_DEBUG_MARKER
+15/16/17` and `"OA: init_module succeeded"` all printed in this run,
+confirming `init_module()` genuinely returned before Eva/fakefb ever ran —
+the stall is provably downstream of OA.ko's own code, not inside it.
+
+**Best-supported mechanism (not fully proven to a named symbol, see
+caveat below)**: cross-referencing `linux-kronos` source, `bind_con_driver()`
+(`drivers/char/vt.c:2960`) calls `acquire_console_sem()` (a blocking, global
+semaphore, not the fb-local `fb_info->lock` fakefb's own header comment
+already documents) around `csw->con_startup()` and the
+`printk("Console: switching ...")` calls — this is exactly the call chain
+above. Separately, the actual `console=ttyS0,115200` backing driver
+(`drivers/serial/8250.c` `serial8250_console_write()`) holds
+`local_irq_save()` **and** a per-port spinlock for its *entire* flush,
+transmitting every buffered character through `wait_for_xmitr()` (a
+`udelay(1)`-based busy-poll per character) while the flushing CPU holds
+`console_sem` for the whole operation. This is a textbook shape for one CPU
+(draining buffered printk backlog through the slow serial path) to hold
+`console_sem` while other CPUs block forever in `acquire_console_sem()`
+inside `bind_con_driver()` — consistent with 3 CPUs stuck on one lock while
+a 4th does TSC-timed busy-waiting elsewhere.
+
+**What does NOT fit that theory cleanly**: the actual backlog at the stall
+point is small (77 `OA_COMPORT_DBG`/marker lines, 21622 bytes of boot log
+total) — implausibly small to explain many *minutes* of draining even
+allowing for a large QEMU/TCG `udelay(1)` slowdown factor — and
+`boot_console.log`'s byte count did not grow **at all**, even by one byte,
+across the entire ~12-minute observation window that followed. A "slowly
+draining" theory would predict at least some trickle of new bytes; none
+appeared. So while the console_sem/serial-flush mechanism is the
+best-supported *candidate* for why the lock never gets released, it is not
+confirmed as *the* cause, and the alternative — some other, unidentified
+global lock genuinely orphaned (taken once, its matching unlock never
+reached) — remains equally plausible from the evidence gathered.
+
+**New finding this session, not previously reported**: this is **not an
+infinite hang**. After the VM sat at this exact point for very close to 12
+minutes wall-clock (systemd unit `Started` 21:20:06, `Deactivated
+successfully` 21:32:09, **33m10s of cumulative CPU time consumed** across
+that ~12 minutes — confirming genuinely high multi-core activity throughout,
+matching the "CPU time keeps climbing" observation from prior sessions), the
+QEMU process **terminated on its own**. No new guest console output appeared
+before it did (log content and size are identical to the last live sample).
+No host-side OOM-kill or crash signal appears in the host kernel log for
+that window. This is consistent with `run_vm.sh`'s `-no-reboot` flag
+intercepting a guest-triggered reset (a silent panic or triple-fault the
+guest was never able to print anything about — plausibly because the
+emergency-print path needs the same stuck console resource) rather than
+QEMU crashing or being killed externally. **No prior session is recorded as
+having waited this long** — every earlier characterization ("stalls, CPU
+climbing, not investigated further") stopped well short of the point where
+this silent, fatal termination becomes visible.
+
+**Root cause is NOT in `fakefb.c`** (its own code runs correctly to the
+literal last line before the hang) **and is NOT in `OA.ko`** (init_module
+provably completed first, and OA.ko's own retry/delay code is bounded and
+fast on the no-hardware path exercised here) — both were checked and ruled
+out with source-level evidence, not just inference. The most defensible
+characterization achievable this session: a kernel-internal console/VT
+subsystem lock interaction, triggered for the first time ever in this VM's
+boot history by fakefb being the first framebuffer ever registered with a
+live VT console present, that this session could not resolve to one named
+lock/holder because **the running kernel's symbol table isn't available
+anywhere on this host** (`vmlinux.bin` is stripped — no `.symtab`; no
+`System.map` under the `RestoreDVD_SystemMNT` tree or the `linux-kronos`
+build tree).
+
+**Concrete next steps for a future session** (not attempted here — outside
+this session's time budget, and each needs either a config change validated
+over multiple boots or non-trivial kernel-build work):
+1. Get a live guest shell *before* the stall completes: `l3:3:wait:/etc/OA.rc
+   start` in `overlay/etc/inittab` blocks the `s1:3:respawn` interactive
+   shell from ever starting while `loadoa` (called from `OA.rc`) is stuck —
+   confirmed live (`telnet ...4444` got no response/connection-closed the
+   entire time). Backgrounding the `fakefb` insmod step in `loadoa`, or
+   moving the `s1` respawn to run unconditionally earlier in the boot
+   sequence, would allow reading `/proc/<insmod-pid>/wchan` or
+   `/proc/<pid>/stack` from the *live* guest kernel — which resolves symbols
+   from the running kernel's own internal kallsyms table, sidestepping the
+   stripped-`vmlinux.bin` problem entirely and giving a definitive answer.
+2. Obtain (or build) a `vmlinux`/`System.map` that actually matches this
+   exact `bzImage` (`RestoreDVD_SystemMNT/mnt/boot/bzImage`, built
+   2024-10-10) to symbolicate `0x40106c5e` (the contended lock) and
+   `0x4026ae2c` (CPU2's location) directly, instead of address-only static
+   disassembly.
+3. As a narrower, lower-effort experiment: try booting with
+   `CONFIG_FRAMEBUFFER_CONSOLE` disabled or `fbcon=map:10` (or otherwise
+   preventing VT take-over of the new fb device) to see if `register_
+   framebuffer()` then returns normally — this would confirm the fbcon
+   take-over chain specifically (vs. some other coincidental cause) without
+   needing symbols, at the cost of losing the on-screen text console (not
+   needed for this project's actual goal, which uses the serial console and
+   `/dev/fb1` via `screenremote`, not a VT text console).
+
+No code was changed this session (only a non-committed, host-local
+`BZIMAGE`/`kronos.img` path workaround used to launch the test on `kronosvm`
+— `run_vm.sh` itself is untouched). See
+`kronosology/.claude/agent-memory/re-decompiler/rtai_virtual_driver_substitute.md`
+for the cross-referenced note pointing here, and
+`kronosology/reconstructed/OA/HARDWARE_REVIEW_LOG.md` for the real-hardware
+verification item this raises (does real hardware's Super-I/O detection
+succeeding on the first probe round avoid ever exercising this code path at
+all, i.e. is this VM-only?).
+
+---
+
 ## 1. Host environment
 
 | Field | Value |
