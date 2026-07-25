@@ -340,3 +340,84 @@ and can't detect that case at all via pixels. Before that happens:
 Until that integration happens, `screenremote.c`'s screen-pixel detection
 remains the deployed source of truth; `eva_mode_peek.ko` stays a loaded (or
 easily reloadable) diagnostic.
+
+## sm_pommi_addr no longer needs manual recalibration per Eva build (2026-07-25)
+
+The above was written when `0x0ae431b0` was still assumed to be a fixed
+constant across every Eva build (true within the 2026-07-17 calibration
+session, never tested across an actual OS version bump). It isn't: a real
+console-less production unit came up with `eva_mode.ko`'s
+`STAGE=read_sm_pommi` (see `docs/api.md`'s `MODE_DETAIL` docs) for its
+entire boot. Root cause, confirmed by decrypting `Eva.img` out of the
+`KRONOS_Update_3_2_3` package (`kronosology/docs/crypto/cryptoloop_keys.md`'s
+recovered, unit-universal AES key) and reading its ELF `.symtab` directly:
+
+| Build | `CMMI::sm_poMMI` (`_ZN4CMMI8sm_poMMIE`) |
+|---|---|
+| 3.2.2 (`/home/share/Decomp/EVA_Decomp/Eva`) | `0x0ae431b0` |
+| 3.2.3 (extracted from `KRONOS_Update_3_2_3/mnt/korg/ro/Eva.img`) | `0x0ae43190` |
+
+A 0x20-byte shift - small, but enough to make `read_eva_u32()` dereference
+garbage. The fix isn't a new hardcoded constant for 3.2.3 (same problem,
+next update) - it's that **the real shipped Eva binary is not stripped**,
+on both builds checked (`readelf -s` finds 60k+ named symbols in each), so
+`sm_poMMI`'s address can be read directly out of Eva's own `.symtab` at
+runtime instead of guessed from a decompile and baked into the module.
+`source/screenremote.c`'s `elf32_find_symbol()`/`resolve_eva_sm_pommi_addr()`
+now do exactly that against `/korg/Eva/Eva` (the live cryptoloop mount, not
+a static file - autodetection happens once per boot, deferred/retried from
+the main loop until that mount exists) and push the result into
+`eva_mode.ko` live via its now-`0644` `sm_pommi_addr` sysfs param -
+`eva_mode_read_proc()` already re-reads that global fresh on every
+`/proc/.eva_mode` call, so no module reload is needed. The compiled-in
+`0x0ae431b0` default stays as a fallback for the (should be rare) case
+where autodetection never manages to run a given boot - never worse than
+today's prior behavior, just no longer the only path.
+
+### Getting the autodetection itself working took 3 more live-hardware cycles - here's why
+
+Shipped in 2.0.3 (`EVA_STAGE` stayed `read_sm_pommi` - autodetection
+silently never worked, no way yet to see why); 2.0.4 added `SM_POMMI_AUTO`
+to `MODE_DETAIL` for exactly this and got back `gave_up` - which turned out
+to be self-inflicted, the give-up code path overwrote the real failure
+reason instead of preserving it; 2.0.5 fixed that and got back
+`stat_or_too_small` - real, but too coarse to act on (fstat() failing vs. a
+genuinely-small file were the same bucket, no size/errno shown).
+
+**Root cause (found before burning a 4th blind cycle - an Opus review of
+the diagnostic code itself, verified independently against this project's
+own `/home/build/linux-kronos` tree and the actual shipped
+`build/screenremote` binary's disassembly): `fstat()` is silently broken
+for every call, on every file, on this specific target - unconditionally.**
+`source/screenremote.c` is built `-static -m32` against this build host's
+modern glibc (>= 2.33). Since glibc 2.33, `fstat()` is no longer a direct
+syscall - it compiles to `fstatat(fd, "", buf, AT_EMPTY_PATH)` (confirmed:
+`objdump -d build/screenremote`'s `__fstat` pushes `$0x1000` before calling
+`__fstatat`). The Kronos's real kernel, 2.6.32.11-korg, predates
+`AT_EMPTY_PATH` entirely (grep confirms it's undefined anywhere in
+`/home/build/linux-kronos/include/`), and its `vfs_fstatat()`
+(`fs/stat.c`) rejects any flag bit outside `AT_SYMLINK_NOFOLLOW` with a
+flat `-EINVAL` - so `fstat()` fails with `EINVAL` for every file,
+unconditionally, on real hardware. `stat()` (used elsewhere in this file)
+is unaffected - glibc compiles it as `fstatat(AT_FDCWD, path, buf, 0)`,
+and flag `0` passes the kernel's check - which is exactly why this was
+invisible everywhere except the two actual `fstat()` call sites in this
+file. Fix: get file size via `lseek(fd, 0, SEEK_END)` +
+`lseek(fd, 0, SEEK_SET)` instead, never `fstat()`, on this target.
+
+**This bug had a second, independent, previously-unknown casualty**:
+`load_boot_splash()`'s on-device override path (`BOOT_SPLASH_PATH`,
+user-deployable via FTP per `docs/api.md`'s "Boot splash" section) also
+called `fstat()` - meaning that override had silently never worked on any
+real unit, always falling straight through to the compiled-in embedded
+splash (or nothing) regardless of whether a real `boot_splash.bin` was
+actually deployed. Fixed the same way, same commit.
+
+**Lesson for next time a console-less unit needs a live-hardware-cycle
+fix**: when a diagnostic keeps coming back with a vague or surprising
+answer after 2+ redeploys, get a second independent review of the
+diagnostic code itself (not just the underlying feature) before spending a
+3rd/4th cycle - this exact bug (a build-host/target glibc-vs-kernel
+mismatch, not anything about ELF parsing or sysfs) would have been very
+hard to guess from the daemon's own vantage point, since `fstat()` fails
+identically regardless of what file it's pointed at.

@@ -165,6 +165,17 @@
  * module memory. Do not rmmod OA while this module is loaded regardless -
  * see project_oa_hot_swap_bug notes - the notifier only protects THIS
  * module's own calls, not the documented /proc/.shm refcount issue.
+ *
+ * VM-testing alternative (optional, off by default): the from-scratch
+ * OA.ko reconstruction under kronosology/reconstructed/OA is a differently
+ * compiled binary, so SINSTANCE_REL_OFFSET's fixed byte offset into
+ * HandleSwitchEvent's machine code does not apply to it. That project
+ * exposes a small non-real, testing-only accessor,
+ * CSTGFrontPanel_GetInstanceForTest(), that returns CSTGFrontPanel::sInstance
+ * directly. Passing its resolved address as the new `fn_sinstance_get`
+ * module param makes nks4_inject_setup()/frontpanel_this() call it instead
+ * of doing the offset read. Leaving `fn_sinstance_get` at its default (0)
+ * reproduces today's real-hardware behaviour exactly.
  */
 
 #include <linux/module.h>
@@ -210,6 +221,13 @@ static unsigned long fn_chord = 0;         /* RT_chord_trigger(uchar,uchar,uchar
                                              * slot-index convention. */
 module_param(fn_chord, ulong, 0444);
 
+static unsigned long fn_sinstance_get = 0; /* VM-testing only: resolved address of
+                                             * CSTGFrontPanel_GetInstanceForTest() in the
+                                             * OA reconstruction. Optional - leave 0 for
+                                             * real hardware (existing SINSTANCE_REL_OFFSET
+                                             * byte-read technique is used instead). */
+module_param(fn_sinstance_get, ulong, 0444);
+
 /* ------------------------------------------------------------------ */
 /*  Function pointer types - regparm(3) reproduces the confirmed ABI   */
 /*  exactly: GCC assigns the first 3 int/pointer args to EAX,EDX,ECX   */
@@ -230,6 +248,8 @@ typedef void (*short_invert_t)(unsigned char byte0, unsigned char byte1,
     __attribute__((regparm(3)));
 typedef void (*rt_chord_trigger_t)(unsigned char pad_index, unsigned char velocity,
                                     unsigned char param3, unsigned char param4)
+    __attribute__((regparm(3)));
+typedef void *(*sinstance_get_t)(void)
     __attribute__((regparm(3)));
 
 /* ------------------------------------------------------------------ */
@@ -264,10 +284,20 @@ static int kptr_ok(unsigned long p)
 }
 
 /* Dereference CSTGFrontPanel::sInstance fresh on every call - cheap, and
- * avoids caching a stale object pointer across an OA reload. */
+ * avoids caching a stale object pointer across an OA reload.
+ *
+ * VM-testing path: if fn_sinstance_get is set, call it directly - it
+ * already returns CSTGFrontPanel::sInstance's current VALUE (not the
+ * address of its storage), so the SINSTANCE_REL_OFFSET indirection below
+ * is skipped entirely. */
 static void *frontpanel_this(void)
 {
     void *p;
+    if (fn_sinstance_get) {
+        sinstance_get_t g = (sinstance_get_t)fn_sinstance_get;
+        p = g();
+        return kptr_ok((unsigned long)p) ? p : NULL;
+    }
     if (!sinstance_addr)
         return NULL;
     p = *(void **)sinstance_addr;
@@ -505,7 +535,13 @@ static struct notifier_block nks4_nb = {
 
 static void nks4_inject_setup(struct work_struct *work)
 {
-    if (fn_switch) {
+    if (fn_sinstance_get) {
+        /* VM-testing path: OA reconstruction exposes sInstance via a real
+         * accessor function - no offset-read needed, frontpanel_this()
+         * calls fn_sinstance_get() directly on every use. */
+        printk(KERN_INFO "nks4_inject: fn_sinstance_get=0x%lx set - using VM-testing "
+               "accessor instead of SINSTANCE_REL_OFFSET\n", fn_sinstance_get);
+    } else if (fn_switch) {
         unsigned long candidate = *(unsigned long *)(fn_switch + SINSTANCE_REL_OFFSET);
         if (kptr_ok(candidate)) {
             sinstance_addr = candidate;

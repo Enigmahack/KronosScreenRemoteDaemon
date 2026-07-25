@@ -153,6 +153,7 @@
 #include <linux/fb.h>
 #include <linux/uinput.h>
 #include <sys/syscall.h>
+#include <elf.h>
 #include "palette_data.h"
 #include "mode_detect_refs.h"
 #include "vkbd_ko.h"
@@ -179,7 +180,7 @@
 #define KBD_EV_KEY  1
 
 /*  Version */
-#define SCREENREMOTE_VERSION "1.13.0"
+#define SCREENREMOTE_VERSION "2.0.6"
 #ifndef BUILD_ID
 #define BUILD_ID "dev"
 #endif
@@ -318,6 +319,7 @@ static int g_last_gate_chord_assign = -1, g_last_gate_hit = -1;
 static uint32_t g_mode        = 0;   /* 0=init 1=Setlist 2=Combi 3=Program
                                          4=Sequence 5=Sampling 6=Global 7=Disk */
 static int g_eva_mode_loaded  = 0;   /* 1 once eva_mode.ko is loaded (see load_eva_mode_module()) */
+static int g_sm_pommi_resolve_pending = 0;  /* 1 = still trying to autodetect sm_pommi_addr; retry from main loop - see resolve_eva_sm_pommi_addr() */
 
 /* Sysinfo CPU snapshot (populated on-demand, only while connected) */
 typedef struct {
@@ -1071,6 +1073,24 @@ static uint32_t boot_splash_active_rows(void);
 struct boot_bar_geom { uint32_t row, col, max_width; };
 static int boot_progress_bar_state(struct boot_bar_geom *g, int *out_filled);
 
+/* Boot curve, measured on hardware (fb1, 8 bpp, sampled every 37th byte):
+ *   loading:  nonblack=0,  distinct=2   (67 s, dead flat - pure black + text)
+ *   UI drawn: nonblack>=21, distinct>=17 (Set List, the darkest default screen)
+ * "a single-second snap with an enormous margin" - see fb_metrics()'s own
+ * definition further down (needs fb1_map/fb1_stride/fb_h, established later
+ * in the file) for the full calibration writeup. Defined this early because
+ * both update_boot_state() (signal 3 of its boot-gate comment) and the
+ * deferred-midi_bridge-load code further down need them, and
+ * update_boot_state() comes first. */
+#define EVA_UI_NONBLACK_PCT 10   /* loading=0,  darkest UI=21 */
+#define EVA_UI_DISTINCT_MIN 8    /* loading=2,  darkest UI=17 */
+#define EVA_UI_READY_CHECKS 2    /* consecutive 1 s passes before loading */
+
+/* Forward decl - defined near the #defines just above, further down in the
+ * file. update_boot_state() below reuses this exact signal+thresholds as a
+ * third, independent boot-gate-clearing path - see its own comment for why. */
+static void fb_metrics(int *pct, int *distinct);
+
 /* Widest real fb_w this daemon has ever seen (800, the Kronos's native
  * panel width) - generously doubled as a sanity cap for send_frame()'s
  * stack-allocated bar-row scratch buffers below, so a corrupt/future
@@ -1631,6 +1651,369 @@ static int eva_mode_read(int *out_mode, int *out_editctx, int *out_slot, int *ou
     return 1;
 }
 
+/* Separate, deliberately independent of eva_mode_read() above: that function
+ * already throws away everything but RESOLVED/EVA_PID/SYS_MODE/EDITCTX_RAW/
+ * EDITCTX_SLOT (and returns 0 for every unresolved case alike), which is
+ * exactly the collapse that left a console-less production unit stuck on
+ * RESOLVED=0 for 30+ minutes with no way to tell why (see
+ * docs/EVA_ModeManager_probe.md). eva_mode.ko's /proc/.eva_mode now also
+ * emits STAGE= on any RESOLVED=0 line - find_task (no process named
+ * eva_comm was found at all - the SAME condition that starves
+ * update_boot_state()'s own independent find_eva_pid()/
+ * eva_uptime_seconds() fallback, so BOOT will never clear via the 180s
+ * override either), read_sm_pommi, or read_modemgr_ptr (Eva IS running,
+ * but the calibrated address doesn't hold what's expected for this Eva
+ * build). This is that field's only consumer - MODE_DETAIL - so a caller
+ * without any console/dropbear access still has a way to see it. Returns
+ * 0 (out_stage untouched) if eva_mode.ko isn't loaded, its /proc node
+ * isn't there, or the reading is actually RESOLVED=1 (nothing to report -
+ * callers should gate on eva_resolved instead, same as MODE_DETAIL does). */
+static int eva_mode_stage(char *out_stage, size_t cap)
+{
+    int fd, resolved = 0;
+    char buf[128], stage[32];
+    ssize_t n;
+
+    if (!g_eva_mode_loaded)
+        return 0;
+    fd = open("/proc/.eva_mode", O_RDONLY);
+    if (fd < 0)
+        return 0;
+    n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0)
+        return 0;
+    buf[n] = '\0';
+
+    if (sscanf(buf, "RESOLVED=%d", &resolved) != 1 || resolved)
+        return 0;
+    if (sscanf(buf, "RESOLVED=%*d\nSTAGE=%31s", stage) != 1)
+        return 0;
+    snprintf(out_stage, cap, "%s", stage);
+    return 1;
+}
+
+/* Autodetecting sm_pommi_addr instead of trusting eva_mode.ko's compiled-in
+ * default (a single VA calibrated against one specific Eva build - see
+ * docs/EVA_ModeManager_probe.md) - added after a real console-less
+ * production unit turned out to be running an Eva build whose sm_poMMI
+ * sits at a different address (STAGE=read_sm_pommi on MODE_DETAIL) than the
+ * dev unit this was calibrated against. The shipped Eva binary is NOT
+ * stripped (confirmed on two real extracted copies, 3.2.2 and 3.2.3 -
+ * readelf -s finds 60k+ named symbols in both), so the address doesn't
+ * need re-deriving from a decompile every time Korg ships a new Eva build:
+ * it can be read directly out of Eva's own on-disk ELF .symtab, the same
+ * way `nm`/`readelf -s` do it, entirely mechanically.
+ *
+ * EVA_SM_POMMI_SYMBOL is the Itanium-mangled name of `CMMI::sm_poMMI`
+ * (demangles via c++filt) - confirmed present, at the address that matches
+ * eva_mode.ko's own hardcoded default, in the real 3.2.2 Eva binary
+ * (/home/share/Decomp/EVA_Decomp/Eva); confirmed present at a DIFFERENT
+ * address (0x0ae43190 vs the hardcoded 0x0ae431b0 - a 0x20 byte shift) in
+ * the real 3.2.3 Eva binary extracted from KRONOS_Update_3_2_3/mnt/korg/ro/
+ * Eva.img, 2026-07-25 - the confirmed root cause of that unit's
+ * STAGE=read_sm_pommi. */
+#define EVA_BINARY_PATH     "/korg/Eva/Eva"
+#define EVA_SM_POMMI_SYMBOL "_ZN4CMMI8sm_poMMIE"   /* CMMI::sm_poMMI */
+#define SM_POMMI_RESOLVE_DEADLINE_S 120   /* give up retrying this many s after retries begin */
+
+/* Reads `path`'s ELF32 .symtab (via its owning section's sh_link to find the
+ * matching .strtab, not by section name - the SHT_SYMTAB/SHT_STRTAB sh_type
+ * fields are what actually define the relationship) looking for `symbol`.
+ * Every offset/size pulled from the file is bounds-checked against the
+ * actual file size before being used for a read - a truncated, corrupt, or
+ * unexpectedly-shaped file just fails closed (returns 0) rather than
+ * reading out of bounds or trusting attacker-shaped values; the path itself
+ * is a fixed constant, never derived from network/client input, but Eva.img
+ * being remounted mid-read (OS update, corruption) is a real possibility
+ * this guards against regardless. Returns 1 and fills *out_addr on a
+ * successful match, 0 otherwise.
+ *
+ * out_reason/reason_cap (if out_reason non-NULL): always filled with exactly
+ * which check failed, INCLUDING the concrete number behind it (errno, actual
+ * size, actual read() return value) wherever one exists - a first version of
+ * this just used a fixed string per checkpoint (e.g. a single
+ * "stat_or_too_small" covering both "fstat() itself failed" AND "file exists
+ * but is suspiciously small", with no size shown) and that collapsed two
+ * very different real answers into one useless bucket on the very first live
+ * deploy, costing a whole redeploy-and-check cycle to even notice. Takes a
+ * caller-owned buffer (not a `const char **` to a string literal) precisely
+ * so it can snprintf() live numbers in, not just point at static text.
+ *
+ * Deliberately uses lseek(SEEK_END)+lseek(SEEK_SET) for the file size,
+ * NEVER fstat() - root-caused live 2026-07-25 (see git history/session
+ * notes around this date): this binary is built with a modern glibc
+ * (>= 2.33) via `-static -m32` against the Kronos's real 2.6.32.11-korg
+ * kernel. Modern glibc's fstat() is no longer a direct syscall - it calls
+ * fstatat(fd, "", buf, AT_EMPTY_PATH) instead (confirmed by disassembling
+ * this project's own build/screenremote binary: `push $0x1000` before the
+ * call). This kernel's vfs_fstatat() (fs/stat.c) rejects ANY flag bit
+ * outside AT_SYMLINK_NOFOLLOW with -EINVAL, and doesn't even define
+ * AT_EMPTY_PATH (added to Linux well after 2.6.32) - so fstat() fails with
+ * EINVAL for EVERY file, unconditionally, on this exact target. stat()
+ * (used elsewhere in this file) is unaffected - glibc compiles it as
+ * fstatat(AT_FDCWD, path, buf, 0), and flag 0 passes the kernel's check -
+ * which is exactly why this bug was invisible everywhere except the two
+ * fstat() call sites in this file (this one, and load_boot_splash()'s,
+ * fixed the same way and at the same time). lseek() is unaffected either
+ * way - it's a plain syscall, no fstat-family involvement. */
+static int elf32_find_symbol(const char *path, const char *symbol,
+                              unsigned long *out_addr, char *out_reason, size_t reason_cap)
+{
+    int fd, ok = 0;
+    Elf32_Ehdr eh;
+    Elf32_Shdr *shdrs = NULL;
+    Elf32_Sym  *syms  = NULL;
+    char       *strtab = NULL;
+    off_t fsize;
+    int i;
+#define SETREASON(...) do { if (out_reason) snprintf(out_reason, reason_cap, __VA_ARGS__); } while (0)
+
+    fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        if (errno == ENOENT)
+            SETREASON("not_mounted_yet");
+        else
+            SETREASON("open_failed_errno_%d", errno);
+        return 0;
+    }
+    fsize = lseek(fd, 0, SEEK_END);
+    if (fsize < 0) {
+        SETREASON("lseek_end_failed_errno_%d", errno);
+        goto out;
+    }
+    if (lseek(fd, 0, SEEK_SET) != 0) {
+        SETREASON("lseek_rewind_failed_errno_%d", errno);
+        goto out;
+    }
+    if (fsize < (off_t)sizeof(eh)) {
+        SETREASON("too_small_size_%lld", (long long)fsize);
+        goto out;
+    }
+    {
+        ssize_t n;
+        errno = 0;
+        n = read(fd, &eh, sizeof(eh));
+        if (n != (ssize_t)sizeof(eh)) {
+            SETREASON("ehdr_read_ret_%zd_errno_%d", n, errno);
+            goto out;
+        }
+    }
+    if (memcmp(eh.e_ident, ELFMAG, SELFMAG) != 0 ||
+        eh.e_ident[EI_CLASS] != ELFCLASS32) {
+        SETREASON("bad_elf_magic_or_class_%02x%02x%02x%02x_%d",
+                   eh.e_ident[0], eh.e_ident[1], eh.e_ident[2], eh.e_ident[3], eh.e_ident[EI_CLASS]);
+        goto out;
+    }
+    if (eh.e_shoff == 0 || eh.e_shnum == 0 || eh.e_shentsize != sizeof(Elf32_Shdr)) {
+        SETREASON("bad_shtab_header_off_%u_num_%u_entsz_%u",
+                   (unsigned)eh.e_shoff, (unsigned)eh.e_shnum, (unsigned)eh.e_shentsize);
+        goto out;
+    }
+    if ((unsigned long long)eh.e_shoff +
+        (unsigned long long)eh.e_shnum * sizeof(Elf32_Shdr) > (unsigned long long)fsize) {
+        SETREASON("shtab_out_of_bounds");
+        goto out;
+    }
+
+    shdrs = malloc((size_t)eh.e_shnum * sizeof(Elf32_Shdr));
+    if (!shdrs) {
+        SETREASON("alloc_failed_shdrs");
+        goto out;
+    }
+    if (lseek(fd, (off_t)eh.e_shoff, SEEK_SET) < 0) {
+        SETREASON("shtab_lseek_errno_%d", errno);
+        goto out;
+    }
+    {
+        size_t want = (size_t)eh.e_shnum * sizeof(Elf32_Shdr);
+        ssize_t n;
+        errno = 0;
+        n = read(fd, shdrs, want);
+        if (n != (ssize_t)want) {
+            SETREASON("shtab_read_ret_%zd_of_%zu_errno_%d", n, want, errno);
+            goto out;
+        }
+    }
+
+    SETREASON("no_symtab_section_of_%u", (unsigned)eh.e_shnum);
+    for (i = 0; i < eh.e_shnum; i++) {
+        Elf32_Shdr *symtab_sh = &shdrs[i];
+        Elf32_Shdr *strtab_sh;
+        uint32_t nsyms, j;
+
+        if (symtab_sh->sh_type != SHT_SYMTAB)
+            continue;
+        if (symtab_sh->sh_link >= (Elf32_Word)eh.e_shnum) {
+            SETREASON("symtab_bad_sh_link_%u", (unsigned)symtab_sh->sh_link);
+            break;
+        }
+        strtab_sh = &shdrs[symtab_sh->sh_link];
+        if (strtab_sh->sh_type != SHT_STRTAB ||
+            symtab_sh->sh_entsize != sizeof(Elf32_Sym) || symtab_sh->sh_size == 0 ||
+            strtab_sh->sh_size == 0) {
+            SETREASON("symtab_shape_mismatch");
+            break;
+        }
+        if ((unsigned long long)symtab_sh->sh_offset + symtab_sh->sh_size > (unsigned long long)fsize ||
+            (unsigned long long)strtab_sh->sh_offset + strtab_sh->sh_size > (unsigned long long)fsize) {
+            SETREASON("symtab_or_strtab_out_of_bounds");
+            break;
+        }
+
+        nsyms = symtab_sh->sh_size / sizeof(Elf32_Sym);
+        syms   = malloc((size_t)nsyms * sizeof(Elf32_Sym));
+        strtab = malloc((size_t)strtab_sh->sh_size);
+        if (!syms || !strtab) {
+            SETREASON("alloc_failed_symtab_n_%u", (unsigned)nsyms);
+            break;
+        }
+        if (lseek(fd, (off_t)symtab_sh->sh_offset, SEEK_SET) < 0) {
+            SETREASON("symtab_lseek_errno_%d", errno);
+            break;
+        }
+        {
+            size_t want = (size_t)nsyms * sizeof(Elf32_Sym);
+            ssize_t n;
+            errno = 0;
+            n = read(fd, syms, want);
+            if (n != (ssize_t)want) {
+                SETREASON("symtab_read_ret_%zd_of_%zu_errno_%d", n, want, errno);
+                break;
+            }
+        }
+        if (lseek(fd, (off_t)strtab_sh->sh_offset, SEEK_SET) < 0) {
+            SETREASON("strtab_lseek_errno_%d", errno);
+            break;
+        }
+        errno = 0;
+        if (read(fd, strtab, (size_t)strtab_sh->sh_size) != (ssize_t)strtab_sh->sh_size) {
+            SETREASON("strtab_read_failed_errno_%d", errno);
+            break;
+        }
+        strtab[strtab_sh->sh_size - 1] = '\0';   /* guard strcmp() below against a truncated last name */
+
+        SETREASON("symbol_not_found_of_%u", (unsigned)nsyms);
+        for (j = 0; j < nsyms; j++) {
+            if (syms[j].st_name == 0 || syms[j].st_name >= strtab_sh->sh_size)
+                continue;
+            if (strcmp(strtab + syms[j].st_name, symbol) == 0) {
+                *out_addr = (unsigned long)syms[j].st_value;
+                ok = 1;
+                SETREASON("ok");
+                break;
+            }
+        }
+        break;   /* a normal ELF exec has exactly one SHT_SYMTAB */
+    }
+
+out:
+#undef SETREASON
+    free(shdrs);
+    free(syms);
+    free(strtab);
+    close(fd);
+    return ok;
+}
+
+#define EVA_SM_POMMI_SYSFS_PATH "/sys/module/eva_mode/parameters/sm_pommi_addr"
+
+/* Live-overrides eva_mode.ko's sm_pommi_addr module param via sysfs
+ * (module_param(sm_pommi_addr, ulong, 0644) - see eva_mode.c) rather than
+ * needing a module reload: eva_mode_read_proc() re-reads the global fresh
+ * on every /proc/.eva_mode call, so this takes effect on the very next
+ * read. Returns 1 on success. out_reason/reason_cap (if out_reason
+ * non-NULL) get a specific failure string, same rationale as
+ * elf32_find_symbol()'s identical parameters - this used to just return 0
+ * with no way to tell "couldn't open the sysfs file at all" (e.g. /sys not
+ * mounted yet, or this kernel/build somehow not exposing per-module
+ * parameter sysfs files) apart from "wrote it, but the kernel rejected the
+ * value", which are very different problems. Also reads the value straight
+ * back after writing and confirms it round-trips - turns "I assume the
+ * kernel took it" into a verified fact for the caller, cheap since it's a
+ * handful of bytes on an already-open-able sysfs file. */
+static int write_eva_sm_pommi_addr(unsigned long addr, char *out_reason, size_t reason_cap)
+{
+    char buf[32];
+    int fd, len;
+    ssize_t n;
+#define SETWREASON(...) do { if (out_reason) snprintf(out_reason, reason_cap, __VA_ARGS__); } while (0)
+
+    fd = open(EVA_SM_POMMI_SYSFS_PATH, O_WRONLY);
+    if (fd < 0) {
+        SETWREASON("wr_open_errno_%d", errno);
+        return 0;
+    }
+    len = snprintf(buf, sizeof(buf), "%lu\n", addr);
+    errno = 0;
+    n = write(fd, buf, (size_t)len);
+    close(fd);
+    if (n != len) {
+        SETWREASON("wr_ret_%zd_of_%d_errno_%d", n, len, errno);
+        return 0;
+    }
+
+    /* Read back and confirm - a successful write() only proves the kernel
+     * accepted the bytes, not that param_set_ulong() parsed them the way
+     * we expect (see eva_mode.c: strict_strtoul(), base 0). */
+    fd = open(EVA_SM_POMMI_SYSFS_PATH, O_RDONLY);
+    if (fd < 0) {
+        SETWREASON("wr_readback_open_errno_%d", errno);
+        return 0;
+    }
+    {
+        char rbuf[32];
+        unsigned long readback = 0;
+        n = read(fd, rbuf, sizeof(rbuf) - 1);
+        close(fd);
+        if (n <= 0) {
+            SETWREASON("wr_readback_read_ret_%zd_errno_%d", n, errno);
+            return 0;
+        }
+        rbuf[n] = '\0';
+        if (sscanf(rbuf, "%lu", &readback) != 1 || readback != addr) {
+            SETWREASON("wr_readback_mismatch_got_%lu", readback);
+            return 0;
+        }
+    }
+    SETWREASON("ok");
+#undef SETWREASON
+    return 1;
+}
+
+/* Last known state of the autodetect attempt below - not just a bool,
+ * because "it isn't working" needs to be diagnosable on a unit with no
+ * console (see elf32_find_symbol()'s *out_reason and MODE_DETAIL's
+ * SM_POMMI_AUTO field, its only consumer). Values: "pending" (initial,
+ * before the first attempt); any of elf32_find_symbol()'s SETREASON()
+ * strings while still retrying (a lookup failure, e.g. "not_mounted_yet" or
+ * "too_small_size_4096"); "write_failed:<reason>" (resolved fine, sysfs
+ * write/readback didn't stick - see write_eva_sm_pommi_addr(), still
+ * retrying, NOT terminal); "ok" is never actually stored here (a
+ * successful write logs and clears g_sm_pommi_resolve_pending without
+ * touching this string, so it's left holding elf32_find_symbol()'s last
+ * "ok" from the resolve step - harmless, MODE_DETAIL callers should gate on
+ * EVA_RESOLVED/EVA_STAGE for "did it actually work", not this field once
+ * pending goes to 0); or "gave_up:<last-reason>" once the retry deadline
+ * hits with no successful+verified write - still on eva_mode.ko's
+ * compiled-in default at that point. */
+static char g_sm_pommi_status[80] = "pending";   /* sized for the worst-case formatted reason string, see elf32_find_symbol()'s SETREASON() calls */
+
+/* Thin, named wrapper around elf32_find_symbol() for the one symbol this
+ * daemon actually needs - see its own header comment above (and
+ * EVA_BINARY_PATH/EVA_SM_POMMI_SYMBOL) for the full "why". Called from the
+ * main loop's deferred retry (arms on g_sm_pommi_resolve_pending, set
+ * alongside eva_mode.ko's load) - each attempt is a single open()+couple of
+ * read()s, cheap enough to poll once/sec same as the other deferred
+ * loads. Fails silently (returns 0) until EVA_BINARY_PATH's cryptoloop
+ * mount actually exists - not an error, just "not there yet" - but always
+ * updates g_sm_pommi_status with the specific reason either way. */
+static int resolve_eva_sm_pommi_addr(unsigned long *out_addr)
+{
+    return elf32_find_symbol(EVA_BINARY_PATH, EVA_SM_POMMI_SYMBOL, out_addr,
+                              g_sm_pommi_status, sizeof(g_sm_pommi_status));
+}
+
 /* Single source of truth for MODE=/EDITCTX= everywhere they're reported
  * (STATE, SYSINFO, MODE_DETAIL): prefers eva_mode.ko's direct memory read
  * (exact - no color thresholds, and the only source that can ever report
@@ -1714,7 +2097,7 @@ static int nks4_progress_read(int *out_pct, int *out_hwver)
  * while in Combi") is exactly what that looks like - a false-confident
  * reading, not a real one. See docs/EVA_ModeManager_probe.md.
  *
- * Two independent, layered signals clear the gate; either is sufficient:
+ * Three independent, layered signals clear the gate; any one is sufficient:
  *
  *   1. Debounced EVA_RESOLVED - eva_mode.ko must report RESOLVED=1 with the
  *      SAME (SYS_MODE, EDITCTX_RAW) pair continuously for EVA_DEBOUNCE_MS.
@@ -1737,6 +2120,30 @@ static int nks4_progress_read(int *out_pct, int *out_hwver)
  *      permanently read-only, which would be a regression, not a safety
  *      win.
  *
+ *   3. EVA UI rendering (fb_metrics(), added 2026-07-25) - reuses, verbatim,
+ *      the exact same nonblack%/distinct-palette-index signal and
+ *      EVA_UI_NONBLACK_PCT/EVA_UI_DISTINCT_MIN/EVA_UI_READY_CHECKS this file
+ *      already trusts to time midi_bridge's load (see its own header
+ *      comment further down for the calibration: loading is 0%/2 indices,
+ *      even the darkest real UI is 21%/17 - "a single-second snap with an
+ *      enormous margin"). Exists because (1) depends on eva_mode.ko
+ *      resolving a specific hardcoded Eva-process VA (sm_pommi_addr) that
+ *      is calibrated per Eva build and can legitimately be wrong for a
+ *      build/OS revision it wasn't calibrated against (see EVA_STAGE=
+ *      read_sm_pommi on MODE_DETAIL) - live-confirmed on real hardware
+ *      2026-07-25: EVA_STAGE stuck at read_sm_pommi (Eva running, address
+ *      wrong for this build) while this exact fb_metrics() signal was
+ *      already firing correctly (midi_bridge loaded fine same boot). (2)
+ *      is a safety net for that case too via the 180s timer, but a slow
+ *      one; this is as fast as (1) normally is, entirely independent of
+ *      eva_mode.ko, and no less trustworthy than what this file already
+ *      lets gate a live kernel-level queue tap into Eva's own MIDI I/O -
+ *      a strictly more delicate operation than accepting a BUTTON/TOUCH
+ *      command. Does NOT by itself prove EDITCTX/SYS_MODE are readable
+ *      (that's what STAGE=read_sm_pommi/read_modemgr_ptr on MODE_DETAIL is
+ *      for) - only that Eva is unambiguously past its loading screen and
+ *      normal command handling is safe, which is all this gate promises.
+ *
  * g_boot_active is a one-way latch: once cleared it stays cleared for the
  * rest of this process's life. The OS doesn't "re-boot" without restarting
  * screenremote itself (which resets every global fresh), so there is no
@@ -1753,6 +2160,13 @@ static int             g_eva_streak_mode    = -1;
 static int             g_eva_streak_editctx = -1;
 static int             g_eva_streak_active  = 0;
 static struct timespec g_eva_streak_since;
+
+/* Debounce streak state for signal (3) above - deliberately separate from
+ * main()'s own eva_ready_streak (which gates midi_bridge's load and stops
+ * being read once that one-shot fires) since this needs to keep counting
+ * for the life of g_boot_active regardless of midi_bridge's own state
+ * (kill-switched, already loaded, or a .boot-flag-skipped boot entirely). */
+static int g_eva_ui_streak = 0;
 
 /* Scans /proc for the lowest-PID process with comm=="Eva" - same tie-break
  * eva_mode.ko's find_eva_mm() uses, for the same reason (a transient
@@ -1942,6 +2356,25 @@ static void update_boot_state(void)
             fprintf(stderr, "screenremote: boot gate cleared (Eva pid=%d alive %lds)\n", pid, up);
         }
     }
+
+    /* Signal (3) - see the block comment above for the full "why" (reuses
+     * midi_bridge's own proven EVA-UI-rendering signal). Guarded on
+     * g_boot_active still being set so a clear from (1) or (2) above this
+     * same call doesn't pay for an extra fb_metrics() sample or double-log. */
+    if (g_boot_active) {
+        int pct = 0, dist = 0;
+        fb_metrics(&pct, &dist);
+        if (pct >= EVA_UI_NONBLACK_PCT && dist >= EVA_UI_DISTINCT_MIN) {
+            if (++g_eva_ui_streak >= EVA_UI_READY_CHECKS) {
+                g_boot_active = 0;
+                free(g_boot_splash); g_boot_splash = NULL;
+                fprintf(stderr, "screenremote: boot gate cleared (EVA UI rendering: "
+                                 "nonblack=%d distinct=%d)\n", pct, dist);
+            }
+        } else {
+            g_eva_ui_streak = 0;
+        }
+    }
 }
 
 /* Commands answered regardless of ctrl ownership AND regardless of the boot
@@ -2047,20 +2480,33 @@ static int parse_boot_splash_buf(const uint8_t *buf, size_t len, const char *sou
  * HAVE_EMBEDDED_BOOT_SPLASH above) when that file is missing or fails
  * validation. Neither source available is not an error - compositing
  * simply stays off and the client sees the plain (mostly-black) live fb1
- * capture during boot, same as before this feature existed. */
+ * capture during boot, same as before this feature existed.
+ *
+ * Sizes via lseek(SEEK_END)+lseek(SEEK_SET), NEVER fstat() - this daemon's
+ * fstat() calls fail unconditionally on real hardware (modern glibc's
+ * fstat() compiles to fstatat(fd,"",buf,AT_EMPTY_PATH); this kernel's
+ * vfs_fstatat() rejects any flag outside AT_SYMLINK_NOFOLLOW with -EINVAL
+ * and predates AT_EMPTY_PATH entirely - root-caused 2026-07-25, see
+ * elf32_find_symbol()'s identical fix and header comment for the full
+ * writeup). Before this fix, this function's on-device override path was
+ * silently DEAD on every real unit - fstat() always failed, so this always
+ * fell straight through to the embedded copy (or nothing) regardless of
+ * whether BOOT_SPLASH_PATH actually existed - the same bug, independently
+ * discovered here while fixing it for sm_pommi_addr autodetection. */
 static void load_boot_splash(void)
 {
     int fd;
-    struct stat st;
+    off_t fsize;
     uint8_t *filebuf;
 
     fd = open(BOOT_SPLASH_PATH, O_RDONLY);
     if (fd >= 0) {
-        if (fstat(fd, &st) == 0 && st.st_size > 0 && st.st_size <= 8 * 1024 * 1024) {
-            filebuf = malloc((size_t)st.st_size);
+        fsize = lseek(fd, 0, SEEK_END);
+        if (fsize > 0 && fsize <= 8 * 1024 * 1024 && lseek(fd, 0, SEEK_SET) == 0) {
+            filebuf = malloc((size_t)fsize);
             if (filebuf) {
-                if (read(fd, filebuf, (size_t)st.st_size) == st.st_size &&
-                        parse_boot_splash_buf(filebuf, (size_t)st.st_size, BOOT_SPLASH_PATH)) {
+                if (read(fd, filebuf, (size_t)fsize) == fsize &&
+                        parse_boot_splash_buf(filebuf, (size_t)fsize, BOOT_SPLASH_PATH)) {
                     free(filebuf);
                     close(fd);
                     return;
@@ -2738,11 +3184,17 @@ static int sysinfo_collect(char *out, int outsz)
 /* MIDI helpers */
 
 static void resolve_kallsyms(unsigned long *recv_fn,    unsigned long *reg_fn,
-                              unsigned long *outport_fn)
+                              unsigned long *outport_fn, unsigned long *inports_get,
+                              unsigned long *outports_get)
 {
     FILE *f = fopen("/proc/kallsyms", "r");
     char line[256];
     *recv_fn = *reg_fn = *outport_fn = 0;
+    /* VM-testing-only: these two accessors only exist in the from-scratch
+     * reconstructed OA.ko used in the QEMU VM (real Kronos OA.ko never
+     * exports them), so on real hardware this lookup simply never matches
+     * and both stay 0 - a safe no-op by construction. */
+    *inports_get = *outports_get = 0;
     if (!f) return;
     while (fgets(line, sizeof(line), f)) {
         unsigned long addr; char type, name[256];
@@ -2750,6 +3202,10 @@ static void resolve_kallsyms(unsigned long *recv_fn,    unsigned long *reg_fn,
         if      (!*recv_fn     && strstr(name, "MidiInPortGeneric7Receive"))   *recv_fn     = addr;
         else if (!*reg_fn      && strstr(name, "RegisterMidiInPort"))          *reg_fn      = addr;
         else if (!*outport_fn  && strstr(name, "RegisterMidiOutPort"))         *outport_fn  = addr;
+        else if (!*inports_get  && strstr(name, "CSTGMidiPortManager_GetInPortsArrayForTest"))
+            *inports_get  = addr;
+        else if (!*outports_get && strstr(name, "CSTGMidiPortManager_GetOutPortsArrayForTest"))
+            *outports_get = addr;
         if (*recv_fn && *reg_fn && *outport_fn) break;
     }
     fclose(f);
@@ -2779,12 +3235,18 @@ static void resolve_kallsyms(unsigned long *recv_fn,    unsigned long *reg_fn,
 
 static void resolve_nks4_kallsyms(unsigned long *fn_switch, unsigned long *fn_touch,
                                    unsigned long *fn_rotary, unsigned long *fn_analog,
-                                   unsigned long *fn_invert, unsigned long *fn_chord)
+                                   unsigned long *fn_invert, unsigned long *fn_chord,
+                                   unsigned long *fn_sinstance_get)
 {
     FILE *f = fopen("/proc/kallsyms", "r");
     unsigned long km_note_out = 0;
     char line[256];
     *fn_switch = *fn_touch = *fn_rotary = *fn_analog = *fn_invert = *fn_chord = 0;
+    /* VM-testing-only: CSTGFrontPanel_GetInstanceForTest only exists in the
+     * from-scratch reconstructed OA.ko used in the QEMU VM (real Kronos
+     * OA.ko never exports it), so on real hardware this stays 0 - a safe
+     * no-op by construction. */
+    *fn_sinstance_get = 0;
     if (!f) return;
     while (fgets(line, sizeof(line), f)) {
         unsigned long addr; char type, name[256];
@@ -2804,6 +3266,8 @@ static void resolve_nks4_kallsyms(unsigned long *fn_switch, unsigned long *fn_to
             *fn_invert = addr;
         else if (!km_note_out && strstr(name, "Do_KM_note_out_chord_trig"))
             km_note_out = addr;
+        else if (!*fn_sinstance_get && strstr(name, "CSTGFrontPanel_GetInstanceForTest"))
+            *fn_sinstance_get = addr;
         if (*fn_switch && *fn_touch && *fn_rotary && *fn_analog && *fn_invert && km_note_out)
             break;
     }
@@ -3838,7 +4302,8 @@ static void process_ctrl_cmd(const char *line, int fd)
          * the two STATE fields, or want to confirm eva_mode.ko is actually
          * in play rather than the pixel fallback. BOOT is the same
          * server-side boot gate STATE reports - see update_boot_state(). */
-        char resp[128];
+        char resp[320];   /* generous margin over the longest realistic EVA_STAGE/SM_POMMI_AUTO combination - rlen is still clamped below regardless */
+        char stage[32] = "";
         int  rlen, mode, editctx, eva_mode2 = 0, eva_editctx2 = 0, eva_slot = -1;
         const char *src;
         int eva_resolved = eva_mode_read(&eva_mode2, &eva_editctx2, &eva_slot, NULL);
@@ -3849,12 +4314,31 @@ static void process_ctrl_cmd(const char *line, int fd)
          * are left as real live values on purpose - they describe the boot
          * gate's OWN progress (is eva_mode.ko loaded, has it resolved a
          * reading at all), which is exactly what this command exists to let
-         * a caller watch, not synth state the client could mistakenly act on. */
+         * a caller watch, not synth state the client could mistakenly act on.
+         * EVA_STAGE is the same idea one level deeper - see eva_mode_stage()'s
+         * own header comment - only meaningful (non-empty) while
+         * EVA_RESOLVED=0, so it's simply omitted otherwise rather than
+         * printed as a confusing empty field. SM_POMMI_AUTO is a DIFFERENT
+         * process entirely - not eva_mode.ko reading Eva, but this daemon's
+         * own attempt to autodetect/correct sm_pommi_addr for eva_mode.ko to
+         * use (see resolve_eva_sm_pommi_addr()) - always shown regardless of
+         * EVA_RESOLVED, since a stuck "pending"/failure-reason state is
+         * exactly the thing to check when EVA_STAGE=read_sm_pommi never
+         * clears despite this having supposedly run. */
         if (g_boot_active) { mode = 0; editctx = 0; src = "none"; eva_slot = -1; }
+        if (!eva_resolved)
+            eva_mode_stage(stage, sizeof(stage));
         rlen = snprintf(resp, sizeof(resp),
-                         "SOURCE=%s MODE=%u EDITCTX=%d EDITSLOT=%d EVA_LOADED=%d EVA_RESOLVED=%d BOOT=%d\n",
+                         "SOURCE=%s MODE=%u EDITCTX=%d EDITSLOT=%d EVA_LOADED=%d EVA_RESOLVED=%d "
+                         "EVA_STAGE=%s SM_POMMI_AUTO=%s BOOT=%d\n",
                          src, (unsigned)mode, editctx,
-                         eva_resolved ? eva_slot : -1, g_eva_mode_loaded, eva_resolved, g_boot_active);
+                         eva_resolved ? eva_slot : -1, g_eva_mode_loaded, eva_resolved,
+                         stage[0] ? stage : "-", g_sm_pommi_status, g_boot_active);
+        /* snprintf() returns the would-be length, not the truncated one - clamp
+         * before handing it to REPLY()/write_all() so a future longer status
+         * string can never turn into an out-of-bounds read here. */
+        if (rlen > (int)sizeof(resp))
+            rlen = (int)sizeof(resp);
         REPLY(resp, (size_t)rlen);
 
     } else if (strcmp(line, "VERSION") == 0) {
@@ -4118,10 +4602,11 @@ static int capture_to_staging(void)
  * The transition is a single-second snap with an enormous margin, so we AND two
  * signals - non-black% (brightness) AND distinct palette-index count
  * (colorfulness, immune to a dark UI) - and require both held for a couple of
- * seconds so no one-frame anomaly can trip it.  Loading fails both by a mile. */
-#define EVA_UI_NONBLACK_PCT 10   /* loading=0,  darkest UI=21 */
-#define EVA_UI_DISTINCT_MIN 8    /* loading=2,  darkest UI=17 */
-#define EVA_UI_READY_CHECKS 2    /* consecutive 1 s passes before loading */
+ * seconds so no one-frame anomaly can trip it.  Loading fails both by a mile.
+ * EVA_UI_NONBLACK_PCT/EVA_UI_DISTINCT_MIN/EVA_UI_READY_CHECKS themselves are
+ * defined earlier in the file, alongside fb_metrics()'s forward decl - both
+ * update_boot_state() (signal 3, see its own block comment) and this deferred
+ * midi_bridge load need them, and update_boot_state() is defined first. */
 /* Sample fb1 sparsely and report two independent "is EVA's UI up?" measures:
  *   *pct      = percent of sampled pixels that are non-black (brightness)
  *   *distinct = number of distinct 8-bpp palette indices seen (colorfulness)
@@ -4158,6 +4643,8 @@ static void fb_metrics(int *pct, int *distinct)
 static void load_midi_bridge(void)
 {
     unsigned long recv_fn = 0, reg_fn = 0, outport_fn = 0;
+    /* VM-testing-only (see resolve_kallsyms()): 0/unset on real hardware. */
+    unsigned long inports_get = 0, outports_get = 0;
     char params[512];
     long ret;
 
@@ -4167,14 +4654,15 @@ static void load_midi_bridge(void)
         fprintf(stderr, "screenremote: OA not Live at midi_bridge load - MIDI disabled\n");
         return;
     }
-    resolve_kallsyms(&recv_fn, &reg_fn, &outport_fn);
+    resolve_kallsyms(&recv_fn, &reg_fn, &outport_fn, &inports_get, &outports_get);
     if (!outport_fn) {
         fprintf(stderr, "screenremote: no usable MIDI symbols in kallsyms - MIDI disabled\n");
         return;
     }
     snprintf(params, sizeof(params),
-             "receive_fn=0x%lx register_fn=0x%lx regoutport=0x%lx eva_ready=1 tap_shared=1",
-             recv_fn, reg_fn, outport_fn);
+             "receive_fn=0x%lx register_fn=0x%lx regoutport=0x%lx eva_ready=1 tap_shared=1 "
+             "fn_inports_get=0x%lx fn_outports_get=0x%lx",
+             recv_fn, reg_fn, outport_fn, inports_get, outports_get);
     extract_ko(MIDI_BRIDGE_KO, midi_bridge_ko, midi_bridge_ko_len);
     ret = syscall(SYS_init_module, (void *)midi_bridge_ko,
                   (unsigned long)midi_bridge_ko_len, params);
@@ -4227,6 +4715,8 @@ static int try_load_nks4_inject(int live_wait_ds)
 {
     unsigned long fn_switch = 0, fn_touch = 0, fn_rotary = 0, fn_analog = 0, fn_invert = 0;
     unsigned long fn_chord = 0;
+    /* VM-testing-only (see resolve_nks4_kallsyms()): 0/unset on real hardware. */
+    unsigned long fn_sinstance_get = 0;
     char params[320];
     long ret;
 
@@ -4235,7 +4725,8 @@ static int try_load_nks4_inject(int live_wait_ds)
     if (!wait_for_oa_live(live_wait_ds))
         return 0;                            /* OA not Live yet - caller may retry */
 
-    resolve_nks4_kallsyms(&fn_switch, &fn_touch, &fn_rotary, &fn_analog, &fn_invert, &fn_chord);
+    resolve_nks4_kallsyms(&fn_switch, &fn_touch, &fn_rotary, &fn_analog, &fn_invert, &fn_chord,
+                           &fn_sinstance_get);
     if (!fn_switch || !fn_touch || !fn_rotary || !fn_analog || !fn_invert) {
         fprintf(stderr, "screenremote: missing NKS4 symbols in kallsyms "
                 "(switch=%s touch=%s rotary=%s analog=%s invert=%s) - "
@@ -4252,8 +4743,8 @@ static int try_load_nks4_inject(int live_wait_ds)
      * (inject_chord() checks fn_chord itself) - doesn't block the other 5. */
     snprintf(params, sizeof(params),
              "fn_switch=0x%lx fn_touch=0x%lx fn_rotary=0x%lx fn_analog=0x%lx fn_invert=0x%lx "
-             "fn_chord=0x%lx",
-             fn_switch, fn_touch, fn_rotary, fn_analog, fn_invert, fn_chord);
+             "fn_chord=0x%lx fn_sinstance_get=0x%lx",
+             fn_switch, fn_touch, fn_rotary, fn_analog, fn_invert, fn_chord, fn_sinstance_get);
     if (!fn_chord)
         fprintf(stderr, "screenremote: fn_chord not resolved - PADCHORD will be unavailable\n");
     extract_ko(NKS4_INJECT_KO, nks4_inject_ko, nks4_inject_ko_len);
@@ -4425,6 +4916,8 @@ int main(void)
     time_t last_mirror_chk = 0, last_net_chk = 0, last_eva_chk = 0, last_boot_chk = 0;
     time_t last_nks4_chk = 0;          /* throttle deferred nks4_inject retry (1/s) */
     time_t nks4_retry_t0 = 0;          /* when deferred retry began - give-up anchor */
+    time_t last_sm_pommi_chk = 0;      /* throttle deferred sm_pommi_addr autodetect retry (1/s) */
+    time_t sm_pommi_retry_t0 = 0;      /* when that retry began - give-up anchor */
     time_t g_start_time = time(NULL);  /* for FBCURVE relative timestamps */
     int eva_ready_streak = 0;          /* consecutive EVA-UI-detected checks */
     struct timespec last_frame = {0, 0};
@@ -4538,6 +5031,13 @@ int main(void)
             g_eva_mode_loaded = (_emret == 0 || errno == EEXIST);
             fprintf(stderr, "screenremote: eva_mode %s\n",
                     g_eva_mode_loaded ? "loaded" : "load failed - falling back to pixel mode detection");
+            /* Loaded with sm_pommi_addr at its compiled-in default (params="" above) -
+             * accurate only for whatever Eva build that default was calibrated
+             * against. Arm the deferred autodetect retry (main loop) to correct it
+             * live via sysfs the moment EVA_BINARY_PATH's ELF symbol table becomes
+             * readable - see resolve_eva_sm_pommi_addr()'s own header comment. No
+             * point arming it if the module itself didn't load. */
+            g_sm_pommi_resolve_pending = g_eva_mode_loaded;
         }
 
         /* Front-panel injection module: safe to load this early too (see
@@ -4776,6 +5276,79 @@ int main(void)
                         NKS4_LOAD_DEADLINE_S);
                 g_nks4_load_pending = 0;   /* give up gracefully */
                 nks4_give_up("OA never went Live within the retry deadline");
+            }
+        }
+
+        /* Deferred sm_pommi_addr autodetect retry - own block, same shape as
+         * nks4_inject's above (own throttle/give-up-anchor vars, doesn't share
+         * last_eva_chk with the FBCURVE/midi chain so it can't be starved by
+         * either). EVA_BINARY_PATH lives inside the Eva.img cryptoloop mount,
+         * which may not exist yet this early - keep probing once/sec until it
+         * does or we give up and just keep eva_mode.ko's compiled-in default
+         * (unchanged behavior from before this existed - never worse than
+         * today). See resolve_eva_sm_pommi_addr()'s own header comment for
+         * why this is possible at all (the shipped Eva binary isn't
+         * stripped) and write_eva_sm_pommi_addr() for how the correction is
+         * applied without a module reload.
+         *
+         * Two things this deliberately does NOT do, both fixed after the
+         * first live deploy of this feature:
+         *
+         *   1. Does NOT give up on the first write failure. A resolved-but-
+         *      unwritten address (e.g. /sys not mounted yet at that exact
+         *      moment) used to permanently clear g_sm_pommi_resolve_pending
+         *      even though the very next second's retry might succeed -
+         *      only a successful WRITE clears it now; a resolve success
+         *      with a write failure just retries again next second, same as
+         *      any other kind of failure.
+         *
+         *   2. Does NOT anchor the give-up deadline to when this loop first
+         *      started (which is very early - right after eva_mode.ko
+         *      loads, well before Eva.img's cryptoloop mount can possibly
+         *      exist). sm_pommi_retry_t0 is now set the first time a probe
+         *      gets PAST "the file doesn't exist yet" - i.e. the clock only
+         *      starts once there's actually something to fail at, so a slow
+         *      but otherwise-working mount can't eat into the window this
+         *      loop gets to actually resolve/write once the file exists. */
+        if (g_sm_pommi_resolve_pending && now - last_sm_pommi_chk >= 1) {
+            last_sm_pommi_chk = now;
+            unsigned long addr = 0;
+            int resolved = resolve_eva_sm_pommi_addr(&addr);   /* sets g_sm_pommi_status internally */
+            int file_seen = strcmp(g_sm_pommi_status, "not_mounted_yet") != 0;
+
+            if (resolved) {
+                char wreason[sizeof(g_sm_pommi_status)];
+                if (write_eva_sm_pommi_addr(addr, wreason, sizeof(wreason))) {
+                    fprintf(stderr, "screenremote: sm_pommi_addr autodetected as 0x%lx "
+                            "(%lds after first seeing %s) - eva_mode.ko updated live, verified via readback\n",
+                            addr, (long)(sm_pommi_retry_t0 ? now - sm_pommi_retry_t0 : 0), EVA_BINARY_PATH);
+                    g_sm_pommi_resolve_pending = 0;   /* only a VERIFIED write ends the retry loop */
+                } else {
+                    snprintf(g_sm_pommi_status, sizeof(g_sm_pommi_status), "write_failed:%s", wreason);
+                    fprintf(stderr, "screenremote: sm_pommi_addr autodetected as 0x%lx "
+                            "but applying it to eva_mode.ko failed (%s) - will retry\n", addr, wreason);
+                }
+            }
+
+            if (g_sm_pommi_resolve_pending) {   /* still pending after the above - not resolved, or resolved but not yet written */
+                if (file_seen && sm_pommi_retry_t0 == 0)
+                    sm_pommi_retry_t0 = now;
+                if (sm_pommi_retry_t0 != 0 && now - sm_pommi_retry_t0 >= SM_POMMI_RESOLVE_DEADLINE_S) {
+                    /* Preserve the LAST attempt's actual failure reason
+                     * (already sitting in g_sm_pommi_status) instead of
+                     * clobbering it with a bare "gave_up" - a first deploy
+                     * of this same diagnostic did exactly that and threw
+                     * away the one piece of information this whole field
+                     * exists to capture. snprintf() can't safely read and
+                     * write the same buffer, hence the copy. */
+                    char last_reason[sizeof(g_sm_pommi_status)];
+                    snprintf(last_reason, sizeof(last_reason), "%s", g_sm_pommi_status);
+                    snprintf(g_sm_pommi_status, sizeof(g_sm_pommi_status), "gave_up:%s", last_reason);
+                    fprintf(stderr, "screenremote: sm_pommi_addr autodetect gave up %ds after first "
+                            "seeing %s (last reason: %s) - keeping eva_mode.ko's compiled-in default\n",
+                            SM_POMMI_RESOLVE_DEADLINE_S, EVA_BINARY_PATH, last_reason);
+                    g_sm_pommi_resolve_pending = 0;   /* give up gracefully */
+                }
             }
         }
 

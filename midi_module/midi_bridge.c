@@ -47,6 +47,18 @@
  * The tap is generic: it captures the shared performance queues plus every
  * out-port's per-port dump queue, so one destination-agnostic stream carries
  * everything the Kronos transmits (see tap_claim_reader).
+ *
+ * VM-testing alternative (optional, off by default): find_port_object()'s and
+ * resolve_out_ports()'s byte-pattern scans (SIB opcode `0f be 50 04 / 89 04
+ * 95 <disp32>`) are calibrated to real OA_real.ko's specific GCC-4.5.0
+ * codegen and won't match the from-scratch OA.ko reconstruction under
+ * kronosology/reconstructed/OA. That project exposes
+ * CSTGMidiPortManager_GetInPortsArrayForTest()/GetOutPortsArrayForTest(),
+ * two small non-real accessor functions that return sMidiInPorts/
+ * sMidiOutPorts directly. Passing their resolved addresses as the new
+ * fn_inports_get/fn_outports_get module params makes both resolvers call
+ * them instead of pattern-scanning. Left at their default (0), real-hardware
+ * behaviour is unchanged.
  */
 
 #include <linux/module.h>
@@ -72,6 +84,19 @@ module_param(register_fn, ulong, 0444);
 
 static unsigned long regoutport = 0;
 module_param(regoutport, ulong, 0444);
+
+/* VM-testing only, optional (default 0 = unused on real hardware). The from-scratch
+ * OA.ko reconstruction under kronosology/reconstructed/OA exposes
+ * CSTGMidiPortManager::sMidiInPorts/sMidiOutPorts directly via two small non-real
+ * accessor functions, so find_port_object()/resolve_out_ports() can skip the
+ * RegisterMidiInPort/RegisterMidiOutPort byte-pattern scan (calibrated to real
+ * hardware's specific GCC-4.5.0 codegen and not applicable to a differently
+ * compiled binary) and just call the accessor directly instead. */
+static unsigned long fn_inports_get = 0;   /* CSTGMidiPortManager_GetInPortsArrayForTest() */
+module_param(fn_inports_get, ulong, 0444);
+
+static unsigned long fn_outports_get = 0;  /* CSTGMidiPortManager_GetOutPortsArrayForTest() */
+module_param(fn_outports_get, ulong, 0444);
 
 /* Which sMidiInPorts index to inject into. -1 (default) = auto-select the USB
  * in-port by type (see in_type); >=0 = force that index (diagnostics).
@@ -146,6 +171,10 @@ static const int QUEUE_BUF_OFF[4] = { 0x0c, 0x18, 0x24, 0x30 };
 /* ------------------------------------------------------------------ */
 
 typedef void (*receive_fn_t)(void *, const uint8_t *, uint32_t)
+    __attribute__((regparm(3)));
+
+/* VM-testing accessor type - see fn_inports_get/fn_outports_get above. */
+typedef void *(*ports_get_t)(void)
     __attribute__((regparm(3)));
 
 static void *port_obj;
@@ -227,10 +256,19 @@ static uint32_t uni_overflow = 0;
 /*  Out-queue tap: resolve, claim a reader, drain, release            */
 /* ------------------------------------------------------------------ */
 
-/* RegisterMidiOutPort: 0f be 50 04 / 89 04 95 <disp32=&sMidiOutPorts> / c3 */
+/* RegisterMidiOutPort: 0f be 50 04 / 89 04 95 <disp32=&sMidiOutPorts> / c3
+ *
+ * VM-testing path: if fn_outports_get is set, call it directly instead of
+ * pattern-scanning `fn`'s compiled bytes - see fn_outports_get above. */
 static unsigned long resolve_out_ports(unsigned long fn)
 {
     const uint8_t *p = (const uint8_t *)fn;
+
+    if (fn_outports_get) {
+        ports_get_t g = (ports_get_t)fn_outports_get;
+        return (unsigned long)g();
+    }
+
     if (!fn) return 0;
     if (p[0] != 0x0f || p[1] != 0xbe || p[2] != 0x50 || p[3] != 0x04 ||
         p[4] != 0x89 || p[5] != 0x04 || p[6] != 0x95)
@@ -610,17 +648,25 @@ static void *find_port_object(void)
     uint8_t *fn_bytes;
     int i;
 
-    if (!register_fn) return NULL;
+    /* VM-testing path: skip the RegisterMidiInPort byte-pattern scan entirely
+     * and call the accessor directly - see fn_inports_get above. */
+    if (fn_inports_get) {
+        ports_get_t g = (ports_get_t)fn_inports_get;
+        ports_array = (uint32_t *)g();
+        printk(KERN_INFO "midi_bridge: sMidiInPorts at %p (VM-testing accessor)\n", ports_array);
+    } else {
+        if (!register_fn) return NULL;
 
-    fn_bytes = (uint8_t *)register_fn;
-    if (fn_bytes[0] != 0x0f || fn_bytes[1] != 0xbe ||
-        fn_bytes[4] != 0x89 || fn_bytes[5] != 0x04 || fn_bytes[6] != 0x95) {
-        printk(KERN_ERR "midi_bridge: RegisterMidiInPort pattern mismatch\n");
-        return NULL;
+        fn_bytes = (uint8_t *)register_fn;
+        if (fn_bytes[0] != 0x0f || fn_bytes[1] != 0xbe ||
+            fn_bytes[4] != 0x89 || fn_bytes[5] != 0x04 || fn_bytes[6] != 0x95) {
+            printk(KERN_ERR "midi_bridge: RegisterMidiInPort pattern mismatch\n");
+            return NULL;
+        }
+
+        ports_array = (uint32_t *)*(uint32_t *)(fn_bytes + 7);
+        printk(KERN_INFO "midi_bridge: sMidiInPorts at %p\n", ports_array);
     }
-
-    ports_array = (uint32_t *)*(uint32_t *)(fn_bytes + 7);
-    printk(KERN_INFO "midi_bridge: sMidiInPorts at %p\n", ports_array);
 
     /* Enumerate for diagnosis: type (+0x25), active-flag (+0x26 bit1), vtable. */
     for (i = 0; i < 8; i++) {
@@ -770,7 +816,7 @@ static void midi_setup(struct work_struct *work)
 {
     int have_out = 0;
 
-    if (receive_fn && register_fn) {
+    if (receive_fn && (register_fn || fn_inports_get)) {
         port_obj = find_port_object();
         if (!port_obj)
             printk(KERN_WARNING "midi_bridge: MIDI IN port discovery failed "
@@ -779,7 +825,7 @@ static void midi_setup(struct work_struct *work)
         printk(KERN_WARNING "midi_bridge: receive_fn/register_fn not set - MIDI IN unavailable\n");
     }
 
-    if (regoutport) {
+    if (regoutport || fn_outports_get) {
         out_ports = resolve_out_ports(regoutport);
         if (out_ports && tap_claim_reader() > 0) {
             int i;
