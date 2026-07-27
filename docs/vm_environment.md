@@ -248,6 +248,8 @@ a port as genuinely reachable.
 
 ## 0c. 2026-07-24 update (same day, continued again) — OA.ko now loads clean; Eva runs its full boot path; only the pre-existing post-fakefb stall remains
 
+> **This section's headline claim is now historical, not current — see section 0e below (added 2026-07-27) for the correction.** Everything described in this section genuinely happened and was genuinely verified on 2026-07-24 against that day's build; it just stopped being true of `HEAD` once later reconstruction work (2026-07-25 onward) added new unresolved symbols that were never stubbed.
+
 **`OA.ko`'s 7 unresolved symbols, fixed** (all 4 were pre-existing
 "deliberately deferred extern" declarations from prior reconstruction
 passes, already explicitly documented as out-of-scope in `oa_global.h`/
@@ -483,6 +485,81 @@ for the cross-referenced note pointing here, and
 verification item this raises (does real hardware's Super-I/O detection
 succeeding on the first probe round avoid ever exercising this code path at
 all, i.e. is this VM-only?).
+
+---
+
+## 0e. 2026-07-27 correction — section 0c's "OA.ko loads clean" claim was stale; real current state is "insmod unblocked, but a separate kernel Oops remains open"
+
+Found and fixed by `kronosology`'s own reverse-engineering work (not this
+repo), documented here because section 0c above (and `PROJECT_BRAIN/status.md`'s
+matching 2026-07-24 entry) reads as a standing, current fact and is not one.
+
+**What changed since section 0c was written**: section 0c's 7-symbol fix was
+real and correct for the `OA.ko` build that existed on 2026-07-24. But
+`kronosology`'s 2026-07-25 reconstruction batches (`CSTGControllerInfo`
+button/analog handlers, `CSTGMidiOutPortSerial`, `CSTGMidiInPortUSB`, and
+friends) added dozens of new "confirmed real, deliberately deferred" extern
+declarations — each individually documented with the project's own
+established no-op-stub convention, but the matching stub *bodies* were never
+actually written for ~44 of them, across three separate files
+(`reconstructed/OA/src/stub/bar2_stubs.cpp`,
+`KorgUsbAudioVirtualDriver/module_main.c`, `OmapNKS4VirtualDriver/module_main.c`).
+Undefined symbols in a `.ko` block `insmod` outright (the kernel resolves
+every referenced symbol before `init_module()` ever runs) — so by 2026-07-27,
+current `HEAD`'s `OA.ko` could not load *at all*, standalone or otherwise,
+despite section 0c's claim still sitting in this document as if it were
+current. See `kronosology/.claude/agent-memory/re-decompiler/oa_insmod_regression_bar2_stub_drift_2026-07-27.md`
+for the full derivation.
+
+**Fixed, kronosology commit `68853c2` (2026-07-27)**: safe no-op/sentinel
+bodies added for all ~44 symbols (matching each symbol's own already-documented
+real semantics, e.g. `ApplyKeybedCalibration`'s confirmed real `0xffff`
+"no calibration data" sentinel). A live `insmod` test in a disposable
+`kronosvm` instance confirmed every symbol now resolves and real
+`init_module` code runs all the way to `OA_DEBUG_MARKER 8` — proof the
+link-time blocker is genuinely gone, since Linux resolves all module symbols
+before `init_module()` executes.
+
+**But a separate, still-open runtime bug means a full clean `insmod` does
+NOT currently happen.** The same 2026-07-27 pass's first-ever live `insmod`
+of a fully-symbol-resolved build hit a genuine kernel NULL-pointer-deref Oops:
+
+```
+BUG: unable to handle kernel NULL pointer dereference at 0000000c
+EIP is at _ZN23CSTGAudioInputMixerBase12SetSendBusesEv+0xc/0x60 [OA]
+Call Trace:
+ CSTGPerformanceVarsManager::Initialize+0x591 [OA]
+ CSTGGlobal::Initialize+0x154 [OA]
+ setup_global_resources+0x3f6 [OA]
+ init_module+0x11e [OA]
+```
+
+Root cause (kronosology commit `2c539fb`): `performance_vars_manager_init.cpp`
+stored the literal integer `8` into a freshly-constructed
+`CSTGAudioInputMixer`'s own vtable-pointer field — a lost `R_386_32`
+relocation; the real ground-truth instruction stores `&vtable+8`, standard
+Itanium-ABI derived-vtable-wins construction order. Fixed by reconstructing
+the real derived vtable (`ShouldMute`/`GetOutputBus`, both previously
+unidentified) and installing the real pointer. **This did NOT fully resolve
+the Oops**: a live re-boot test after the fix still crashed identically in
+the same function — bisection localized a SEPARATE, deeper issue (the
+object's vtable pointer reverting to NULL again moments later, before
+`SetSendBuses()` runs) but could not isolate its root cause within that
+session's time budget. Flagged open for a dedicated future pass with
+gdbstub-based bisection (own `rt_printk`-based instrumentation is suspected
+of confounding the earlier bisection attempt).
+
+**Current state, precisely**: "`OA.ko` cannot `insmod` at all" is fixed and
+verified. "`OA.ko` `insmod`s with zero kernel oops" is still NOT true — a
+live boot Oopses inside `CSTGAudioInputMixerBase::SetSendBuses()` before
+`init_module()` can complete. Section 0c's narrative (RTAI hang fixed, 7
+symbols fixed, `OA: init_module succeeded` observed, Eva ran clean) is an
+accurate record of what was true and verified on 2026-07-24 for that day's
+build; it should not be read as a statement about the current `HEAD`. Check
+`PROJECT_BRAIN/status.md`'s latest kronosology-section entries before
+relying on either claim.
+
+Doc-only correction; no real-hardware access, no code changes in this repo.
 
 ---
 
