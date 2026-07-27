@@ -563,6 +563,136 @@ Doc-only correction; no real-hardware access, no code changes in this repo.
 
 ---
 
+## 0f. 2026-07-27 — section 0d's fbcon/VT stall ROOT-CAUSED AND FIXED: it was
+a heap buffer overflow in `kronos_vm/fakefb/fakefb.c`, not a vanilla-kernel
+VT/console lock bug
+
+Section 0d's own characterization (spinlock/`console_sem` contention inside
+`register_framebuffer()`'s fbcon-takeover chain, "genuinely fatal after ~12
+minutes, not infinite") was a reasonable read of the evidence available at
+the time but turned out to be the wrong subsystem entirely. Re-investigated
+fresh with this project's now-much-more-mature dynamic-debugging toolkit
+(QEMU-monitor EIP/register sampling across repeated live samples, QEMU's
+native gdbstub for a second independent read of the same state, and — new
+this pass — building individual kernel `.o` files from `/home/build/linux-kronos`
+to structurally identify the frozen code, plus a throwaway kernel-module
+probe to measure real struct layout/offsets).
+
+**Reproduction**: fresh disposable `kronosvm` instance, same known-good
+OA.ko+Eva build this project reached earlier the same day (commit `13fba9f`
+state, `-smp 1`). Stall reproduced in ~50s, byte-for-byte identical to two
+prior sessions' independent findings (2026-07-25 sec 0d, `0x40154c03`-area;
+2026-07-26 `eva_screenremote_vm_test_livelock_terminated`, `0x40154c03`
+exactly). Three "info registers" monitor samples several seconds apart were
+bit-for-bit identical (EIP, all GPRs, EFLAGS) — but this is `-smp 1`, so this
+specific instance's shape is necessarily a single-thread retry loop, not the
+sec-0d/2026-07-26 multi-CPU spinlock-contention picture (both may share a
+root cause; not fully disambiguated).
+
+**The decisive new evidence**: `CR2` (last page-fault linear address) read
+back as `0xc0a6f304`, exactly `EBX+4` — the operand the frozen instruction
+(`mov eax, [ebx+4]` at `0x40154c03`) was dereferencing. Reading guest virtual
+address `0xc0a6f300` failed with "Cannot access memory" via **two
+independent** mechanisms (QEMU monitor `x`, and a separately-attached native
+gdbstub `x`) — this is a genuine, unrecoverable kernel-mode page fault being
+taken over and over on the same instruction, not a spinlock/semaphore wait.
+A second gdb sample (a fresh connect-and-stop) caught EIP at a *different*
+address, `0x40436828`, inside the same `__delay`/`udelay`-style TSC busy-wait
+routine independently identified by the 2026-07-26 session (`0x40436141`,
+~0x6e7 away) — consistent with an outer retry loop that alternates between
+re-walking a corrupted list and a delay/backoff before retrying.
+
+**Identifying `0xc0a6f300`**: the disassembly at the frozen EIP is a classic
+`list_for_each`-style walk (inlined `rcu_read_lock()` via a `preempt_count`
+increment at `thread_info+0x14`, a `prefetch()` hint, `container_of(-4)`
+pointer arithmetic, a fixed static list head at VA `0x405401f0`, and a
+per-node field check at `+0xcc`). Building 15 candidate `.c` files
+individually against `/home/build/linux-kronos` (same tree + `korg_kronos_defconfig`
+already validated byte-accurate for `struct module` layout — see
+`project_linux_kronos_kernel_tree.md`) — `drivers/video/fbmem.c`, `vt.c`,
+`fbcon.c`, `notifier.c`, `drivers/base/{core,bus,class,dd,power/main,platform}.c`,
+`kernel/{power/main,kmod,workqueue,sched}.c`, `lib/klist.c` — found no
+byte-exact match for this shape (a full `vmlinux` build for authoritative
+symbols hit the same GCC12-vs-2.6.32-headers wall this tree's own docs
+already flag as out of scope: `syscall_trace_enter`/`_leave` `asmregparm`
+prototype conflicts in `ptrace.c`). So the *kernel-side* caller of this list
+walk is still unnamed. But a **precise, independently-verified arithmetic
+match** nailed the address itself: `fakefb.ko`'s own compiled `.data`
+section (containing only the module's static `fakefb_ops` struct, 0x58
+bytes) starts at the real runtime address the module's own boot-time printk
+already reports (`fbops@0x258=0xc0a6f2a0`); its `.bss` section (8 bytes:
+`fb_mem` + `info`) is placed immediately after per this kernel's
+`layout_sections()` grouping (writable sections together). `0xc0a6f2a0 +
+0x58 (.data) + 8 (.bss) = 0xc0a6f300` — an **exact** match with zero fudge
+factor, confirmed via `objdump -t`/`readelf -S` on the actual `fakefb.ko`
+staged in this VM's disk image. So the fault address is precisely the first
+byte past `fakefb.ko`'s own writable module memory (its `.bss`/`.rodata`
+boundary) — meaning some kernel list's node pointer had been corrupted to
+point directly into this module's own image, being misread as a much larger
+structure (fields read up to `+0xcc`) than anything actually living there.
+
+**The confirmed, measured, fixed bug**: `fakefb.c`'s own header comment
+already documented that the real Korg kernel's `struct fb_info` is "44 bytes
+larger before fbops/screen_base" than this project's vanilla build headers
+produce (`CONFIG_FB_DEFERRED_IO` is off in the vanilla tree used to build
+this module, on in `korg_kronos_defconfig`) — and patched the two field
+*write offsets* (`0x258`/`0x26c`) to match the real kernel's layout. But it
+never adjusted the **allocation size**: `framebuffer_alloc(0, NULL)` sizes
+its `kzalloc()` using `sizeof(struct fb_info)` **as THIS MODULE compiled
+it**, not the real kernel's larger size. Measured directly (a throwaway
+probe module built against the exact same headers, using a `char
+array[sizeof(...)]`/`nm -S` trick to read the size back precisely, since a
+full functional `vmlinux` build wasn't available): `sizeof(struct
+fb_info)=608`, `offsetof(fbops)=556`, `offsetof(screen_base)=576`. The
+`screen_base` write at literal offset `0x26c`..`0x270` (bytes 620-624)
+lands **16 bytes past the end of a 608-byte `kzalloc()`'d buffer** — a
+confirmed heap buffer overflow, corrupting whatever the kernel's slab
+allocator placed immediately after that allocation.
+
+**Fix** (`kronos_vm` commit `2f46732`): pass `size=64` instead of `size=0`
+to `framebuffer_alloc()`, so it over-allocates slack space past the struct
+(`info->par` ends up pointing into the unused slack — harmless, this module
+never reads `par`). 16 bytes were strictly required; 64 gives headroom.
+
+**Live-verified**: same disk image, same `bzImage`, only `fakefb.ko` (on
+disk, `/korg/rw/screenremote/fakefb.ko`) swapped for the fixed rebuild
+(md5-verified round-trip through the disk image). Boot now sails straight
+through the entire `loadoa` sequence — `8139cp` loads, `screenremote`
+launches (PID logged), `vkbd`/`eva_mode` come up — and sustains a ticking
+`[watchdog] alive at Ns` heartbeat past **520 seconds wall-clock with zero
+stall**, the QEMU process settling to ~50% CPU (idle-ish, not spinning). This
+is the first time this project has gotten past this exact point, and by a
+wide margin exceeds this project's own established "genuine sustained boot"
+bar (Eva's own 5-minute standard).
+
+**One workaround tried and ruled out before the real fix was found**:
+dropping `console=tty0` from the kernel cmdline (keeping `vga=0x0303
+fbcon=map:0`, per this doc's own earlier caution about not dropping all
+three at once) made **zero difference** — identical `EIP`/`EBX`/`CR2` to the
+byte, confirming the freeze has nothing to do with which device is the
+*system console* and ruling out the simplest cmdline-only workaround
+hypothesis. Not needed now that the real fix is in.
+
+**One follow-up flagged, not yet investigated**: post-fix, `fakefb.ko`'s own
+`init` printks (`fb_mem=`/`info=`/`fbops@...`/`register_framebuffer
+returned %d`) do not appear in the boot log at all, and `loadoa`'s own `[
+-d /sys/class/graphics/fb0 ]` check reports not-found ("WARNING: fakefb
+driver not in /sys after insmod"), so `screenremote`'s `/dev/fb1` path may
+still not have real backing. This is a **new observation, not a new
+regression** — `register_framebuffer()` was never reachable long enough to
+be observed succeeding or failing cleanly before this fix, so there is no
+prior "known good" baseline for what this specific check reports. Needs a
+dedicated look (working guest shell or a temporary extra printk) rather than
+being assumed either way. Does not affect the OA.ko/Eva boot-chain milestone
+this fix unblocks.
+
+No further subagents were spawned for this investigation per the task's
+instruction; own disposable VM instances (3 total this session, all
+confirmed by exact PID and own cmdline before touching) were stopped
+cleanly via the QEMU monitor `quit` command, verified gone via `ps`.
+
+---
+
 ## 1. Host environment
 
 | Field | Value |
