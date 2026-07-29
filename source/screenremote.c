@@ -129,6 +129,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <stdint.h>
 #include <stdarg.h>
 #include <signal.h>
@@ -1209,13 +1210,80 @@ static int send_frame(int fd)
     return -1;
 }
 
-static int do_handshake(int fd, uint8_t *mode_out, uint8_t *fps_out,
-                        const struct sockaddr_in *peer)
+#define STREAM_HELLO_SIZE 9
+#define STREAM_HELLO_MAX  (STREAM_HELLO_SIZE + 64 + 128)
+
+struct stream_handshake {
+    int                fd;
+    int                flags;
+    size_t             have, need;
+    uint8_t            hello[STREAM_HELLO_MAX];
+    struct sockaddr_in peer;
+    struct timespec    deadline;
+};
+
+static void stream_handshake_close(struct stream_handshake *hs, const char *reason)
 {
-    uint8_t  hdr[9];   /* KSCR(4) + ver(1) + mode(1) + fps(1) + ulen(1) + plen(1) */
+    if (hs->fd >= 0) {
+        log_access(inet_ntoa(hs->peer.sin_addr), 0, reason);
+        close(hs->fd);
+        hs->fd = -1;
+    }
+}
+
+static int stream_handshake_reject(struct stream_handshake *hs, const char *reason)
+{
+    uint8_t fail[5];
+    memcpy(fail, MAGIC, 4);
+    fail[4] = 0x01;
+    (void)write_all(hs->fd, fail, sizeof(fail));
+    stream_handshake_close(hs, reason);
+    return -1;
+}
+
+/* Read one bounded stream hello without ever waiting for the peer. */
+static int stream_handshake_read(struct stream_handshake *hs)
+{
+    for (;;) {
+        ssize_t n;
+        size_t want;
+
+        if (hs->need == 0 && hs->have == STREAM_HELLO_SIZE) {
+            const uint8_t *hdr = hs->hello;
+            if (memcmp(hdr, MAGIC, 4) != 0 || hdr[4] != 0x02)
+                return stream_handshake_reject(hs, "bad magic/version");
+            if (hdr[7] == 0 || hdr[7] > 64 || hdr[8] > 128)
+                return stream_handshake_reject(hs, "bad credential lengths");
+            hs->need = STREAM_HELLO_SIZE + hdr[7] + hdr[8];
+        }
+        if (hs->need && hs->have == hs->need)
+            return 1;
+
+        want = hs->need ? hs->need - hs->have : STREAM_HELLO_SIZE - hs->have;
+        n = recv(hs->fd, hs->hello + hs->have, want, 0);
+        if (n > 0) {
+            hs->have += (size_t)n;
+            continue;
+        }
+        if (n == 0) {
+            stream_handshake_close(hs, hs->need ? "credential read error" : "incomplete hello");
+            return -1;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+            return 0;
+        if (errno == EINTR)
+            continue;
+        stream_handshake_close(hs, hs->need ? "credential read error" : "incomplete hello");
+        return -1;
+    }
+}
+
+static int do_handshake(int fd, uint8_t *mode_out, uint8_t *fps_out,
+                        const struct sockaddr_in *peer, const uint8_t *hello)
+{
+    const uint8_t *hdr = hello;  /* KSCR(4) + ver(1) + mode(1) + fps(1) + ulen(1) + plen(1) */
     uint8_t  rsp[4 + 1 + 2 + 2 + PAL_ENTRIES * 3];
     char     user[65], pass[129];
-    struct timeval tv5 = {5, 0}, tvz = {0, 0};
     uint8_t  fail[5];
     uint8_t  ulen, plen;
     int      i, j, auth;
@@ -1223,12 +1291,6 @@ static int do_handshake(int fd, uint8_t *mode_out, uint8_t *fps_out,
 
     memcpy(fail, MAGIC, 4);
 
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv5, sizeof(tv5));
-
-    if (recv(fd, hdr, sizeof(hdr), MSG_WAITALL) != (ssize_t)sizeof(hdr)) {
-        log_access(peer_ip, 0, "incomplete hello");
-        return -1;
-    }
     if (memcmp(hdr, MAGIC, 4) != 0 || hdr[4] != 0x02) {
         fail[4] = 0x01;
         write_all(fd, fail, 5);
@@ -1245,15 +1307,11 @@ static int do_handshake(int fd, uint8_t *mode_out, uint8_t *fps_out,
         return -1;
     }
 
-    if (recv(fd, user, ulen, MSG_WAITALL) != ulen ||
-        (plen > 0 && recv(fd, pass, plen, MSG_WAITALL) != (ssize_t)plen)) {
-        log_access(peer_ip, 0, "credential read error");
-        return -1;
-    }
+    memcpy(user, hdr + STREAM_HELLO_SIZE, ulen);
+    if (plen)
+        memcpy(pass, hdr + STREAM_HELLO_SIZE + ulen, plen);
     user[ulen] = '\0';
     pass[plen] = '\0';
-
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tvz, sizeof(tvz));
 
     const char *auth_reason = NULL;
     auth = check_auth(user, pass, &auth_reason);
@@ -3367,7 +3425,7 @@ static int hex_decode(const char *hex, uint8_t *out, int maxlen)
 {
     int len = 0;
     while (*hex && len < maxlen) {
-        while (*hex == ' ') hex++;
+        while (isspace((unsigned char)*hex)) hex++;
         if (!*hex) break;
         unsigned int b;
         int consumed = 0;
@@ -3383,6 +3441,9 @@ static int hex_decode(const char *hex, uint8_t *out, int maxlen)
         out[len++] = (uint8_t)b;
         hex += consumed;
     }
+    while (isspace((unsigned char)*hex)) hex++;
+    if (*hex)
+        return -1;   /* never acknowledge a silently truncated MIDI/SysEx message */
     return len;
 }
 
@@ -3494,6 +3555,8 @@ static struct timespec sysex_t0;                /* capture start time           
 #define SYSEX_INITIAL_TIMEOUT_MS  5000
 #define SYSEX_TAIL_TIMEOUT_MS     1000
 
+static void sysex_finish(void);
+
 /* Bring up the loopback interface via ioctl.  midi_tcp listens on 127.0.0.1,
  * which the Kronos does not configure by default.  Done with ioctl rather than
  * system("ifconfig ...") because non-rooted units have no /bin/sh - the same
@@ -3519,10 +3582,34 @@ static void bring_up_loopback(void)
     close(s);
 }
 
+static int midi_capture_reap_exited(void)
+{
+    int status;
+    pid_t r;
+
+    if (midi_cap_pid <= 0)
+        return 0;
+    r = waitpid(midi_cap_pid, &status, WNOHANG);
+    if (r == midi_cap_pid || (r < 0 && errno == ECHILD)) {
+        midi_cap_pid = -1;
+        return 1;
+    }
+    return 0;
+}
+
 static void start_midi_capture(void)
 {
     pid_t pid;
     int i;
+
+    if (midi_capture_reap_exited() && midi_cap_fd >= 0) {
+        if (sysex_pending)
+            sysex_finish();
+        close(midi_cap_fd);
+        midi_cap_fd = -1;
+    }
+    if (midi_cap_fd >= 0 || midi_cap_pid > 0)
+        return;
 
     extract_ko(MIDI_TCP_BIN, midi_tcp_bin, midi_tcp_bin_len);
     chmod(MIDI_TCP_BIN, 0755);
@@ -3561,6 +3648,8 @@ static void start_midi_capture(void)
             close(fd);
         }
     }
+    if (midi_cap_fd < 0)
+        (void)midi_capture_reap_exited();
 }
 
 
@@ -3641,6 +3730,9 @@ static void midi_capture_down(void)
  * interleaved channel messages and real-time bytes are discarded. */
 static void sysex_poll(int readable)
 {
+    if (midi_cap_fd < 0)
+        (void)midi_capture_reap_exited();
+
     if (readable && midi_cap_fd >= 0) {
         uint8_t tmp[4096];
         int n;
@@ -4798,6 +4890,31 @@ static void ensure_log_dir(void)
     chown(LOG_DIR, KRONOS_UID, KRONOS_GID);
 }
 
+static int write_boot_marker(void)
+{
+    int fd, saved_errno = 0;
+
+    fd = open(BOOT_FLAG, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd < 0) {
+        perror("screenremote: .boot");
+        return 0;
+    }
+    if (fchown(fd, KRONOS_UID, KRONOS_GID) < 0)
+        saved_errno = errno;
+    if (fsync(fd) < 0 && !saved_errno)
+        saved_errno = errno;
+    if (close(fd) < 0 && !saved_errno)
+        saved_errno = errno;
+    if (syscall(SYS_sync) < 0 && !saved_errno)
+        saved_errno = errno;
+    if (saved_errno) {
+        errno = saved_errno;
+        perror("screenremote: .boot");
+        return 0;
+    }
+    return 1;
+}
+
 static void dump_kmsg(void)
 {
     static char kbuf[131072];
@@ -4920,7 +5037,9 @@ int main(void)
     time_t sm_pommi_retry_t0 = 0;      /* when that retry began - give-up anchor */
     time_t g_start_time = time(NULL);  /* for FBCURVE relative timestamps */
     int eva_ready_streak = 0;          /* consecutive EVA-UI-detected checks */
+    int rebind_module_load = 0;        /* durable .boot guard covers rebind retries */
     struct timespec last_frame = {0, 0};
+    struct stream_handshake handshake = { .fd = -1 };
     ss_last_chg = time(NULL);
 
     signal(SIGPIPE, SIG_IGN);
@@ -4948,7 +5067,7 @@ int main(void)
      * so the unit can recover.  Lives in the FTP-visible log folder
      * (/korg/rw/HD/ScreenRemote/.boot) so the user can remove it over FTP - no
      * shell access needed on an unrooted Kronos - to re-enable MIDI next boot. */
-    int boot_flag_found = 0;
+    int boot_flag_found = 0, boot_marker_ready;
     {
         struct stat _bf;
         if (stat(BOOT_FLAG, &_bf) == 0) {
@@ -4957,18 +5076,12 @@ int main(void)
                     "MIDI hooks disabled for safe recovery (remove %s to re-enable)\n",
                     BOOT_FLAG);
         }
-        int _bfd = open(BOOT_FLAG, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-        if (_bfd >= 0) {
-            fchown(_bfd, KRONOS_UID, KRONOS_GID);  /* FTP-deletable/readable */
-            fsync(_bfd);
-            close(_bfd);
-        }
         /* The marker MUST be durable on disk BEFORE any init_module() call: if a
          * module load freezes the RTAI box, the next boot has to see .boot to skip
          * the dangerous loads and self-recover.  open()+close() alone leaves it in
          * the page cache (ext3 commit interval up to seconds), so a hard freeze can
          * lose it -> permanent boot loop.  sync() forces it out now. */
-        sync();
+        boot_marker_ready = write_boot_marker();
     }
 
     /* Kill-switch: if the folder /korg/rw/HD/_nomod exists, load NO kernel modules.
@@ -4981,7 +5094,10 @@ int main(void)
      * remains as defense-in-depth.  Checked here because this daemon is what loads
      * the modules (init_module(2) from embedded buffers); a kernel-side FS check is
      * unreliable in init_module context on the RTAI kernel. */
-    int load_mods = 1;
+    int load_mods = boot_marker_ready;
+    if (!load_mods)
+        fprintf(stderr, "screenremote: .boot marker was not made durable - "
+                "not loading any kernel modules\n");
     {
         struct stat _ns;
         if (stat("/korg/rw/HD/_nomod", &_ns) == 0 && S_ISDIR(_ns.st_mode)) {
@@ -5137,6 +5253,12 @@ int main(void)
             struct in_addr ia; ia.s_addr = lan_ip;
             fprintf(stderr, "screenremote: bound to %s\n", inet_ntoa(ia));
         }
+        if (load_mods && !boot_flag_found && !g_nks4_loaded) {
+            g_nks4_load_pending = 1;
+            nks4_retry_t0 = 0;
+            rebind_module_load = 1;
+            fprintf(stderr, "screenremote: network ready - retrying unavailable nks4_inject\n");
+        }
     }
     disc_fd = make_udp_disc();
     fprintf(stderr, "screenremote: listening on %d (stream) %d (ctrl) %d (discovery)\n",
@@ -5146,16 +5268,10 @@ int main(void)
      * OS is fully operational - clear the boot flag so the next boot
      * knows this one succeeded and loads MIDI normally.
      *
-     * EXCEPT: if midi_bridge's load is still pending (deferred until EVA is
-     * up - see g_midi_load_pending below), clearing the flag here leaves the
-     * boot-loop recovery net NOT actually covering that load - the
-     * historically brick-causing one. A freeze during/right after it would
-     * then have no .boot flag left to catch on the next boot (found
-     * 2026-07-16). Defer the clear until right after that load actually
-     * happens, in the main loop. If midi_bridge isn't going to load at all
-     * this boot (calibration mode, kill-switch, or already-skipped), there's
-     * no load event to wait for, so clear immediately as before. */
-    if (!g_midi_load_pending)
+     * EXCEPT: retain it until every deferred kernel-module load has reached
+     * its terminal state. This covers MIDI and an NKS4 retry independently,
+     * including calibration mode where MIDI is intentionally never pending. */
+    if (boot_marker_ready && !g_midi_load_pending && !g_nks4_load_pending)
         unlink(BOOT_FLAG);
 
     /* Startup survived the module-load window: take a final ring-buffer snapshot
@@ -5172,9 +5288,19 @@ int main(void)
         fd_set rfds;
         struct timeval tv;
         time_t now = time(NULL);
-        int maxfd, r;
+        int maxfd, r, client_just_connected = 0;
 
         if (g_exit) break;
+
+        if (handshake.fd >= 0) {
+            struct timespec hs_now;
+            clock_gettime(CLOCK_MONOTONIC, &hs_now);
+            if (hs_now.tv_sec > handshake.deadline.tv_sec ||
+                    (hs_now.tv_sec == handshake.deadline.tv_sec &&
+                     hs_now.tv_nsec >= handshake.deadline.tv_nsec))
+                stream_handshake_close(&handshake,
+                        handshake.need ? "credential read error" : "incomplete hello");
+        }
 
         /* Land any rate-limited CC whose hold interval elapsed.  cc_pending stays
          * set while a controller's final value is still held, so we shorten the
@@ -5240,7 +5366,10 @@ int main(void)
                                     "- loading midi_bridge\n", pct, dist);
                     load_midi_bridge();
                     g_midi_load_pending = 0;
-                    unlink(BOOT_FLAG);   /* deferred from startup - see the comment there */
+                    if (!g_nks4_load_pending) {
+                        unlink(BOOT_FLAG);   /* deferred from startup - see the comment there */
+                        rebind_module_load = 0;
+                    }
                 }
             } else {
                 eva_ready_streak = 0;
@@ -5276,6 +5405,10 @@ int main(void)
                         NKS4_LOAD_DEADLINE_S);
                 g_nks4_load_pending = 0;   /* give up gracefully */
                 nks4_give_up("OA never went Live within the retry deadline");
+            }
+            if (!g_nks4_load_pending && !g_midi_load_pending) {
+                unlink(BOOT_FLAG);
+                rebind_module_load = 0;
             }
         }
 
@@ -5358,6 +5491,7 @@ int main(void)
             uint32_t cur_ip = find_lan_ip();
             if (cur_ip != g_bound_ip) {
                 if (client_fd >= 0) { close(client_fd); client_fd = -1; }
+                if (handshake.fd >= 0) stream_handshake_close(&handshake, "incomplete hello");
                 if (ctrl_fd  >= 0) { close(ctrl_fd);  ctrl_fd = -1; ctrl_lb_n = 0; ctrl_lb_overflow = 0; }
                 shadow_valid      = 0;
                 g_ctrl_allowed_ip = 0;
@@ -5379,6 +5513,24 @@ int main(void)
                     if (stream_listen >= 0 && ctrl_listen >= 0) {
                         g_bound_ip = cur_ip;
                         fprintf(stderr, "screenremote: rebound to %s\n", inet_ntoa(dbg));
+                        if (!rebind_module_load && load_mods && !boot_flag_found &&
+                            (!g_nks4_loaded || (!g_fbcurve_cal && !g_midi_loaded))) {
+                            if (write_boot_marker()) {
+                                rebind_module_load = 1;
+                                if (!g_nks4_loaded) {
+                                    g_nks4_load_pending = 1;
+                                    nks4_retry_t0 = 0;
+                                }
+                                if (!g_fbcurve_cal && !g_midi_loaded) {
+                                    g_midi_load_pending = 1;
+                                    eva_ready_streak = 0;
+                                }
+                                fprintf(stderr, "screenremote: retrying unavailable kernel modules after IP rebind\n");
+                            } else {
+                                fprintf(stderr, "screenremote: rebind marker not durable - "
+                                        "module retries skipped\n");
+                            }
+                        }
                     } else {
                         if (stream_listen >= 0) { close(stream_listen); stream_listen = -1; }
                         if (ctrl_listen   >= 0) { close(ctrl_listen);   ctrl_listen   = -1; }
@@ -5456,7 +5608,7 @@ int main(void)
         /* Build select set - listeners may be -1 during rebind */
         FD_ZERO(&rfds);
         maxfd = -1;
-        if (stream_listen >= 0) {
+        if (handshake.fd < 0 && stream_listen >= 0) {
             FD_SET(stream_listen, &rfds);
             if (stream_listen > maxfd) maxfd = stream_listen;
         }
@@ -5479,6 +5631,10 @@ int main(void)
         if (midi_cap_fd >= 0) {
             FD_SET(midi_cap_fd, &rfds);
             if (midi_cap_fd > maxfd) maxfd = midi_cap_fd;
+        }
+        if (handshake.fd >= 0) {
+            FD_SET(handshake.fd, &rfds);
+            if (handshake.fd > maxfd) maxfd = handshake.fd;
         }
 
         /* Adaptive timeout: wait only until the next frame is due.
@@ -5513,6 +5669,19 @@ int main(void)
                 tv.tv_usec = max_us;
             }
         }
+        if (handshake.fd >= 0) {
+            struct timespec hs_now;
+            long remaining_us, timeout_us;
+            clock_gettime(CLOCK_MONOTONIC, &hs_now);
+            remaining_us = (handshake.deadline.tv_sec - hs_now.tv_sec) * 1000000L +
+                           (handshake.deadline.tv_nsec - hs_now.tv_nsec) / 1000L;
+            if (remaining_us < 0) remaining_us = 0;
+            timeout_us = tv.tv_sec * 1000000L + tv.tv_usec;
+            if (remaining_us < timeout_us) {
+                tv.tv_sec = remaining_us / 1000000L;
+                tv.tv_usec = remaining_us % 1000000L;
+            }
+        }
 
         if (maxfd < 0) { usleep(500000); continue; }
         r = select(maxfd + 1, &rfds, NULL, NULL, &tv);
@@ -5523,8 +5692,41 @@ int main(void)
          * Always non-blocking (MSG_DONTWAIT inside sysex_poll). */
         sysex_poll(midi_cap_fd >= 0 && FD_ISSET(midi_cap_fd, &rfds));
 
-        /* New streaming client */
-        if (stream_listen >= 0 && FD_ISSET(stream_listen, &rfds)) {
+        if (handshake.fd >= 0 && FD_ISSET(handshake.fd, &rfds)) {
+            if (stream_handshake_read(&handshake) > 0) {
+                int new_fd = handshake.fd;
+                if (do_handshake(new_fd, &client_mode, &client_fps, &handshake.peer,
+                                 handshake.hello) < 0) {
+                    close(new_fd);
+                } else if (fcntl(new_fd, F_SETFL, handshake.flags) < 0) {
+                    perror("screenremote: restore stream socket flags");
+                    close(new_fd);
+                } else {
+                    if (client_fd >= 0) close(client_fd);
+                    shadow_valid = 0;
+                    client_fd = new_fd;
+                    g_ctrl_allowed_ip = handshake.peer.sin_addr.s_addr;
+                    clock_gettime(CLOCK_MONOTONIC, &last_frame);
+                    client_just_connected = 1;
+                    fprintf(stderr, "screenremote: client connected mode=%u fps=%u from %s\n",
+                            client_mode, client_fps, inet_ntoa(handshake.peer.sin_addr));
+                    if (client_mode == MODE_CHANGE) {
+                        capture_to_staging();
+                        if (send_frame_buf(client_fd, staging) < 0) {
+                            close(client_fd); client_fd = -1;
+                            g_ctrl_allowed_ip = 0;
+                        } else {
+                            uint8_t *tmp = shadow; shadow = staging; staging = tmp;
+                            shadow_valid = 1;
+                        }
+                    }
+                }
+                handshake.fd = -1;
+            }
+        }
+
+        /* New streaming client: one incomplete hello is retained at a time. */
+        if (handshake.fd < 0 && stream_listen >= 0 && FD_ISSET(stream_listen, &rfds)) {
             struct timeval send_to = {5, 0};
             struct sockaddr_in peer;
             socklen_t plen = sizeof(peer);
@@ -5538,30 +5740,17 @@ int main(void)
 #define SO_SNDBUFFORCE 32
 #endif
                 { int sb = 512 * 1024; setsockopt(new_fd, SOL_SOCKET, SO_SNDBUFFORCE, &sb, sizeof(sb)); }
-                if (do_handshake(new_fd, &client_mode, &client_fps, &peer) < 0) {
-                    close(new_fd);
-                } else {
-                    if (client_fd >= 0) close(client_fd);
-                    shadow_valid = 0;
-                    client_fd = new_fd;
-                    g_ctrl_allowed_ip = peer.sin_addr.s_addr;
-                    clock_gettime(CLOCK_MONOTONIC, &last_frame);
-                    fprintf(stderr, "screenremote: client connected mode=%u fps=%u from %s\n",
-                            client_mode, client_fps, inet_ntoa(peer.sin_addr));
-                    /* Send the current framebuffer immediately on connect.
-                     * Change-driven mode only sends when the screen changes, so a
-                     * newly connected client would see a blank display until the
-                     * Kronos UI moves.  Sending once here ensures the client always
-                     * has a valid initial frame regardless of screen activity. */
-                    if (client_mode == MODE_CHANGE) {
-                        capture_to_staging();
-                        if (send_frame_buf(client_fd, staging) < 0) {
-                            close(client_fd); client_fd = -1;
-                            g_ctrl_allowed_ip = 0;
-                        } else {
-                            uint8_t *tmp = shadow; shadow = staging; staging = tmp;
-                            shadow_valid = 1;
-                        }
+                {
+                    int flags = fcntl(new_fd, F_GETFL, 0);
+                    if (flags < 0 || fcntl(new_fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+                        close(new_fd);
+                    } else {
+                        handshake.fd = new_fd;
+                        handshake.flags = flags;
+                        handshake.have = handshake.need = 0;
+                        handshake.peer = peer;
+                        clock_gettime(CLOCK_MONOTONIC, &handshake.deadline);
+                        handshake.deadline.tv_sec += 5;
                     }
                 }
             }
@@ -5707,7 +5896,7 @@ int main(void)
         }
 
         /* Pull mode: client requests a frame */
-        if (client_fd >= 0 && client_mode == MODE_PULL &&
+        if (!client_just_connected && client_fd >= 0 && client_mode == MODE_PULL &&
             FD_ISSET(client_fd, &rfds)) {
             uint8_t cmd;
             ssize_t n = recv(client_fd, &cmd, 1, 0);
@@ -5727,6 +5916,7 @@ int main(void)
     /* Clean shutdown: clear fb0 so fbcon can resume, close sockets. */
     if (kmsg_pid > 0) { kill(kmsg_pid, SIGTERM); waitpid(kmsg_pid, NULL, 0); kmsg_pid = -1; }
     if (client_fd >= 0) close(client_fd);
+    if (handshake.fd >= 0) close(handshake.fd);
     if (ctrl_fd   >= 0) close(ctrl_fd);
     if (stream_listen >= 0) close(stream_listen);
     if (ctrl_listen   >= 0) close(ctrl_listen);
