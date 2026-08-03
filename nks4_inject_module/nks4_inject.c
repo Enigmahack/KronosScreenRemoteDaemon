@@ -409,12 +409,12 @@ static int inject_write_proc(struct file *file, const char __user *buf,
         return -EFAULT;
     kbuf[n] = '\0';
 
+    spin_lock_irqsave(&inj_lock, flags);
     if (oa_dead) {
         cnt_gated++;
+        spin_unlock_irqrestore(&inj_lock, flags);
         return -ENODEV;
     }
-
-    spin_lock_irqsave(&inj_lock, flags);
     strlcpy(last_cmd, kbuf, sizeof(last_cmd));
 
     if (sscanf(kbuf, "BTN_DOWN %d", &a) == 1) {

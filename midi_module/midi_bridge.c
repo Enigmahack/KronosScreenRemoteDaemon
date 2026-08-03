@@ -331,7 +331,14 @@ static void tap_claim_slots(void)
         }
         t->reader_idx = idx;
         t->cursor     = wpos;   /* start from now */
-        probe_kernel_write((void *)(t->ringctl + RC_RCUR0 + idx * 4), &t->cursor, sizeof(t->cursor));
+        if (probe_kernel_write((void *)(t->ringctl + RC_RCUR0 + idx * 4), &t->cursor, sizeof(t->cursor)) != 0) {
+            /* The ioremapped control region is gone — the cursor write failed.
+             * Do NOT call __sync_fetch_and_sub(rcount) here: rcount itself
+             * lives in the same unmapped region and would fault too.  Accept
+             * the inflated reader count and just retire the tap. */
+            t->ringctl = 0;
+            t->reader_idx = -1;
+        }
     }
 }
 
@@ -355,8 +362,19 @@ static void tap_release_slots(void)
         }
         if (cur_count == (uint8_t)(t->reader_idx + 1)) {
             uint32_t zero = 0;
-            probe_kernel_write((void *)(t->ringctl + RC_RCUR0 + t->reader_idx * 4), &zero, sizeof(zero));
-            __sync_fetch_and_sub(rcount, 1);
+            if (probe_kernel_write((void *)(t->ringctl + RC_RCUR0 + t->reader_idx * 4), &zero, sizeof(zero)) == 0) {
+                /* Cursor cleared cleanly - safe to give the slot back. */
+                __sync_fetch_and_sub(rcount, 1);
+            } else {
+                /* The ioremapped region is gone — the cursor clear failed.
+                 * Do NOT decrement rcount (it lives in the same unmapped
+                 * region).  Retire the tap completely so a later dump window
+                 * can never attempt to touch it again. */
+                t->ringctl = 0;
+            }
+            /* If the write failed the ioremapped region is gone; leaving
+             * the count inflated is the least-bad option (the queue is dead
+             * either way). */
         }
         t->reader_idx = -1;
     }
@@ -483,7 +501,12 @@ static void tap_drain_one(struct tapq *t)
         uni_overflow += wpos - t->cursor;
         t->cursor = wpos;
     }
-    probe_kernel_write((void *)(t->ringctl + RC_RCUR0 + t->reader_idx * 4), &t->cursor, sizeof(t->cursor));
+    if (probe_kernel_write((void *)(t->ringctl + RC_RCUR0 + t->reader_idx * 4), &t->cursor, sizeof(t->cursor)) != 0) {
+        /* Cursor writeback failed - the control region is gone.  Retire this
+         * tap so the next drain check doesn't touch it again. */
+        t->ringctl = 0;
+        t->reader_idx = -1;
+    }
 }
 
 /* Drain all tapped queues in slot order. A dump halts all other MIDI, so at most

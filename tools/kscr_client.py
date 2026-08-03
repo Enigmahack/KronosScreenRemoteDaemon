@@ -120,12 +120,16 @@ class AuthResponse:
     __slots__ = ('width', 'height', 'palette', 'frame_bytes')
 
     def __init__(self, raw: bytes):
+        if len(raw) < 5:
+            raise ValueError(f'auth response too short ({len(raw)} bytes, need at least 5)')
         if raw[:4] != KSCR_MAGIC:
             raise ValueError(f'bad magic: {raw[:4]!r}')
         status = raw[4]
         if status != STATUS_OK:
             msgs = {STATUS_FAIL: 'wrong password', STATUS_NOUSER: 'user not found'}
             raise PermissionError(f'auth failed (status=0x{status:02x}): {msgs.get(status, "unknown")}')
+        if len(raw) != AUTH_RESP_LEN:
+            raise ValueError(f'auth response wrong size for OK status ({len(raw)} bytes, expected {AUTH_RESP_LEN})')
         self.width   = struct.unpack_from('<H', raw, 5)[0]
         self.height  = struct.unpack_from('<H', raw, 7)[0]
         self.palette = raw[9:9 + 256 * 3]
@@ -150,7 +154,14 @@ class KSCRPullClient:
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._sock.connect((host, port))
         self._sock.sendall(_make_auth_pkt(user, pwd, MODE_PULL, fps))
-        self._auth = AuthResponse(_recv_all(self._sock, AUTH_RESP_LEN))
+        # Read the 5-byte header first so auth failures (5 bytes, then close)
+        # surface as PermissionError, not EOFError.
+        auth_raw = _recv_all(self._sock, 5)
+        if auth_raw[4] != STATUS_OK:
+            # AuthResponse raises PermissionError for non-OK status
+            AuthResponse(auth_raw)
+        auth_raw += _recv_all(self._sock, AUTH_RESP_LEN - 5)
+        self._auth = AuthResponse(auth_raw)
 
     @property
     def width(self)       -> int:   return self._auth.width
@@ -197,7 +208,14 @@ class KSCRChangeClient:
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._sock.connect((host, port))
         self._sock.sendall(_make_auth_pkt(user, pwd, MODE_CHANGE, fps))
-        self._auth = AuthResponse(_recv_all(self._sock, AUTH_RESP_LEN))
+        # Read the 5-byte header first so auth failures (5 bytes, then close)
+        # surface as PermissionError, not EOFError.
+        auth_raw = _recv_all(self._sock, 5)
+        if auth_raw[4] != STATUS_OK:
+            # AuthResponse raises PermissionError for non-OK status
+            AuthResponse(auth_raw)
+        auth_raw += _recv_all(self._sock, AUTH_RESP_LEN - 5)
+        self._auth = AuthResponse(auth_raw)
         self.frame = bytearray(self.frame_bytes)
 
     @property

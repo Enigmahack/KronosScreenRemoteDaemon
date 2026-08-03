@@ -468,8 +468,18 @@ int main(int argc, char *argv[]) {
                     if (n > 16) fprintf(stderr, " ...");
                     fprintf(stderr, "\n");
                 }
-                if (midi_fd >= 0)
-                    write(midi_fd, buf, n);
+                if (midi_fd >= 0) {
+                    ssize_t w = write(midi_fd, buf, n);
+                    if (w != n) {
+                        /* /proc/.midi_in is gone (OA teardown) or short-write -
+                         * the drain check above already handles EAGAIN/EWOULDBLOCK,
+                         * so a mismatch here is permanent.  Close and stop injecting. */
+                        if (debug)
+                            fprintf(stderr, "midi_in write(%d) returned %zd, closing\n", n, w);
+                        close(midi_fd);
+                        midi_fd = -1;
+                    }
+                }
             }
         }
 
