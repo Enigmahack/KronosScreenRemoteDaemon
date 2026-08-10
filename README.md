@@ -36,7 +36,8 @@ source/
   no_tracepoints.h          - stub header for kernel tracepoint macros
   vkbd_ko.h                 - generated: embedded vkbd.ko as a C array (do not edit; not committed)
   midi_bridge_ko.h          - generated: embedded midi_bridge.ko as a C array (do not edit; not committed)
-  nks4_inject_ko.h          - generated: embedded nks4_inject.ko as a C array (do not edit; not committed)
+  nks4_inject_ko.h          - generated: embedded nks4_inject.ko as a C array (do not edit; committed as a bootstrap copy, regenerated on module rebuild)
+  eva_mode_ko.h             - generated: embedded eva_mode.ko as a C array (do not edit; committed as a bootstrap copy, regenerated on module rebuild)
   midi_tcp_bin.h             - generated: embedded midi_tcp binary as a C array (do not edit; not committed)
 
 vkbd_module/
@@ -55,6 +56,11 @@ nks4_inject_module/
   nks4_inject.c              - front-panel injection kernel module source (/proc/.nks4inject write, /proc/.nks4inject_status read)
   Kbuild                    - kernel build descriptor
   Makefile.module            - builds nks4_inject.ko, patches it, then generates nks4_inject_ko.h
+
+eva_mode_module/
+  eva_mode.c                 - Eva CModeManager mode-state reader kernel module source (/proc/.eva_mode read)
+  Kbuild                    - kernel build descriptor
+  Makefile.module            - builds eva_mode.ko, patches it, then generates eva_mode_ko.h
 
 tools/
   kscr_client.py             - Python 3 reference client (stream, control, and MIDI-bridge protocols)
@@ -182,6 +188,10 @@ If `nks4_inject.ko` fails to load (symbol resolution failure against `/proc/kall
 
 `PALETTE`, `REGION`, and `PIXEL` are framebuffer-read diagnostic/calibration commands used to derive the pixel fingerprints and hit boxes above; they have no dependency on `nks4_inject.ko`.
 
+### Mode detection
+
+`STATE`, `MODE_DETAIL`, and `SYSINFO` get their `MODE=`/`EDITCTX=` values from `eva_mode.ko` (extracted from `eva_mode_ko.h`, loaded early at startup), which reads Eva's live CModeManager state directly out of its process memory and exposes it as `/proc/.eva_mode` - exact, no pixel thresholds. Its one calibrated address (`CMMI::sm_poMMI`, which differs between Eva builds) is auto-corrected at runtime: the daemon reads the symbol straight out of Eva's on-disk ELF symbol table and live-writes the module parameter via sysfs. When the module isn't loaded or hasn't resolved yet (early boot, kill-switch), the daemon falls back to framebuffer pixel detection (`mode_detect_refs.h`).
+
 ### MIDI injection
 
 Because `midi_bridge.ko` reads OA's in-memory objects (the MIDI in-port array and the out-queue it taps as a reader), its load is **deferred until the Kronos has finished booting** — specifically until EVA has drawn its UI, detected from the framebuffer (non-black percentage plus distinct-colour count; the loading/update screen is essentially all-black with a couple of colours, the drawn UI is not). This is well after OA reaches `MODULE_STATE_LIVE`, so the module never reads half-built state, and — critically — it keeps the tap out of the fragile boot-settling window (see "Real-time safety" below). A `/korg/rw/screenremote/.fbcurve` flag file puts the daemon in a brick-safe calibration mode that logs the boot framebuffer curve and skips loading `midi_bridge` entirely. Unlike its predecessor `midi_inject.ko`, the module does **not** patch OA `.text` — MIDI-out capture is done by claiming a spare reader slot on OA's transmit queue, so there is no trampoline, no `.text` write, and no teardown freeze when OA is unloaded.
@@ -202,7 +212,7 @@ Continuous controllers (e.g. mod wheel, breath) sent via `MIDI_SEND` are rate-li
 
 ### Boot safety and recovery
 
-Kernel module loading (`vkbd.ko`, `nks4_inject.ko`, `midi_bridge.ko`) is inherently risky on the Kronos's RTAI kernel, so startup is guarded by three independent mechanisms, all living under the FTP-visible `/korg/rw/HD` folder so they are reachable even on a non-rooted unit with no shell access:
+Kernel module loading (`vkbd.ko`, `nks4_inject.ko`, `midi_bridge.ko`, `eva_mode.ko`) is inherently risky on the Kronos's RTAI kernel, so startup is guarded by three independent mechanisms, all living under the FTP-visible `/korg/rw/HD` folder so they are reachable even on a non-rooted unit with no shell access:
 
 - **Boot flag** (`/korg/rw/HD/ScreenRemote/.boot`) - written at the start of every boot and deleted only once the framebuffer, network, and both listeners are confirmed up. It is also durably recreated before retrying unavailable injection modules after a successful IP rebind. If it is still present when the daemon starts, the previous boot did not finish cleanly, so no kernel modules are loaded that boot. Delete the file over FTP to re-enable module loading on the next boot.
 - **Kill switch** (`/korg/rw/HD/_nomod`) - if this folder exists, the daemon loads no kernel modules at all, regardless of the boot flag. Create it over FTP (`mkdir _nomod`) and reboot to bring the unit up with no kernel modules at all - useful before running a Korg OS update or the Factory State Restore cleaner, and for recovering a wedged unit. (`midi_bridge.ko` no longer patches OA `.text`, so the old teardown freeze at "Preparing to Install" is gone; this kill-switch remains as defense-in-depth.)
@@ -231,6 +241,7 @@ Kernel module loading (`vkbd.ko`, `nks4_inject.ko`, `midi_bridge.ko`) is inheren
 make -C vkbd_module -f Makefile.module
 make -C nks4_inject_module -f Makefile.module
 make -C midi_module -f Makefile.module
+make -C eva_mode_module -f Makefile.module
 ```
 
 Each runs `make modules` against the 2.6.32.11 kernel tree, runs `patch_init_offset.py` on the resulting `.ko`, and then uses `xxd -i` to regenerate the corresponding C header (`source/vkbd_ko.h`, `source/nks4_inject_ko.h`, `source/midi_bridge_ko.h`).

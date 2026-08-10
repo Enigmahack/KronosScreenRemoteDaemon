@@ -181,7 +181,7 @@
 #define KBD_EV_KEY  1
 
 /*  Version */
-#define SCREENREMOTE_VERSION "2.0.7"
+#define SCREENREMOTE_VERSION "2.0.9"
 #ifndef BUILD_ID
 #define BUILD_ID "dev"
 #endif
@@ -632,14 +632,57 @@ static void set_cloexec(int fd)
 
 /* Kernel message log (dmesg) */
 /* I/O helper */
+/* Total wall-clock budget for "peer isn't taking bytes right now" inside ONE
+ * write_all() call - covers both the EAGAIN leg and the partial-write leg. */
+#define WRITE_ALL_STALL_MS 250
+
 static int write_all(int fd, const void *buf, size_t n)
 {
     const uint8_t *p = buf;
+    struct timespec t0, tn;
+    /* Taken BEFORE the loop, deliberately.  A budget measured from the first
+     * EAGAIN is wrong on a *blocking* fd: EAGAIN there means SO_SNDTIMEO has
+     * ALREADY expired (5 s on the stream socket, 2 s on a one-shot ctrl
+     * socket), so a lazily-started clock reads 0 ms at that point, sleeps, and
+     * lets write() burn a second full timeout before giving up.  Anchored at
+     * entry, the first EAGAIN on a blocking fd already reads >= the socket
+     * timeout and returns immediately - i.e. exactly the pre-retry behaviour. */
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+#define WRITE_ALL_STALLED() \
+    (clock_gettime(CLOCK_MONOTONIC, &tn), \
+     (tn.tv_sec - t0.tv_sec) * 1000L + (tn.tv_nsec - t0.tv_nsec) / 1000000L \
+        >= WRITE_ALL_STALL_MS)
+
     while (n > 0) {
         ssize_t r = write(fd, p, n);
+        if (r < 0 && errno == EINTR)
+            continue;   /* signal mid-write is not a dead peer */
+        if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            /* Intended case: an O_NONBLOCK fd (the persistent ctrl socket) where
+             * a large response (SYSEX_RESP can reach ~131 KB) exceeds the socket
+             * send buffer.  Wait for drain room rather than truncate the reply.
+             *
+             * A *blocking* fd with SO_SNDTIMEO also lands here, but only after
+             * having already blocked for its whole timeout - the entry-anchored
+             * deadline above means it fails out on this first check instead of
+             * multiplying that timeout by the retry count.  Without that, a
+             * client that stops draining (sleeping laptop, Wi-Fi drop with no
+             * RST -> TCP zero-window) froze this single-threaded loop for
+             * ~125 s: no frames, no ctrl, no MIDI drain, and no stuck-pad
+             * watchdog either. */
+            if (WRITE_ALL_STALLED()) return -1;
+            usleep(10000);
+            continue;
+        }
         if (r <= 0) return -1;
         p += r; n -= (size_t)r;
+        /* Partial-write leg needs the same bound: SO_SNDTIMEO reports a short
+         * count (NOT EAGAIN) whenever some bytes made it out, so a peer holding
+         * a tiny receive window keeps this loop making one-byte progress with
+         * every write() blocking the full timeout - unbounded without this. */
+        if (n > 0 && WRITE_ALL_STALLED()) return -1;
     }
+#undef WRITE_ALL_STALLED
     return 0;
 }
 
@@ -902,23 +945,14 @@ static void check_mirror_flag(void)
 }
 
 /* Network */
+static uint32_t find_lan_ip(void);   /* defined immediately below */
+
 static int network_ok(void)
 {
-    struct ifaddrs *ifa, *p;
-    int ok = 0;
-    if (getifaddrs(&ifa) < 0) return 0;
-    for (p = ifa; p && !ok; p = p->ifa_next) {
-        struct sockaddr_in *sin;
-        uint32_t a;
-        if (!p->ifa_addr || p->ifa_addr->sa_family != AF_INET) continue;
-        sin = (struct sockaddr_in *)p->ifa_addr;
-        a   = ntohl(sin->sin_addr.s_addr);
-        if ((a >> 24) == 127)   continue;
-        if ((a >> 16) == 0xA9FE) continue;
-        ok = 1;
-    }
-    freeifaddrs(ifa);
-    return ok;
+    /* Exactly "a usable LAN IPv4 address exists" - the same predicate
+     * find_lan_ip() uses to pick the bind address, so the network-up wait and
+     * the bind can never disagree about what "up" means. */
+    return find_lan_ip() != INADDR_ANY;
 }
 
 /* Returns the first usable LAN IPv4 address in network byte order, or INADDR_ANY. */
@@ -2141,7 +2175,7 @@ static int nks4_progress_read(int *out_pct, int *out_hwver)
 /* ── Boot-state gate ──────────────────────────────────────────────────────
  * Goal: never let a client send an interactive command (touch/button/wheel/
  * MIDI/etc.) while the Kronos OS is still booting - only the read-only
- * allowlist (see is_readonly_cmd()) is answered during that window, and the
+ * allowlist (see cmd_class()) is answered during that window, and the
  * decision is made entirely server-side (a client, especially one that just
  * connected, has no way to tell "still booting" from "genuinely idle" on its
  * own - that determination belongs to the daemon, not something every client
@@ -2316,9 +2350,13 @@ static long eva_uptime_seconds(int pid)
     if (!rparen)
         return -1;
     p = rparen + 1;
-    /* Fields after comm, 1-indexed from field 3 (state) at *p: starttime is
-     * field 22, i.e. the 20th whitespace-separated token starting from p. */
-    for (i = 3; i < 22; i++) {
+    /* Fields after comm: starttime is field 22, i.e. the 20th whitespace-
+     * separated token after comm (field 3 is token 1), so advance exactly 20
+     * tokens.  The previous bound (i < 22) stopped one token early and read
+     * field 21 (itrealvalue, hardcoded 0 since Linux 2.6.17), making Eva's
+     * age equal to the full system uptime - the boot-gate override fired at
+     * 180 s of UPTIME regardless of when Eva actually started. */
+    for (i = 0; i < 20; i++) {
         p = strchr(p, ' ');
         if (!p)
             return -1;
@@ -2347,11 +2385,21 @@ static long eva_uptime_seconds(int pid)
     }
 }
 
+/* One-way gate clear, shared by all three independent clearing signals in
+ * update_boot_state() below - frees the boot splash (never needed again once
+ * the gate is open) exactly once, whichever signal fires first. */
+static void boot_gate_clear(void)
+{
+    g_boot_active = 0;
+    free(g_boot_splash);
+    g_boot_splash = NULL;
+}
+
 /* Called once per main-loop iteration (see main()) - cheap once latched
  * (g_boot_active == 0 short-circuits immediately), so no throttling needed
  * even though this runs far more often than eva_mode.ko's own /proc/.eva_mode
- * changes. See the block comment above for the two signals and why either
- * clears the gate. */
+ * changes. See the block comment above for the signals and why any one of
+ * them clears the gate. */
 static void update_boot_state(void)
 {
     int mode = 0, editctx = 0, pid = -1, resolved;
@@ -2387,8 +2435,7 @@ static void update_boot_state(void)
                 usleep(EVA_CONFIRM_DELAY_MS * 1000);
                 cresolved = eva_mode_read(&cmode, &ceditctx, NULL, NULL);
                 if (cresolved && cmode == mode && ceditctx == editctx) {
-                    g_boot_active = 0;
-                    free(g_boot_splash); g_boot_splash = NULL;   /* no longer needed - see apply_boot_splash() */
+                    boot_gate_clear();
                     fprintf(stderr, "screenremote: boot gate cleared (eva_mode.ko confirmed stable, "
                                      "MODE=%d EDITCTX=%d)\n", mode, editctx);
                     return;
@@ -2409,8 +2456,7 @@ static void update_boot_state(void)
     if (pid > 0) {
         long up = eva_uptime_seconds(pid);
         if (up >= EVA_BOOT_UPTIME_OVERRIDE_S) {
-            g_boot_active = 0;
-            free(g_boot_splash); g_boot_splash = NULL;
+            boot_gate_clear();
             fprintf(stderr, "screenremote: boot gate cleared (Eva pid=%d alive %lds)\n", pid, up);
         }
     }
@@ -2424,8 +2470,7 @@ static void update_boot_state(void)
         fb_metrics(&pct, &dist);
         if (pct >= EVA_UI_NONBLACK_PCT && dist >= EVA_UI_DISTINCT_MIN) {
             if (++g_eva_ui_streak >= EVA_UI_READY_CHECKS) {
-                g_boot_active = 0;
-                free(g_boot_splash); g_boot_splash = NULL;
+                boot_gate_clear();
                 fprintf(stderr, "screenremote: boot gate cleared (EVA UI rendering: "
                                  "nonblack=%d distinct=%d)\n", pct, dist);
             }
@@ -2435,22 +2480,40 @@ static void update_boot_state(void)
     }
 }
 
-/* Commands answered regardless of ctrl ownership AND regardless of the boot
- * gate above - see docs/api.md's "Read-only allowlist exception". Shared by
- * the ctrl-accept path (ownership bypass) and process_ctrl_cmd() (boot-gate
- * bypass) so the two can never drift apart. */
-static int is_readonly_cmd(const char *line)
+/* Command classes for access control and the boot gate (see docs/api.md's
+ * "Read-only allowlist exception" and update_boot_state()'s block comment):
+ *   CMD_RO_ALWAYS    - read-only AND answered even during boot: STATE/
+ *                      MODE_DETAIL/SYSINFO are how a client polls for BOOT to
+ *                      clear, PALETTE is the fixed lookup table needed to
+ *                      decode the video stream at all (boot splash included),
+ *                      VERSION is static build metadata - none are synth state.
+ *   CMD_RO_BOOTGATED - read-only (any IP may ask, no ownership needed) but
+ *                      rejected while BOOT=1: these report touch/pad/pixel
+ *                      activity that is meaningless (no legitimate touch input
+ *                      exists while BOOT=1) or, for PIXEL/REGION, could be read
+ *                      as a claim about live UI content that isn't trustworthy
+ *                      yet.
+ *   CMD_MUTATING     - everything else: ownership required, rejected in boot.
+ * Shared by the ctrl-accept path (ownership bypass) and process_ctrl_cmd()
+ * (boot-gate enforcement) so the two can never drift apart. */
+#define CMD_MUTATING      0
+#define CMD_RO_BOOTGATED  1
+#define CMD_RO_ALWAYS     2
+static int cmd_class(const char *line)
 {
-    return strcmp(line, "LASTTOUCH") == 0 ||
-           strcmp(line, "PADMAP_LIST") == 0 ||
-           strcmp(line, "PADMAP_STATE") == 0 ||
-           strncmp(line, "PIXEL ", 6) == 0 ||
-           strncmp(line, "REGION ", 7) == 0 ||
-           strcmp(line, "PALETTE") == 0 ||
-           strcmp(line, "STATE") == 0 ||
-           strcmp(line, "MODE_DETAIL") == 0 ||
-           strcmp(line, "VERSION") == 0 ||
-           strcmp(line, "SYSINFO") == 0;
+    if (strcmp(line, "PALETTE") == 0 ||
+        strcmp(line, "STATE") == 0 ||
+        strcmp(line, "MODE_DETAIL") == 0 ||
+        strcmp(line, "VERSION") == 0 ||
+        strcmp(line, "SYSINFO") == 0)
+        return CMD_RO_ALWAYS;
+    if (strcmp(line, "LASTTOUCH") == 0 ||
+        strcmp(line, "PADMAP_LIST") == 0 ||
+        strcmp(line, "PADMAP_STATE") == 0 ||
+        strncmp(line, "PIXEL ", 6) == 0 ||
+        strncmp(line, "REGION ", 7) == 0)
+        return CMD_RO_BOOTGATED;
+    return CMD_MUTATING;
 }
 
 /* ── Boot splash compositing ──────────────────────────────────────────────
@@ -2833,12 +2896,21 @@ static void send_padchord(int pad, int vel)
  * rtf5_btn_table[] above.  Only ever called once g_rtf5_fallback_active is set; touch_fd
  * is opened lazily on first use (mirrors nks4_fd's own open-on-demand pattern) and left
  * open across calls, since /dev/rtf5 may not exist yet the first time this fires. */
+/* /dev/rtf5 is opened lazily (it may not exist yet the first time a fallback
+ * event fires) and left open across calls - mirrors nks4_fd's open-on-demand
+ * pattern. */
+static int rtf5_fd(void)
+{
+    if (touch_fd < 0) {
+        touch_fd = open("/dev/rtf5", O_WRONLY);
+        set_cloexec(touch_fd);
+    }
+    return touch_fd;
+}
+
 static void send_rtf5_event(uint32_t dev, uint32_t code, uint32_t value)
 {
-    if (touch_fd < 0)
-        touch_fd = open("/dev/rtf5", O_WRONLY);
-    set_cloexec(touch_fd);
-    if (touch_fd >= 0) {
+    if (rtf5_fd() >= 0) {
         uint32_t pkt[5] = { 0x00010014u, 0u, dev, code, value };
         (void)write(touch_fd, pkt, 20);
     }
@@ -2848,10 +2920,7 @@ static void send_rtf5_event(uint32_t dev, uint32_t code, uint32_t value)
  * separate value field) - not expressible through send_rtf5_event()'s 5-field layout. */
 static void send_rtf5_wheel(uint32_t field3)
 {
-    if (touch_fd < 0)
-        touch_fd = open("/dev/rtf5", O_WRONLY);
-    set_cloexec(touch_fd);
-    if (touch_fd >= 0) {
+    if (rtf5_fd() >= 0) {
         uint32_t pkt[4] = { 0x00010010u, 0u, 0x0000000du, field3 };
         (void)write(touch_fd, pkt, 16);
     }
@@ -3241,32 +3310,112 @@ static int sysinfo_collect(char *out, int outsz)
 
 /* MIDI helpers */
 
+/* Generic /proc/kallsyms substring resolver - one scanner shared by the MIDI
+ * and NKS4 OA-symbol lookups below.  Each probe is {unique name substring,
+ * out-pointer}; *out gets the address from the first kallsyms line whose
+ * symbol name contains the substring.  Every substring used below is a unique
+ * fragment of one specific mangled OA symbol (none appears inside any other
+ * symbol), so substring-first-match is exact.  Stops early once every probe
+ * has resolved. */
+struct sym_probe { const char *substr; unsigned long *out; };
+
+/* GCC emits cloned variants of a function under the original name plus one of
+ * these suffixes when it partially inlines / specialises it (-O2 does this
+ * routinely).  A clone is a DIFFERENT function with a DIFFERENT signature - it
+ * assumes the caller already performed whatever checks it was split out of -
+ * so binding a probe to one and then calling it through the real function's
+ * prototype is a wrong-ABI call into the kernel.
+ *
+ * They matter here because every probe below is a substring match, and a clone
+ * contains its parent's whole name.  They are also emitted as LOCAL symbols
+ * ('t'), so the type filter alone does not exclude them, and ELF requires
+ * LOCALs to precede GLOBALs in .symtab - which is the order /proc/kallsyms
+ * emits a module's symbols in - so a clone reliably WINS a first-match race
+ * against the function it was cloned from.
+ *
+ * Not hypothetical: the from-scratch OA.ko reconstruction used in the QEMU VM
+ * carries _ZN21CSTGMidiInPortGeneric7ReceiveEPKhj.part.0 at symtab index 678
+ * versus index 5887 for the real function, so the pre-filter resolver bound
+ * midi_bridge's receive_fn to the clone there.  The real Kronos OA.ko has no
+ * clones for any probed symbol (checked: all 9 live probes match exactly one
+ * symbol each), so this is hardening on real hardware and a fix in the VM. */
+static int is_gcc_clone(const char *name)
+{
+    return strstr(name, ".part.")     || strstr(name, ".isra.") ||
+           strstr(name, ".constprop.") || strstr(name, ".cold");
+}
+
+/* Resolve every probe from /proc/kallsyms in TWO passes.
+ *
+ * Pass 1 additionally requires the symbol type to be text (t/T/w/W).  Every
+ * probe here targets a function, and honouring the type char - which was
+ * already being parsed and thrown away - closes a whole class of mis-binding:
+ * /proc/kallsyms also carries __kstrtab_/__ksymtab_/__kcrctab_ DATA entries
+ * that embed an exported function's name verbatim, so if any probed symbol
+ * ever became EXPORT_SYMBOL'd those would otherwise match a .rodata address
+ * before the function itself.
+ *
+ * Pass 2 runs only for probes still unresolved and drops the type
+ * requirement.  This exists because the type filter must NOT be able to make
+ * things worse: both callers treat an unresolved probe as terminal and
+ * non-retryable for the whole boot (try_load_nks4_inject() returns -1 =
+ * "front-panel injection disabled"; load_midi_bridge() gives up on MIDI
+ * entirely).  On 2.6.32 s_show() renders a module symbol's type as
+ * `exported ? toupper : tolower`, where `exported` means __ksymtab
+ * membership rather than STB_GLOBAL - so these non-EXPORT_SYMBOL'd symbols
+ * should all render as lowercase 't', which pass 1 accepts.  "Should" is not
+ * good enough to gate MIDI and front-panel injection on, hence the fallback:
+ * pass 1 is pure hardening, pass 2 guarantees we never resolve less than the
+ * old single-pass code did.
+ *
+ * The clone rejection applies to BOTH passes - it is the part that actually
+ * fixes a live mis-binding (see is_gcc_clone), and unlike the type filter it
+ * cannot cost us a legitimate symbol. */
+static void kallsyms_resolve(struct sym_probe *probes, int nprobes)
+{
+    FILE *f;
+    char line[256];
+    int i, pass, unresolved = nprobes;
+
+    for (i = 0; i < nprobes; i++)
+        *probes[i].out = 0;
+    f = fopen("/proc/kallsyms", "r");
+    if (!f) return;
+    for (pass = 0; pass < 2 && unresolved > 0; pass++) {
+        if (pass && fseek(f, 0L, SEEK_SET) != 0) break;
+        while (unresolved > 0 && fgets(line, sizeof(line), f)) {
+            unsigned long addr; char type, name[256];
+            if (sscanf(line, "%lx %c %255s", &addr, &type, name) != 3) continue;
+            if (pass == 0 &&
+                type != 't' && type != 'T' && type != 'w' && type != 'W') continue;
+            if (is_gcc_clone(name)) continue;
+            for (i = 0; i < nprobes; i++) {
+                if (!*probes[i].out && strstr(name, probes[i].substr)) {
+                    *probes[i].out = addr;
+                    unresolved--;
+                }
+            }
+        }
+    }
+    fclose(f);
+}
+
 static void resolve_kallsyms(unsigned long *recv_fn,    unsigned long *reg_fn,
                               unsigned long *outport_fn, unsigned long *inports_get,
                               unsigned long *outports_get)
 {
-    FILE *f = fopen("/proc/kallsyms", "r");
-    char line[256];
-    *recv_fn = *reg_fn = *outport_fn = 0;
-    /* VM-testing-only: these two accessors only exist in the from-scratch
-     * reconstructed OA.ko used in the QEMU VM (real Kronos OA.ko never
-     * exports them), so on real hardware this lookup simply never matches
-     * and both stay 0 - a safe no-op by construction. */
-    *inports_get = *outports_get = 0;
-    if (!f) return;
-    while (fgets(line, sizeof(line), f)) {
-        unsigned long addr; char type, name[256];
-        if (sscanf(line, "%lx %c %255s", &addr, &type, name) != 3) continue;
-        if      (!*recv_fn     && strstr(name, "MidiInPortGeneric7Receive"))   *recv_fn     = addr;
-        else if (!*reg_fn      && strstr(name, "RegisterMidiInPort"))          *reg_fn      = addr;
-        else if (!*outport_fn  && strstr(name, "RegisterMidiOutPort"))         *outport_fn  = addr;
-        else if (!*inports_get  && strstr(name, "CSTGMidiPortManager_GetInPortsArrayForTest"))
-            *inports_get  = addr;
-        else if (!*outports_get && strstr(name, "CSTGMidiPortManager_GetOutPortsArrayForTest"))
-            *outports_get = addr;
-        if (*recv_fn && *reg_fn && *outport_fn) break;
-    }
-    fclose(f);
+    /* VM-testing-only: the two *ForTest accessors only exist in the
+     * from-scratch reconstructed OA.ko used in the QEMU VM (real Kronos OA.ko
+     * never exports them), so on real hardware those probes never match and
+     * stay 0 - a safe no-op by construction. */
+    struct sym_probe probes[] = {
+        { "MidiInPortGeneric7Receive", recv_fn },
+        { "RegisterMidiInPort", reg_fn },
+        { "RegisterMidiOutPort", outport_fn },
+        { "CSTGMidiPortManager_GetInPortsArrayForTest", inports_get },
+        { "CSTGMidiPortManager_GetOutPortsArrayForTest", outports_get },
+    };
+    kallsyms_resolve(probes, (int)(sizeof(probes) / sizeof(probes[0])));
 }
 
 /* Resolve the 5 OA.ko-internal symbols nks4_inject.ko calls directly (see that
@@ -3275,63 +3424,91 @@ static void resolve_kallsyms(unsigned long *recv_fn,    unsigned long *reg_fn,
  * the operator (this daemon) resolves them from /proc/kallsyms and passes the
  * live addresses in as insmod params, rather than the module trying
  * kallsyms_lookup_name() itself (not confirmed exported on this kernel). */
-/* RT_chord_trigger(uchar,uchar,uchar,uchar) is NOT kallsyms-visible (no
- * standalone symbol - it's a plain, non-exported function with internal
- * linkage), unlike the class methods above. It's the real per-pad "Pads
- * (touch to play)" trigger: reads KARMA's own chord-memory tables and calls
- * Do_KM_note_out_chord_trig() per voice - confirmed hardware-verified,
- * matching the on-screen NOTE/VEL grid exactly for all 8 pads (0-indexed:
- * pad_index N = on-screen "Pad N+1"). Do_KM_note_out_chord_trig() itself
- * IS kallsyms-visible, so we resolve RT_chord_trigger's live address via the
- * fixed file-offset delta between the two in the reference binary (same
- * technique already established in this project for other unexported
- * symbols) - both live in the same .ko, so the delta survives relocation.
+/* RT_chord_trigger(uchar,uchar,uchar,uchar) is the real per-pad "Pads (touch to
+ * play)" trigger: reads KARMA's own chord-memory tables and calls
+ * Do_KM_note_out_chord_trig() per voice - confirmed hardware-verified, matching
+ * the on-screen NOTE/VEL grid exactly for all 8 pads (0-indexed: pad_index N =
+ * on-screen "Pad N+1").
+ *
+ * CORRECTED 2026-08-09: this used to say RT_chord_trigger was "NOT kallsyms-
+ * visible (no standalone symbol - internal linkage)".  It is.  In OA_real.ko it
+ * is `_Z16RT_chord_triggerhhhh`, FUNC GLOBAL in .text, 1688 bytes - the exact
+ * same symbol class as HandleSwitchEvent and every other symbol resolved here.
+ * So we now probe for it DIRECTLY, and keep the delta below only as a fallback.
+ *
+ * The full mangled name is required, not a "RT_chord_trigger" substring: that
+ * substring also matches _Z20RT_chord_trigger_ntehhc (0x513003),
+ * _Z20RT_chord_trigger_velhhh (0x513038) and _Z21RT_chord_trigger_chanhh
+ * (0x51306d) - three different functions with three different signatures.
+ *
+ * Fallback: Do_KM_note_out_chord_trig IS also kallsyms-visible, and the two sit
+ * at a fixed distance in the same .ko, so the delta survives relocation.
  * Ground-truthed against OA_real.ko: RT_chord_trigger=0x00512842,
- * Do_KM_note_out_chord_trig=0x0055e3fa -> delta=0x4bbb8. Re-derive both
- * addresses with `nm` against the current OA.ko if this OS build changes. */
+ * Do_KM_note_out_chord_trig=0x0055e3fa -> delta=0x4bbb8 (re-verified against
+ * the real binary's symbol table 2026-08-09, still exact).
+ *
+ * The delta path is inherently unsafe on its own: its only guard is against
+ * underflow, and module .text always lands far above 0x4bbb8, so ANY future OS
+ * build that moves these two functions relative to each other yields a wrong
+ * but plausible address that nks4_inject would then call in kernel context.
+ * That is exactly why the direct probe is now primary and a disagreement
+ * between the two is logged loudly. */
 #define RT_CHORD_TRIGGER_DELTA  0x4bbb8UL
 
 static void resolve_nks4_kallsyms(unsigned long *fn_switch, unsigned long *fn_touch,
                                    unsigned long *fn_rotary, unsigned long *fn_analog,
                                    unsigned long *fn_invert, unsigned long *fn_chord,
+                                   unsigned long *fn_setled,
                                    unsigned long *fn_sinstance_get)
 {
-    FILE *f = fopen("/proc/kallsyms", "r");
-    unsigned long km_note_out = 0;
-    char line[256];
-    *fn_switch = *fn_touch = *fn_rotary = *fn_analog = *fn_invert = *fn_chord = 0;
-    /* VM-testing-only: CSTGFrontPanel_GetInstanceForTest only exists in the
-     * from-scratch reconstructed OA.ko used in the QEMU VM (real Kronos
-     * OA.ko never exports it), so on real hardware this stays 0 - a safe
-     * no-op by construction. */
-    *fn_sinstance_get = 0;
-    if (!f) return;
-    while (fgets(line, sizeof(line), f)) {
-        unsigned long addr; char type, name[256];
-        if (sscanf(line, "%lx %c %255s", &addr, &type, name) != 3) continue;
-        if      (!*fn_switch && strstr(name, "HandleSwitchEventE14eSTGButtonCodeb"))
-            *fn_switch = addr;
-        else if (!*fn_touch  && strstr(name, "HandleTouchPanelE24eNKS4TouchPanelEventTypei"))
-            *fn_touch  = addr;
-        else if (!*fn_rotary && strstr(name, "CSTGFrontPanel12HandleRotaryEi"))
-            *fn_rotary = addr;
-        else if (!*fn_analog && strstr(name, "HandleAnalogControllerE20eSTGAnalogDeviceCodeht"))
-            *fn_analog = addr;
-        /* Must NOT match ShortInvertNkS4RawAnalogValue (a different, unrelated
-         * function) - the "Raw" variant breaks this exact substring, so plain
-         * strstr is already safe here without an extra length/suffix check. */
-        else if (!*fn_invert && strstr(name, "ShortInvertNkS4AnalogValue"))
-            *fn_invert = addr;
-        else if (!km_note_out && strstr(name, "Do_KM_note_out_chord_trig"))
-            km_note_out = addr;
-        else if (!*fn_sinstance_get && strstr(name, "CSTGFrontPanel_GetInstanceForTest"))
-            *fn_sinstance_get = addr;
-        if (*fn_switch && *fn_touch && *fn_rotary && *fn_analog && *fn_invert && km_note_out)
-            break;
-    }
-    fclose(f);
+    unsigned long km_note_out = 0, chord_direct = 0, chord_delta = 0;
+    /* "ShortInvertNkS4AnalogValue" must NOT match ShortInvertNkS4RawAnalogValue
+     * (a different, unrelated function) - the "Raw" variant breaks this exact
+     * substring, so plain strstr is already safe without a suffix check.
+     * CSTGFrontPanel_GetInstanceForTest is VM-testing-only (only exists in the
+     * QEMU OA.ko reconstruction; never matches on real hardware, stays 0).
+     *
+     * fn_setled is CSTGFrontPanelMsgHandler::SetLED - NOT called by anything
+     * here.  It is resolved purely as an address ANCHOR: its second and third
+     * instructions are `push ebp; mov eax, ds:CSTGFrontPanel::sInstance`, so
+     * the 4 bytes at its entry+0x2 are the relocated address of
+     * CSTGFrontPanel::sInstance, which nks4_inject needs and cannot get any
+     * other way (kallsyms on this kernel does not expose .bss data symbols).
+     * See nks4_inject.c's SETLED_SINSTANCE_OFFSET for the full derivation and
+     * why the offset it used before pointed at the wrong singleton. */
+    struct sym_probe probes[] = {
+        { "HandleSwitchEventE14eSTGButtonCodeb", fn_switch },
+        { "HandleTouchPanelE24eNKS4TouchPanelEventTypei", fn_touch },
+        { "CSTGFrontPanel12HandleRotaryEi", fn_rotary },
+        { "HandleAnalogControllerE20eSTGAnalogDeviceCodeht", fn_analog },
+        { "ShortInvertNkS4AnalogValue", fn_invert },
+        { "_Z16RT_chord_triggerhhhh", &chord_direct },
+        { "Do_KM_note_out_chord_trig", &km_note_out },
+        { "CSTGFrontPanelMsgHandler6SetLED", fn_setled },
+        { "CSTGFrontPanel_GetInstanceForTest", fn_sinstance_get },
+    };
+    kallsyms_resolve(probes, (int)(sizeof(probes) / sizeof(probes[0])));
+
     if (km_note_out > RT_CHORD_TRIGGER_DELTA)
-        *fn_chord = km_note_out - RT_CHORD_TRIGGER_DELTA;
+        chord_delta = km_note_out - RT_CHORD_TRIGGER_DELTA;
+
+    if (chord_direct) {
+        *fn_chord = chord_direct;
+        if (chord_delta && chord_delta != chord_direct)
+            fprintf(stderr, "screenremote: RT_chord_trigger delta stale - direct symbol "
+                    "0x%lx vs Do_KM_note_out_chord_trig-0x%lx = 0x%lx; using the direct "
+                    "symbol. Re-derive RT_CHORD_TRIGGER_DELTA against this OA.ko.\n",
+                    chord_direct, RT_CHORD_TRIGGER_DELTA, chord_delta);
+    } else {
+        /* No direct symbol (older/stripped OA.ko). Fall back, but say so - the
+         * delta is only as good as the OS build it was derived against. */
+        *fn_chord = chord_delta;
+        if (chord_delta)
+            fprintf(stderr, "screenremote: RT_chord_trigger symbol absent - falling back "
+                    "to the 0x%lx delta from Do_KM_note_out_chord_trig (0x%lx -> 0x%lx), "
+                    "UNVERIFIED against this OA.ko\n",
+                    RT_CHORD_TRIGGER_DELTA, km_note_out, chord_delta);
+    }
 }
 
 
@@ -3597,39 +3774,50 @@ static int midi_capture_reap_exited(void)
     return 0;
 }
 
-static void start_midi_capture(void)
+/* wait_iters bounds the child-startup connect loop (200 ms per iteration):
+ * 30 at the boot-time load (midi_tcp may take a moment to exec+bind), shorter
+ * on a main-loop respawn so a repeatedly-failing helper can't stall the loop. */
+static void start_midi_capture(int wait_iters)
 {
     pid_t pid;
     int i;
 
-    if (midi_capture_reap_exited() && midi_cap_fd >= 0) {
+    /* Close a stale capture socket whenever the helper is gone - whether this
+     * call's own reap noticed, or the pid was already -1 (midi_capture_down(),
+     * or the main loop's respawn check reaping first). */
+    if ((midi_capture_reap_exited() || midi_cap_pid <= 0) && midi_cap_fd >= 0) {
         if (sysex_pending)
             sysex_finish();
         close(midi_cap_fd);
         midi_cap_fd = -1;
     }
-    if (midi_cap_fd >= 0 || midi_cap_pid > 0)
-        return;
+    if (midi_cap_fd >= 0)
+        return;   /* helper alive AND connected - nothing to do */
 
-    extract_ko(MIDI_TCP_BIN, midi_tcp_bin, midi_tcp_bin_len);
-    chmod(MIDI_TCP_BIN, 0755);
+    /* Fork a fresh helper only when none is running; if one IS running but we
+     * never connected (e.g. the boot-time connect loop lost a slow exec),
+     * skip straight to the connect retry below. */
+    if (midi_cap_pid <= 0) {
+        extract_ko(MIDI_TCP_BIN, midi_tcp_bin, midi_tcp_bin_len);
+        chmod(MIDI_TCP_BIN, 0755);
 
-    /* Ensure loopback is up - Kronos doesn't configure it by default */
-    bring_up_loopback();
+        /* Ensure loopback is up - Kronos doesn't configure it by default */
+        bring_up_loopback();
 
-    pid = fork();
-    if (pid < 0) return;
+        pid = fork();
+        if (pid < 0) return;
 
-    if (pid == 0) {
-        execl(MIDI_TCP_BIN, "midi_tcp", "-s", NULL);
-        _exit(127);
+        if (pid == 0) {
+            execl(MIDI_TCP_BIN, "midi_tcp", "-s", NULL);
+            _exit(127);
+        }
+
+        midi_cap_pid = pid;
+        fprintf(stderr, "screenremote: midi_tcp pid=%d port=%d\n",
+                (int)pid, MIDI_TCP_PORT);
     }
 
-    midi_cap_pid = pid;
-    fprintf(stderr, "screenremote: midi_tcp pid=%d port=%d\n",
-            (int)pid, MIDI_TCP_PORT);
-
-    for (i = 0; i < 30 && midi_cap_fd < 0; i++) {
+    for (i = 0; i < wait_iters && midi_cap_fd < 0; i++) {
         struct sockaddr_in sa;
         int fd;
         usleep(200000);
@@ -3697,6 +3885,35 @@ static void sysex_finish(void)
     sysex_in_f0      = 0;
 }
 
+/* The ONE way to close the persistent ctrl socket.  A SYSEX issued over a
+ * CTRL_PERSIST session parks sysex_resp_fd == ctrl_fd for up to
+ * SYSEX_INITIAL_TIMEOUT_MS (5 s); if ctrl_fd is closed inside that window and
+ * the SysEx state isn't cleared with it, sysex_resp_fd is left holding a closed
+ * fd NUMBER.  The kernel hands that number to the very next accept()/open(), so
+ * sysex_finish() then writes "SYSEX_RESP <hex>\n" into whatever now owns it -
+ * the video stream socket is the realistic victim, which desyncs the client
+ * mid-frame - and, since sysex_resp_fd != ctrl_fd is true again by then, closes
+ * that unrelated live connection too.
+ *
+ * Only the peer-disconnect path used to do this; the rebind / ownership-revoked
+ * / CTRL_PERSIST-replaced paths all didn't.  Routing every close through here is
+ * what keeps them from drifting apart again. */
+static void ctrl_fd_close(void)
+{
+    if (ctrl_fd < 0)
+        return;
+    if (sysex_pending && sysex_resp_fd == ctrl_fd) {
+        sysex_resp_fd    = -1;
+        sysex_pending    = 0;
+        sysex_cap_offset = 0;
+        sysex_in_f0      = 0;
+    }
+    close(ctrl_fd);
+    ctrl_fd          = -1;
+    ctrl_lb_n        = 0;
+    ctrl_lb_overflow = 0;
+}
+
 /* The midi_tcp helper (our MIDI-capture side) has gone away - EOF or a hard
  * error on midi_cap_fd.  Tear the capture side down cleanly:
  *   - a permanently-readable dead fd left in the select set spins the main loop
@@ -3708,7 +3925,8 @@ static void sysex_finish(void)
  *   - reap the child so it doesn't linger as a zombie.
  * MIDI *injection* (midi_in_fd -> /proc/.midi_in) is a wholly separate path and
  * keeps working; SYSEX/capture just report unavailable (ERR SYSEX_FAIL, and
- * MIDI_STATUS's MIDI_CAPTURE=0) until the daemon is restarted. */
+ * MIDI_STATUS's MIDI_CAPTURE=0) until the main loop's helper-respawn check
+ * brings midi_tcp back (see main()). */
 static void midi_capture_down(void)
 {
     if (sysex_pending)
@@ -3811,36 +4029,21 @@ static void process_ctrl_cmd(const char *line, int fd)
 {
 #define REPLY(msg, len) do { if (fd >= 0) write_all(fd, (msg), (len)); } while (0)
 
-    /* Hard read-only enforcement during boot (see update_boot_state()'s block
-     * comment) - every mutating command is rejected here, uniformly, whether
-     * it arrived through the one-shot accept path or an already-established
-     * CTRL_PERSIST session. The read-only allowlist itself still answers
-     * normally (STATE/MODE_DETAIL/SYSINFO in particular are how a client
-     * finds out BOOT= cleared). */
-    if (g_boot_active && !is_readonly_cmd(line)) {
-        REPLY("ERR BOOTING\n", 12);
-        return;
-    }
+/* Front-panel-injection availability guards.  NKS4_GUARD also allows the
+ * degraded rtf5 fallback; NKS4_GUARD_STRICT is for commands that have no
+ * rtf5 equivalent at all (added after rtf5 was retired - see header comment). */
+#define NKS4_GUARD() do { \
+    if (!g_nks4_loaded && !g_rtf5_fallback_active) { REPLY("ERR NKS4_NOT_LOADED\n", 20); return; } \
+} while (0)
+#define NKS4_GUARD_STRICT() do { \
+    if (!g_nks4_loaded) { REPLY("ERR NKS4_NOT_LOADED\n", 20); return; } \
+} while (0)
 
-    /* The rest of the read-only allowlist doesn't need to stay answerable
-     * during boot the way STATE/MODE_DETAIL/SYSINFO do (those three are
-     * how a client polls for BOOT to clear, and null out their synth-state
-     * fields individually instead - see their own handlers below).
-     * LASTTOUCH/PADMAP_LIST/PADMAP_STATE/PIXEL/REGION all report on touch/
-     * pad/pixel activity that's either meaningless (no legitimate touch
-     * input exists while BOOT=1, since that's mutating and already
-     * rejected above) or, for PIXEL/REGION, could otherwise be read as a
-     * claim about live UI content that isn't trustworthy yet. PALETTE and
-     * VERSION are deliberately exempt - PALETTE is a fixed lookup table a
-     * client needs just to decode the video stream at all (boot splash
-     * included), and VERSION is static build metadata, neither is synth
-     * state. */
-    if (g_boot_active &&
-            (strcmp(line, "LASTTOUCH") == 0 ||
-             strcmp(line, "PADMAP_LIST") == 0 ||
-             strcmp(line, "PADMAP_STATE") == 0 ||
-             strncmp(line, "PIXEL ", 6) == 0 ||
-             strncmp(line, "REGION ", 7) == 0)) {
+    /* Hard read-only enforcement during boot (see update_boot_state()'s block
+     * comment): everything except CMD_RO_ALWAYS is rejected here, uniformly,
+     * whether it arrived through the one-shot accept path or an established
+     * CTRL_PERSIST session.  See cmd_class() for why each class is what it is. */
+    if (g_boot_active && cmd_class(line) != CMD_RO_ALWAYS) {
         REPLY("ERR BOOTING\n", 12);
         return;
     }
@@ -3856,47 +4059,39 @@ static void process_ctrl_cmd(const char *line, int fd)
         check_mirror_flag();
         REPLY("OK\n", 3);
 
-    } else if (strncmp(line, "TOUCH ", 6) == 0) {
-        /* x/y out of framebuffer bounds are snapped to the nearest edge inside
-         * inject_touch() itself; only an unparsable line is rejected. */
-        int x = 0, y = 0;
-        if (!g_nks4_loaded && !g_rtf5_fallback_active) { REPLY("ERR NKS4_NOT_LOADED\n", 20); return; }
-        if (sscanf(line + 6, "%d %d", &x, &y) == 2) {
-            inject_touch(1, x, y);  /* pen-down */
-            inject_touch(2, x, y);  /* pen-up */
-            REPLY("OK\n", 3);
-        } else {
-            REPLY("ERR\n", 4);
-        }
-
-    } else if (strncmp(line, "TOUCH_DOWN ", 11) == 0) {
-        int x = 0, y = 0;
-        if (!g_nks4_loaded && !g_rtf5_fallback_active) { REPLY("ERR NKS4_NOT_LOADED\n", 20); return; }
-        if (sscanf(line + 11, "%d %d", &x, &y) == 2) {
-            inject_touch(1, x, y);
-            REPLY("OK\n", 3);
-        } else {
-            REPLY("ERR\n", 4);
-        }
-
-    } else if (strncmp(line, "TOUCH_MOVE ", 11) == 0) {
-        int x = 0, y = 0;
-        if (!g_nks4_loaded && !g_rtf5_fallback_active) { REPLY("ERR NKS4_NOT_LOADED\n", 20); return; }
-        if (sscanf(line + 11, "%d %d", &x, &y) == 2) {
-            inject_touch(3, x, y);
-            REPLY("OK\n", 3);
-        } else {
-            REPLY("ERR\n", 4);
-        }
-
-    } else if (strncmp(line, "TOUCH_UP ", 9) == 0) {
-        int x = 0, y = 0;
-        if (!g_nks4_loaded && !g_rtf5_fallback_active) { REPLY("ERR NKS4_NOT_LOADED\n", 20); return; }
-        if (sscanf(line + 9, "%d %d", &x, &y) == 2) {
-            inject_touch(2, x, y);
-            REPLY("OK\n", 3);
-        } else {
-            REPLY("ERR\n", 4);
+    } else if (strncmp(line, "TOUCH", 5) == 0) {
+        /* All four touch forms share one parse+inject path - the command word
+         * only selects which event type(s) fire (1=down 2=up 3=move; type2=0
+         * means single-event).  x/y out of framebuffer bounds are snapped to
+         * the nearest edge inside inject_touch() itself; only an unparsable
+         * line is rejected. */
+        static const struct { const char *pfx; int type1, type2; } touch_cmds[] = {
+            { "TOUCH ",      1, 2 },   /* tap: pen-down + pen-up */
+            { "TOUCH_DOWN ", 1, 0 },
+            { "TOUCH_MOVE ", 3, 0 },
+            { "TOUCH_UP ",   2, 0 },
+        };
+        int x = 0, y = 0, ti;
+        for (ti = 0; ti < 4; ti++) {
+            size_t pl = strlen(touch_cmds[ti].pfx);
+            if (strncmp(line, touch_cmds[ti].pfx, pl) != 0)
+                continue;
+            /* Guard INSIDE the matched branch, not at the top: this arm is
+             * entered on the 5-char "TOUCH" prefix, so a non-command like
+             * "TOUCHX 1 2" or a bare "TOUCH" reaches it too - guarding up
+             * there answered those with a confidently wrong
+             * "ERR NKS4_NOT_LOADED" instead of falling through as the
+             * unrecognised command it is. */
+            NKS4_GUARD();
+            if (sscanf(line + pl, "%d %d", &x, &y) == 2) {
+                inject_touch(touch_cmds[ti].type1, x, y);
+                if (touch_cmds[ti].type2)
+                    inject_touch(touch_cmds[ti].type2, x, y);
+                REPLY("OK\n", 3);
+            } else {
+                REPLY("ERR\n", 4);
+            }
+            break;
         }
 
     } else if (strncmp(line, "PADCHORD ", 9) == 0) {
@@ -3910,7 +4105,7 @@ static void process_ctrl_cmd(const char *line, int fd)
          * preserve their relative balance) - confirmed correct on hardware;
          * param4 is fixed at 1, not yet shown to need to vary. */
         int pad = 0, vel = 0;
-        if (!g_nks4_loaded) { REPLY("ERR NKS4_NOT_LOADED\n", 20); return; }
+        NKS4_GUARD_STRICT();
         if (sscanf(line + 9, "%d %d", &pad, &vel) == 2) {
             send_padchord(pad, vel);
             REPLY("OK\n", 3);
@@ -4054,7 +4249,7 @@ static void process_ctrl_cmd(const char *line, int fd)
     } else if (strncmp(line, "BUTTON ", 7) == 0) {
         const char *bname = line + 7;
         const struct btn_def *b;
-        if (!g_nks4_loaded && !g_rtf5_fallback_active) { REPLY("ERR NKS4_NOT_LOADED\n", 20); return; }
+        NKS4_GUARD();
         for (b = btn_table; b->name; b++) {
             if (strcmp(bname, b->name) == 0) break;
         }
@@ -4087,7 +4282,7 @@ static void process_ctrl_cmd(const char *line, int fd)
         const struct rtf5_btn_def *rbtns[8];
         int count = 0, hold_ms = 0;
         const char *p = line + 6;
-        if (!g_nks4_loaded && !g_rtf5_fallback_active) { REPLY("ERR NKS4_NOT_LOADED\n", 20); return; }
+        NKS4_GUARD();
         while (*p == ' ') p++;
         /* Optional leading number = hold duration in ms; clamp into [0,5000]
          * rather than reject (a client sending "-50" or "999999" almost
@@ -4146,7 +4341,7 @@ static void process_ctrl_cmd(const char *line, int fd)
          * a negative literal). */
         const char *dir = line + 6;
         int delta;
-        if (!g_nks4_loaded && !g_rtf5_fallback_active) { REPLY("ERR NKS4_NOT_LOADED\n", 20); return; }
+        NKS4_GUARD();
         if (strcmp(dir, "CW") == 0)       delta = 0x00000100;
         else if (strcmp(dir, "CCW") == 0) delta = 0x0000FF00;
         else { REPLY("ERR\n", 4); return; }
@@ -4162,7 +4357,7 @@ static void process_ctrl_cmd(const char *line, int fd)
          * genuinely malformed line (sscanf fails to find two integers at
          * all) is treated as an error. */
         int idx = 0, val = 0;
-        if (!g_nks4_loaded && !g_rtf5_fallback_active) { REPLY("ERR NKS4_NOT_LOADED\n", 20); return; }
+        NKS4_GUARD();
         if (sscanf(line + 7, "%d %d", &idx, &val) == 2) {
             idx = clampi(idx, 1, 8);
             val = clampi(val, 0, 127);
@@ -4182,7 +4377,7 @@ static void process_ctrl_cmd(const char *line, int fd)
         /* Physical RT Knob n, device code 8 + (n-1). Same snap-not-reject
          * policy as SLIDER. */
         int idx = 0, val = 0;
-        if (!g_nks4_loaded) { REPLY("ERR NKS4_NOT_LOADED\n", 20); return; }
+        NKS4_GUARD_STRICT();
         if (sscanf(line + 5, "%d %d", &idx, &val) == 2) {
             idx = clampi(idx, 1, 8);
             nks4_analog_write(8 + (idx - 1), val);
@@ -4195,7 +4390,7 @@ static void process_ctrl_cmd(const char *line, int fd)
         /* Value slider, device code 25.  val is snapped into [0,127]; only a
          * line with no parsable integer at all is rejected. */
         int val = 0;
-        if (!g_nks4_loaded && !g_rtf5_fallback_active) { REPLY("ERR NKS4_NOT_LOADED\n", 20); return; }
+        NKS4_GUARD();
         if (sscanf(line + 8, "%d", &val) == 1) {
             val = clampi(val, 0, 127);
             if (g_nks4_loaded)
@@ -4223,131 +4418,97 @@ static void process_ctrl_cmd(const char *line, int fd)
      * slow many-step ramp was smooth and repeatable. Send DAMPER as a gradual
      * ramp only - see that command's own comment below. */
 
-    } else if (strncmp(line, "JOYSTICK ", 9) == 0) {
-        /* Standard pitch/mod Joystick (Kronos manual item 12). Hardware-
-         * confirmed via a full-radius clockwise circular sweep then a
-         * half-radius counter-clockwise sweep, same as VECTOR below. */
-        char axis = 0; int val = 0;
-        if (!g_nks4_loaded) { REPLY("ERR NKS4_NOT_LOADED\n", 20); return; }
-        if (sscanf(line + 9, "%c %d", &axis, &val) == 2 && (axis == 'X' || axis == 'Y')) {
-            nks4_analog_write(axis == 'X' ? 1 : 2, val);
-            REPLY("OK\n", 3);
-        } else {
-            REPLY("ERR\n", 4);   /* unrecognised axis - no sensible value to snap to */
+    } else if (strncmp(line, "JOYSTICK ", 9) == 0 ||
+               strncmp(line, "VECTOR ", 7) == 0 ||
+               strncmp(line, "RIBBON ", 7) == 0) {
+        /* Two-axis analog controls over one shared parse+dispatch path.
+         * JOYSTICK = standard pitch/mod joystick (manual item 12);
+         * VECTOR = Vector Synthesis joystick (manual item 9), a separate
+         * physical control; RIBBON = ribbon controller, X = finger position
+         * (Z is a structurally-confirmed dispatch entry but untested -
+         * docs/api.md Section 10).  JOYSTICK/VECTOR hardware-confirmed via
+         * full/half-radius circular sweeps, RIBBON X via center/max/min.
+         * An unrecognised axis is rejected - no sensible value to snap to. */
+        static const struct { const char *pfx; char a1; int c1; char a2; int c2; } axis_cmds[] = {
+            { "JOYSTICK ", 'X', 1, 'Y', 2 },
+            { "VECTOR ",   'X', 5, 'Y', 6 },
+            { "RIBBON ",   'X', 3, 'Z', 4 },
+        };
+        char axis = 0;
+        int val = 0, ai, dev = -1;
+        NKS4_GUARD_STRICT();
+        for (ai = 0; ai < 3; ai++) {
+            size_t pl = strlen(axis_cmds[ai].pfx);
+            if (strncmp(line, axis_cmds[ai].pfx, pl) != 0)
+                continue;
+            if (sscanf(line + pl, "%c %d", &axis, &val) == 2) {
+                if      (axis == axis_cmds[ai].a1) dev = axis_cmds[ai].c1;
+                else if (axis == axis_cmds[ai].a2) dev = axis_cmds[ai].c2;
+            }
+            break;
         }
-
-    } else if (strncmp(line, "VECTOR ", 7) == 0) {
-        /* Vector Joystick (Kronos manual item 9) - a separate physical control
-         * from JOYSTICK above, used for Vector Synthesis, not pitch/mod.
-         * Hardware-confirmed via a full-radius clockwise circular sweep then a
-         * half-radius counter-clockwise sweep. */
-        char axis = 0; int val = 0;
-        if (!g_nks4_loaded) { REPLY("ERR NKS4_NOT_LOADED\n", 20); return; }
-        if (sscanf(line + 7, "%c %d", &axis, &val) == 2 && (axis == 'X' || axis == 'Y')) {
-            nks4_analog_write(axis == 'X' ? 5 : 6, val);
-            REPLY("OK\n", 3);
-        } else {
-            REPLY("ERR\n", 4);
-        }
-
-    } else if (strncmp(line, "RIBBON ", 7) == 0) {
-        /* X axis (finger position) hardware-confirmed via a center/max/center/
-         * min/center sweep. Z axis's exact meaning (commonly touch pressure on
-         * a ribbon strip) is real (confirmed dispatch entry) but untested -
-         * see docs/api.md Section 10. */
-        char axis = 0; int val = 0;
-        if (!g_nks4_loaded) { REPLY("ERR NKS4_NOT_LOADED\n", 20); return; }
-        if (sscanf(line + 7, "%c %d", &axis, &val) == 2 && (axis == 'X' || axis == 'Z')) {
-            nks4_analog_write(axis == 'X' ? 3 : 4, val);
+        if (dev >= 0) {
+            nks4_analog_write(dev, val);
             REPLY("OK\n", 3);
         } else {
             REPLY("ERR\n", 4);
         }
 
-    } else if (strncmp(line, "AFTERTOUCH ", 11) == 0) {
-        /* Keybed channel aftertouch. Hardware-confirmed via a 0/half/full/
-         * half/0 sweep - large single-step jumps work fine. */
-        int val = 0;
-        if (!g_nks4_loaded) { REPLY("ERR NKS4_NOT_LOADED\n", 20); return; }
-        if (sscanf(line + 11, "%d", &val) == 1) {
-            nks4_analog_write(7, val);
+    } else if (strncmp(line, "AFTERTOUCH ", 11) == 0 ||
+               strncmp(line, "PEDAL ", 6) == 0 ||
+               strncmp(line, "FOOTSWITCH ", 11) == 0) {
+        /* Single-value analog controls over one shared parse+dispatch path -
+         * keybed channel aftertouch (7), rear-panel assignable PEDAL jack
+         * (27), rear-panel assignable foot SWITCH jack (28).  All
+         * hardware-confirmed (0/half/full sweeps; large single-step jumps
+         * work, unlike the ramped controls below).  FOOTSWITCH is a switch,
+         * but its value is still snapped into [0,127] rather than restricted
+         * to 0/127 - the daemon does not assume the assigned function only
+         * cares about on/off. */
+        static const struct { const char *pfx; int dev; } sv_cmds[] = {
+            { "AFTERTOUCH ", 7  },
+            { "PEDAL ",      27 },
+            { "FOOTSWITCH ", 28 },
+        };
+        int val = 0, si, dev = -1;
+        NKS4_GUARD_STRICT();
+        for (si = 0; si < 3; si++) {
+            size_t pl = strlen(sv_cmds[si].pfx);
+            if (strncmp(line, sv_cmds[si].pfx, pl) != 0)
+                continue;
+            if (sscanf(line + pl, "%d", &val) == 1)
+                dev = sv_cmds[si].dev;
+            break;
+        }
+        if (dev >= 0) {
+            nks4_analog_write(dev, val);
             REPLY("OK\n", 3);
         } else {
             REPLY("ERR\n", 4);
         }
 
-    } else if (strncmp(line, "PEDAL ", 6) == 0) {
-        /* Rear-panel assignable PEDAL jack (continuous, e.g. expression).
-         * Hardware-confirmed via a 0/half/full/half/0 sweep - large single-step
-         * jumps work fine here, unlike DAMPER below. */
-        int val = 0;
-        if (!g_nks4_loaded) { REPLY("ERR NKS4_NOT_LOADED\n", 20); return; }
-        if (sscanf(line + 6, "%d", &val) == 1) {
-            nks4_analog_write(27, val);
-            REPLY("OK\n", 3);
-        } else {
-            REPLY("ERR\n", 4);
-        }
-
-    } else if (strncmp(line, "FOOTSWITCH ", 11) == 0) {
-        /* Rear-panel assignable foot SWITCH jack. Hardware-confirmed via a
-         * single on(127)/off(0) tap, registered correctly with no polarity
-         * surprises - a simple on/off switch, unlike the other continuous
-         * controls here, but the value is still snapped into [0,127] rather
-         * than restricted to those two values - the daemon does not assume
-         * the assigned function only cares about on/off. */
-        int val = 0;
-        if (!g_nks4_loaded) { REPLY("ERR NKS4_NOT_LOADED\n", 20); return; }
-        if (sscanf(line + 11, "%d", &val) == 1) {
-            nks4_analog_write(28, val);
-            REPLY("OK\n", 3);
-        } else {
-            REPLY("ERR\n", 4);
-        }
-
-    } else if (strncmp(line, "DAMPER ", 7) == 0) {
-        /* Rear-panel DAMPER jack - sustain, or half-damper position if the
-         * current Program/Combi has half-damper response configured.
+    } else if (strncmp(line, "DAMPER ", 7) == 0 || strncmp(line, "TEMPO ", 6) == 0) {
+        /* Ramped controls - a direct jump to a target value produces
+         * inconsistent, non-repeatable results on real hardware; a smooth
+         * monotonic ramp through every intermediate value does not.  See
+         * nks4_analog_ramp()'s header comment for the full evidence (DAMPER:
+         * AnalogDamperHandler evidently uses rate-of-change to tell an on/off
+         * footswitch from a continuous half-damper pedal; TEMPO: confirmed
+         * identical ascending/descending).  Routed through nks4_analog_ramp()
+         * so callers never have to think about this.
          *
-         * Hardware-confirmed, but with a real quirk: the jack accepts either
-         * a simple on/off footswitch (Korg PS-1) or a continuous half-damper
-         * pedal (Korg DS-1H), and AnalogDamperHandler evidently uses rate-of-
-         * change to tell them apart - NOT a polarity-setting effect (a
-         * polarity change was tried first based on the odd initial symptoms
-         * and made no difference). A direct jump to a target value produces
-         * inconsistent, non-repeatable results on real hardware; a gradual
-         * ramp through every intermediate value does not - confirmed via a
-         * 256-step sweep, smooth and repeatable both directions. Routed
-         * through nks4_analog_ramp() below so callers never have to think
-         * about this - send a target value like any other command here. */
-        int val = 0;
-        if (!g_nks4_loaded) { REPLY("ERR NKS4_NOT_LOADED\n", 20); return; }
-        if (sscanf(line + 7, "%d", &val) == 1) {
-            nks4_analog_ramp(29, val, &g_damper_value);
-            REPLY("OK\n", 3);
-        } else {
-            REPLY("ERR\n", 4);
-        }
-
-    } else if (strncmp(line, "TEMPO ", 6) == 0) {
-        /* Tempo, device code 26. Same behavioural class as DAMPER above - a
-         * direct jump produces inconsistent results, a gradual ramp does not
-         * - routed through the same nks4_analog_ramp() helper.
-         *
-         * value is 0-127 like every other analog command here, NOT a direct
-         * BPM number - it maps onto the documented 40-300bpm range through a
-         * confirmed non-linear curve (more resolution at low tempos), not a
-         * straight line. Ground-truthed on hardware, identical ascending and
-         * descending:
+         * TEMPO's value is 0-127 like every other analog command, NOT a BPM
+         * number - it maps onto the documented ~40-300bpm range through a
+         * confirmed non-linear curve (more resolution at low tempos):
          *   value:  0   16   32   48   64   80   96  112  127
          *   bpm:   40   51   68   92  120  154  196  245  297
-         * Interpolate between these points for an intermediate value if a
-         * client needs a specific BPM; no closed-form formula is exposed
-         * here since the confirmed data is the more reliable source. */
-        int val = 0;
-        if (!g_nks4_loaded) { REPLY("ERR NKS4_NOT_LOADED\n", 20); return; }
-        if (sscanf(line + 6, "%d", &val) == 1) {
-            nks4_analog_ramp(26, val, &g_tempo_value);
+         * Interpolate between these points for a specific BPM. */
+        int val = 0, dev, *state;
+        NKS4_GUARD_STRICT();
+        if (line[0] == 'D') { dev = 29; state = &g_damper_value; }
+        else                { dev = 26; state = &g_tempo_value; }
+        if (sscanf(line + (line[0] == 'D' ? 7 : 6), "%d", &val) == 1) {
+            nks4_analog_ramp(dev, val, state);
             REPLY("OK\n", 3);
         } else {
             REPLY("ERR\n", 4);
@@ -4427,10 +4588,11 @@ static void process_ctrl_cmd(const char *line, int fd)
                          eva_resolved ? eva_slot : -1, g_eva_mode_loaded, eva_resolved,
                          stage[0] ? stage : "-", g_sm_pommi_status, g_boot_active);
         /* snprintf() returns the would-be length, not the truncated one - clamp
-         * before handing it to REPLY()/write_all() so a future longer status
-         * string can never turn into an out-of-bounds read here. */
-        if (rlen > (int)sizeof(resp))
-            rlen = (int)sizeof(resp);
+         * to the bytes actually present (sizeof-1 max) before handing it to
+         * REPLY()/write_all(), so a truncated response doesn't ship its NUL
+         * terminator as an extra on-wire byte. */
+        if (rlen >= (int)sizeof(resp))
+            rlen = (int)sizeof(resp) - 1;
         REPLY(resp, (size_t)rlen);
 
     } else if (strcmp(line, "VERSION") == 0) {
@@ -4499,6 +4661,8 @@ static void process_ctrl_cmd(const char *line, int fd)
     }
 
 #undef REPLY
+#undef NKS4_GUARD
+#undef NKS4_GUARD_STRICT
 }
 
 /* Called when ctrl_fd (O_NONBLOCK) has data.  Reads available bytes, processes
@@ -4770,7 +4934,7 @@ static void load_midi_bridge(void)
         }
         set_cloexec(midi_in_fd);
         g_midi_loaded = (midi_in_fd >= 0);
-        start_midi_capture();
+        start_midi_capture(30);   /* boot-time load: generous exec+bind window */
         fprintf(stderr, "screenremote: midi_in=%d capture=%d\n",
                 midi_in_fd >= 0 ? 1 : 0, midi_cap_fd >= 0 ? 1 : 0);
     } else {
@@ -4806,10 +4970,10 @@ static void load_midi_bridge(void)
 static int try_load_nks4_inject(int live_wait_ds)
 {
     unsigned long fn_switch = 0, fn_touch = 0, fn_rotary = 0, fn_analog = 0, fn_invert = 0;
-    unsigned long fn_chord = 0;
+    unsigned long fn_chord = 0, fn_setled = 0;
     /* VM-testing-only (see resolve_nks4_kallsyms()): 0/unset on real hardware. */
     unsigned long fn_sinstance_get = 0;
-    char params[320];
+    char params[384];
     long ret;
 
     if (g_nks4_loaded)
@@ -4818,7 +4982,7 @@ static int try_load_nks4_inject(int live_wait_ds)
         return 0;                            /* OA not Live yet - caller may retry */
 
     resolve_nks4_kallsyms(&fn_switch, &fn_touch, &fn_rotary, &fn_analog, &fn_invert, &fn_chord,
-                           &fn_sinstance_get);
+                           &fn_setled, &fn_sinstance_get);
     if (!fn_switch || !fn_touch || !fn_rotary || !fn_analog || !fn_invert) {
         fprintf(stderr, "screenremote: missing NKS4 symbols in kallsyms "
                 "(switch=%s touch=%s rotary=%s analog=%s invert=%s) - "
@@ -4835,10 +4999,17 @@ static int try_load_nks4_inject(int live_wait_ds)
      * (inject_chord() checks fn_chord itself) - doesn't block the other 5. */
     snprintf(params, sizeof(params),
              "fn_switch=0x%lx fn_touch=0x%lx fn_rotary=0x%lx fn_analog=0x%lx fn_invert=0x%lx "
-             "fn_chord=0x%lx fn_sinstance_get=0x%lx",
-             fn_switch, fn_touch, fn_rotary, fn_analog, fn_invert, fn_chord, fn_sinstance_get);
+             "fn_chord=0x%lx fn_setled=0x%lx fn_sinstance_get=0x%lx",
+             fn_switch, fn_touch, fn_rotary, fn_analog, fn_invert, fn_chord, fn_setled,
+             fn_sinstance_get);
     if (!fn_chord)
         fprintf(stderr, "screenremote: fn_chord not resolved - PADCHORD will be unavailable\n");
+    /* Not fatal: nks4_inject falls back to deriving CSTGFrontPanel::sInstance from
+     * fn_switch's own relocated .text, and BUTTON/WHEEL/analog never need it at all
+     * (only the TOUCH commands dereference `this`). See nks4_inject.c. */
+    if (!fn_setled)
+        fprintf(stderr, "screenremote: SetLED anchor not resolved - nks4_inject will use "
+                "its fn_switch-derived sInstance fallback (TOUCH only)\n");
     extract_ko(NKS4_INJECT_KO, nks4_inject_ko, nks4_inject_ko_len);
     ret = syscall(SYS_init_module, (void *)nks4_inject_ko,
                   (unsigned long)nks4_inject_ko_len, params);
@@ -4970,6 +5141,9 @@ static void unload_our_modules(void)
     syscall(__NR_delete_module, "nks4_inject", O_NONBLOCK);
     g_nks4_loaded = 0;
     syscall(__NR_delete_module, "vkbd", O_NONBLOCK);
+    /* Read-only and notifier-free, so leaving it resident would be safe - but
+     * unloading keeps "no modules of ours left behind after exit" uniform. */
+    syscall(__NR_delete_module, "eva_mode", O_NONBLOCK);
 }
 
 /* Reap the forked helper children (kmsg drainer + midi_tcp capture) AND unload
@@ -4999,6 +5173,27 @@ static void graceful_shutdown(pid_t kmsg_pid)
     unload_our_modules();
 }
 
+/* midi_tcp respawn pacing (see the respawn block in main()).  start_midi_capture()
+ * blocks the main loop 200 ms per connect attempt, so a helper that can NEVER come
+ * up (port 9875 already bound, /proc/.midi_ring missing, extracted binary won't
+ * exec) must not be retried on a fixed short interval - at the original 10 s / 5
+ * attempts that was a full second of frozen main loop every 10 s, forever, plus a
+ * fresh fork+extract each time.  Back off geometrically instead and reset on
+ * success, so a transient crash still recovers within ~10 s while a permanent
+ * failure settles at one cheap attempt every 2 minutes. */
+#define MIDI_RESPAWN_MIN_S   10
+#define MIDI_RESPAWN_MAX_S  120
+
+/* Frame pacing interval for the current stream client - the single divisor
+ * shared by the change-mode sender and the select() timeout computation in
+ * main().  do_handshake() already clamps fps into [1,FPS_MAX]; the guard here
+ * keeps the division safe even if that ever changes. */
+static long frame_interval_ns(int fps)
+{
+    if (fps <= 0 || fps > FPS_MAX) fps = FPS_MAX;
+    return 1000000000L / fps;
+}
+
 /* Pin ourselves - and, by inheritance across fork+exec, our streaming children and
  * the midi_tcp child - to physical CORE 0 (logical CPUs 0,1).  On the Kronos (Atom
  * D2550, 2 cores + HT: core0=CPU0,1 / core1=CPU2,3) the RT audio engine, EVA, and
@@ -5022,9 +5217,59 @@ static void pin_off_rt_core(void)
 }
 
 /*  Main */
+/* Guarantee file descriptors 0, 1 and 2 are open before this process opens
+ * ANYTHING else.  This must run before the first open()/fopen()/socket() call.
+ *
+ * WHY THIS IS LOAD-BEARING ON A PRODUCTION BOARD:
+ * A production Kronos has no terminal of any kind - no serial console broken
+ * out, no keyboard/VT.  The daemon is started from the GRUB boot path as
+ *     kernel -> init=/korg/kronos_init (PID 1)
+ *            -> /korg/rw/kronosmods_init &
+ *            -> pidof screenremote >/dev/null 2>&1 || .../screenremote &
+ * and, unlike a debug build (which wraps the whole block in
+ * `exec >> <debug_log> 2>&1`), a RELEASE build redirects nothing.  So this
+ * process inherits whatever fds PID 1 got, and PID 1's fds 0/1/2 come from the
+ * kernel's own `sys_open("/dev/console")` + two dups in kernel_init().  If no
+ * console driver is registered - exactly the "no terminal at all" case - that
+ * open FAILS and the kernel merely prints "Warning: unable to open an initial
+ * console".  fds 0/1/2 are then CLOSED for PID 1 and everything it spawns.
+ *
+ * open() always returns the lowest free descriptor, so with 0/1/2 closed the
+ * first three opens in main() (read_config(), read_pubid(), ...) would silently
+ * BECOME stdin/stdout/stderr.  Every one of this file's 65 fprintf(stderr,...)
+ * and 14 perror() calls would then write plain log text straight into whatever
+ * landed on fd 2 - the framebuffer mapping, a client socket, or /proc/.nks4inject.
+ * Corruption, not a missing log line.
+ *
+ * Parking /dev/null on any closed slot costs one syscall at startup and makes
+ * the release build behave identically with and without a console.  Fallback to
+ * a read-only directory fd if /dev/null isn't there yet (very early boot, before
+ * /dev is populated): writes to it fail harmlessly with EBADF, which is exactly
+ * the no-op we want out of stderr. */
+static void ensure_std_fds(void)
+{
+    int fd;
+
+    for (;;) {
+        fd = open("/dev/null", O_RDWR);
+        if (fd < 0)
+            fd = open("/", O_RDONLY);   /* last resort - unwritable, harmless */
+        if (fd < 0)
+            return;                     /* nothing available; nothing we can do */
+        if (fd > 2) {                   /* 0,1,2 were all already open - done */
+            close(fd);
+            return;
+        }
+        /* fd is 0, 1 or 2: that slot was closed. Leave it occupied and loop to
+         * fill the next lowest free one. */
+    }
+}
+
 int main(void)
 {
     pid_t kmsg_pid = -1;
+    /* MUST be first - before any open()/fopen()/socket() in this process. */
+    ensure_std_fds();
     pin_off_rt_core();   /* keep our load off the RT/sample-loading core - do this
                           * before any fork so children inherit the affinity */
     int stream_listen, ctrl_listen, disc_fd = -1, client_fd = -1;
@@ -5035,6 +5280,8 @@ int main(void)
     time_t nks4_retry_t0 = 0;          /* when deferred retry began - give-up anchor */
     time_t last_sm_pommi_chk = 0;      /* throttle deferred sm_pommi_addr autodetect retry (1/s) */
     time_t sm_pommi_retry_t0 = 0;      /* when that retry began - give-up anchor */
+    time_t last_midi_respawn_chk = 0;  /* throttle midi_tcp helper respawn check */
+    int midi_respawn_backoff_s = MIDI_RESPAWN_MIN_S;  /* grows while respawn keeps failing */
     time_t g_start_time = time(NULL);  /* for FBCURVE relative timestamps */
     int eva_ready_streak = 0;          /* consecutive EVA-UI-detected checks */
     int rebind_module_load = 0;        /* durable .boot guard covers rebind retries */
@@ -5485,6 +5732,31 @@ int main(void)
             }
         }
 
+        /* midi_tcp helper respawn: if the capture subprocess died (crash or
+         * kill), MIDI injection still works but capture/SYSEX don't - bring
+         * the helper back rather than leaving capture down until a daemon
+         * restart.  start_midi_capture() is a no-op while the helper is alive
+         * AND connected.
+         *
+         * Only ONE connect attempt per pass (200 ms of blocked main loop, not
+         * 1 s): if the fork succeeded but the connect lost the race, the next
+         * pass skips the fork entirely (midi_cap_pid > 0) and just retries the
+         * connect, so a slow exec still gets picked up - it just costs a
+         * backoff interval instead of stalling the loop here.  See
+         * MIDI_RESPAWN_MIN_S/MAX_S for why the interval has to grow. */
+        if (g_midi_loaded && midi_cap_fd < 0 &&
+                now - last_midi_respawn_chk >= midi_respawn_backoff_s) {
+            last_midi_respawn_chk = now;
+            start_midi_capture(1);
+            if (midi_cap_fd >= 0) {
+                midi_respawn_backoff_s = MIDI_RESPAWN_MIN_S;   /* recovered - re-arm fast retries */
+            } else if (midi_respawn_backoff_s < MIDI_RESPAWN_MAX_S) {
+                midi_respawn_backoff_s *= 3;
+                if (midi_respawn_backoff_s > MIDI_RESPAWN_MAX_S)
+                    midi_respawn_backoff_s = MIDI_RESPAWN_MAX_S;
+            }
+        }
+
         /* Periodic network check - re-bind if IP changed (DHCP, link down/up) */
         if (now - last_net_chk >= 10) {
             last_net_chk = now;
@@ -5492,7 +5764,7 @@ int main(void)
             if (cur_ip != g_bound_ip) {
                 if (client_fd >= 0) { close(client_fd); client_fd = -1; }
                 if (handshake.fd >= 0) stream_handshake_close(&handshake, "incomplete hello");
-                if (ctrl_fd  >= 0) { close(ctrl_fd);  ctrl_fd = -1; ctrl_lb_n = 0; ctrl_lb_overflow = 0; }
+                ctrl_fd_close();
                 shadow_valid      = 0;
                 g_ctrl_allowed_ip = 0;
                 g_si_prev_valid   = 0;
@@ -5568,19 +5840,14 @@ int main(void)
         /* Change-driven frame send */
         if (client_fd >= 0 && client_mode == MODE_CHANGE) {
             struct timespec ts;
-            /* do_handshake guarantees fps in [1,FPS_MAX], but guard the divisor
-             * anyway so this can never divide by zero (matches the select-timeout
-             * path below, which already guards it). */
-            long frame_ns = 1000000000L / (client_fps ? client_fps : FPS_MAX);
+            long frame_ns = frame_interval_ns(client_fps);
             clock_gettime(CLOCK_MONOTONIC, &ts);
             long elapsed = (ts.tv_sec  - last_frame.tv_sec)  * 1000000000L
                          + (ts.tv_nsec - last_frame.tv_nsec);
             if (elapsed >= frame_ns) {
                 last_frame = ts;
 
-                int do_capture = 1;
-
-                if (do_capture && capture_to_staging()) {
+                if (capture_to_staging()) {
                     int send_ok;
                     if (!shadow_valid) {
                         send_ok = send_frame_buf(client_fd, staging) == 0;
@@ -5648,10 +5915,10 @@ int main(void)
                 clock_gettime(CLOCK_MONOTONIC, &ts_now);
                 long ns_since  = (ts_now.tv_sec  - last_frame.tv_sec)  * 1000000000L
                                + (ts_now.tv_nsec - last_frame.tv_nsec);
-                long ns_remain = 1000000000L / (client_fps ? client_fps : FPS_MAX) - ns_since;
+                long ns_remain = frame_interval_ns(client_fps) - ns_since;
                 us = ns_remain > 0 ? ns_remain / 1000 : 0;
             } else {
-                us = 1000000L / (client_fps ? client_fps : FPS_MAX);
+                us = frame_interval_ns(client_fps) / 1000;
             }
             tv.tv_sec  = 0;
             tv.tv_usec = us;
@@ -5685,7 +5952,20 @@ int main(void)
 
         if (maxfd < 0) { usleep(500000); continue; }
         r = select(maxfd + 1, &rfds, NULL, NULL, &tv);
-        if (r < 0) continue;
+        if (r < 0) {
+            /* EINTR is routine (SIGTERM/SIGINT land here) - just re-loop.
+             * Anything else is not: select() failing persistently (a stale fd
+             * in the set -> EBADF, a bad nfds/timeout -> EINVAL) would spin
+             * this loop at 100 % CPU with nothing in the log to say why, which
+             * on a fanless synth presents as "it got hot and went sluggish".
+             * No such path is reachable today (the fd set is rebuilt from
+             * scratch every iteration) - this is here so it stays that way. */
+            if (errno != EINTR) {
+                perror("screenremote: select");
+                usleep(100000);
+            }
+            continue;
+        }
 
         /* Drain midi_tcp output every iteration: collects SysEx responses
          * when a capture is pending, discards other MIDI bytes otherwise.
@@ -5810,7 +6090,7 @@ int main(void)
                     struct timeval zero = {0, 0};
                     setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &zero, sizeof(zero));
 
-                    int is_readonly = is_readonly_cmd(firstline);
+                    int is_readonly = cmd_class(firstline) != CMD_MUTATING;
                     int owned = (g_ctrl_allowed_ip != 0 &&
                                  cpeer.sin_addr.s_addr == g_ctrl_allowed_ip);
 
@@ -5827,8 +6107,10 @@ int main(void)
                         close(cfd);
                     } else if (owned) {
                         if (strcmp(firstline, "CTRL_PERSIST") == 0) {
-                            /* Persistent connection: replace any previous ctrl_fd */
-                            if (ctrl_fd >= 0) close(ctrl_fd);
+                            /* Persistent connection: replace any previous ctrl_fd.
+                             * Via ctrl_fd_close() so a SysEx still parked on the
+                             * OLD session can't outlive it holding a stale fd. */
+                            ctrl_fd_close();
                             ctrl_fd   = cfd;
                             g_ctrl_persist_ip = cpeer.sin_addr.s_addr;
                             ctrl_lb_n = 0;
@@ -5860,22 +6142,14 @@ int main(void)
          * or the bound IP was rebound) - see g_ctrl_persist_ip's comment. */
         if (ctrl_fd >= 0 && g_ctrl_persist_ip != g_ctrl_allowed_ip) {
             fprintf(stderr, "screenremote: persistent ctrl ownership revoked, closing\n");
-            close(ctrl_fd); ctrl_fd = -1; ctrl_lb_n = 0; ctrl_lb_overflow = 0;
+            ctrl_fd_close();
         }
 
         /* Persistent ctrl connection: process any available command lines */
         if (ctrl_fd >= 0 && FD_ISSET(ctrl_fd, &rfds)) {
             if (handle_ctrl_persistent_data() < 0) {
                 fprintf(stderr, "screenremote: persistent ctrl disconnected\n");
-                if (sysex_pending && sysex_resp_fd == ctrl_fd) {
-                    sysex_resp_fd = -1;
-                    sysex_pending = 0;
-                    sysex_cap_offset = 0;
-                }
-                close(ctrl_fd);
-                ctrl_fd        = -1;
-                ctrl_lb_n      = 0;
-                ctrl_lb_overflow = 0;
+                ctrl_fd_close();
                 g_si_prev_valid = 0;
             }
         }
@@ -5917,7 +6191,13 @@ int main(void)
     if (kmsg_pid > 0) { kill(kmsg_pid, SIGTERM); waitpid(kmsg_pid, NULL, 0); kmsg_pid = -1; }
     if (client_fd >= 0) close(client_fd);
     if (handshake.fd >= 0) close(handshake.fd);
-    if (ctrl_fd   >= 0) close(ctrl_fd);
+    /* Deliver a still-pending SysEx (captured-so-far, or ERR TIMEOUT) before
+     * tearing the socket down, so a waiting client gets an answer instead of a
+     * bare EOF - and so a one-shot SysEx fd, which nothing else tracks, is
+     * closed rather than left to process exit.  Must run BEFORE ctrl_fd_close(),
+     * which discards pending SysEx state by design. */
+    if (sysex_pending) sysex_finish();
+    ctrl_fd_close();   /* the one way to close it - see the helper's comment */
     if (stream_listen >= 0) close(stream_listen);
     if (ctrl_listen   >= 0) close(ctrl_listen);
     if (disc_fd >= 0) close(disc_fd);

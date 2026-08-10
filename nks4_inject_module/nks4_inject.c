@@ -132,14 +132,20 @@
  * (confirmed live, 2026-07: absent even though `nm OA.ko` shows it as a
  * normal global). Same technique already used elsewhere in this project
  * (midi_bridge.c's "resolve sMidiInPorts via the byte pattern in
- * RegisterMidiInPort") applies here: HandleSwitchEvent's own first few
- * instructions load sInstance via `mov 0x0,%eax` with an R_386_32
+ * RegisterMidiInPort") applies here: wherever OA's own code loads that
+ * singleton it does so with `mov eax,ds:<sInstance>` carrying an R_386_32
  * relocation - by link/load time the module loader has already filled in
- * the real resolved address as a literal 4-byte immediate embedded in
- * HandleSwitchEvent's own already-loaded, already-relocated machine code.
- * We're a kernel module too, so we just read those 4 bytes directly out of
- * OA's live .text at a fixed, ground-truthed offset - no separate address
- * to resolve or pass in. See SINSTANCE_REL_OFFSET below.
+ * the real resolved address as a literal 4-byte immediate embedded in that
+ * already-loaded, already-relocated machine code. We're a kernel module
+ * too, so we just read those 4 bytes directly out of OA's live .text at a
+ * fixed, ground-truthed offset - no separate address to resolve.
+ *
+ * IMPORTANT (corrected 2026-08-09): the anchor for that read is
+ * CSTGFrontPanelMsgHandler::SetLED, NOT HandleSwitchEvent. This module used
+ * to read HandleSwitchEvent+0x25, which relocates against CSTGGlobal::
+ * sInstance, not CSTGFrontPanel::sInstance - see the long derivation comment
+ * at SETLED_SINSTANCE_OFFSET below for the byte-level proof, why three of the
+ * four handlers never cared, and why HandleTouchPanel did.
  *
  * Command interface: write one line to /proc/.nks4inject
  *   BTN <code>              press + release a raw scan code (0-127)
@@ -209,10 +215,12 @@ static unsigned long fn_invert = 0;        /* ShortInvertNkS4AnalogValue */
 module_param(fn_invert, ulong, 0444);
 
 static unsigned long fn_chord = 0;         /* RT_chord_trigger(uchar,uchar,uchar,uchar) -
-                                             * NOT kallsyms-visible (no separate symbol),
-                                             * resolved via the fixed file-offset delta from
-                                             * Do_KM_note_out_chord_trig (which IS visible) -
-                                             * see project notes. EXPERIMENTAL: reads directly
+                                             * kallsyms-visible as _Z16RT_chord_triggerhhhh
+                                             * (FUNC GLOBAL, 1688 bytes); the daemon probes
+                                             * for it directly and only falls back to the
+                                             * Do_KM_note_out_chord_trig delta if absent -
+                                             * see resolve_nks4_kallsyms() in screenremote.c.
+                                             * EXPERIMENTAL: reads directly
                                              * from KARMA's chord-memory tables and calls
                                              * Do_KM_note_out_chord_trig() per voice - this is
                                              * the real per-pad "Pads (touch to play)" trigger,
@@ -221,12 +229,26 @@ static unsigned long fn_chord = 0;         /* RT_chord_trigger(uchar,uchar,uchar
                                              * slot-index convention. */
 module_param(fn_chord, ulong, 0444);
 
+static unsigned long fn_setled = 0;        /* CSTGFrontPanelMsgHandler::SetLED - NEVER called.
+                                             * Resolved purely as an address anchor: the 4
+                                             * bytes at its entry+0x2 are the relocated
+                                             * address of CSTGFrontPanel::sInstance. See
+                                             * SETLED_SINSTANCE_OFFSET below. */
+module_param(fn_setled, ulong, 0444);
+
 static unsigned long fn_sinstance_get = 0; /* VM-testing only: resolved address of
                                              * CSTGFrontPanel_GetInstanceForTest() in the
                                              * OA reconstruction. Optional - leave 0 for
-                                             * real hardware (existing SINSTANCE_REL_OFFSET
-                                             * byte-read technique is used instead). */
+                                             * real hardware (the byte-read techniques
+                                             * below are used instead). */
 module_param(fn_sinstance_get, ulong, 0444);
+
+static unsigned long sinstance_override = 0; /* Operator escape hatch: force
+                                               * &CSTGFrontPanel::sInstance (the ADDRESS OF
+                                               * the .bss slot, not the object pointer) when
+                                               * both derivations below fail or disagree on
+                                               * a future OS build. 0 = derive normally. */
+module_param(sinstance_override, ulong, 0644);
 
 /* ------------------------------------------------------------------ */
 /*  Function pointer types - regparm(3) reproduces the confirmed ABI   */
@@ -269,18 +291,122 @@ static int last_chord_pad = -1, last_chord_vel = -1, last_chord_p3 = -1, last_ch
 static int last_chord_rc = -2;   /* -2 = never called since load */
 static char last_cmd[64];
 
-/* Byte offset, from HandleSwitchEvent's own entry point, of the 4-byte
- * immediate operand of `mov 0x0,%eax` that R_386_32-relocates against
- * CSTGFrontPanel::sInstance. Ground-truthed via objdump -dr against the
- * real OA.ko (offline file offset 0xc114 opcode / 0xc115 operand, function
- * entry 0xc0f0 -> 0x25). Re-verify with objdump if OA.ko is ever rebuilt. */
-#define SINSTANCE_REL_OFFSET 0x25
+/* ---- Deriving &CSTGFrontPanel::sInstance ---------------------------------
+ *
+ * kallsyms on this kernel does not expose .bss data symbols, so the address of
+ * CSTGFrontPanel::sInstance has to be read back out of OA's own already-relocated
+ * .text: wherever OA itself loads that singleton, the module loader has already
+ * patched the real runtime address in as a literal 4-byte R_386_32 immediate.
+ *
+ * CORRECTED 2026-08-09 - this code previously read the WRONG immediate.
+ * =====================================================================
+ * SINSTANCE_REL_OFFSET was documented as "the `mov 0x0,%eax` that relocates
+ * against CSTGFrontPanel::sInstance". Verified against the real shipping OA.ko
+ * (.rel.text relocations + raw opcode bytes), HandleSwitchEvent @ .text+0xc0f0
+ * actually looks like this:
+ *
+ *   c0f0: 55                push ebp
+ *   c0f1: 89 e5             mov  ebp,esp
+ *   c0f3: 83 e4 f0          and  esp,0xfffffff0
+ *   c0f6: 8d 64 24 f0       lea  esp,[esp-0x10]
+ *   c0fa: a1 <reloc>        mov  eax, ds:CPowerOffTimer::sInstance   <- `this` DIES here
+ *   c0ff: 89 5c 24 08       mov  [esp+8],ebx
+ *   c103: 89 74 24 0c       mov  [esp+0xc],esi
+ *   c107: c6 00 01          mov  byte [eax],1
+ *   c10a: a1 <reloc>        mov  eax, ds:CSTGMidiPortManager::sInstance
+ *   c10f: 80 38 00          cmp  byte [eax],0
+ *   c112: 74 4f             je   0xc163                              (not-ready gate)
+ *   c114: a1 <reloc>        mov  eax, ds:CSTGGlobal::sInstance       <- entry+0x24/+0x25
+ *   c119: 0f b6 c9          movzx ecx,cl
+ *   c11c: 8b 98 84 06 00 00 mov  ebx,[eax+0x684]
+ *
+ * i.e. entry+0x25 relocates against CSTGGlobal::sInstance, NOT
+ * CSTGFrontPanel::sInstance. frontpanel_this() was therefore handing every
+ * handler the CSTGGlobal singleton. It is a perfectly valid kernel pointer, so
+ * kptr_ok() never complained and nothing ever failed loudly.
+ *
+ * Why that went unnoticed: HandleSwitchEvent, HandleRotary and
+ * HandleAnalogController destroy `this`/EAX at entry+0x0a, before ever reading
+ * it (see the trace above) - they are `this`-blind, and every piece of state
+ * they touch comes off CPowerOffTimer/CSTGMidiPortManager/CSTGGlobal/
+ * CSTGControllerRTData globals instead. That is exactly why BUTTON, WHEEL,
+ * SLIDER, KNOB, VSLIDER, TEMPO, PEDAL and DAMPER are all hardware-confirmed
+ * working despite the wrong pointer.
+ *
+ * HandleTouchPanel is the one exception: it saves the original EAX into EBX
+ * before the clobber and genuinely uses it, reading/writing this+0x104
+ * (on-screen-touchpad-mode flag), this+0x105 (KARMA X-Y contact-active flag),
+ * this+0x106 (derived KARMA CC number) and reading floats at this+0x108 /
+ * this+0x10c. Against CSTGGlobal those are unrelated live fields, so injected
+ * TOUCH was gating on the wrong byte and, whenever CSTGGlobal+0x104 happened to
+ * be non-zero, WRITING into CSTGGlobal+0x105/+0x106 and firing
+ * SendKarmaCCToKG() with a garbage CC number and value. TOUCH still appeared to
+ * work end to end only because the part that drives the UI - the unconditional
+ * 20-byte PushUnsolicitedMessage tail - never touches `this`.
+ *
+ * Two independent derivations, both ground-truthed against the real OA.ko;
+ * setup cross-checks them and refuses to guess if they disagree.
+ *
+ * (1) PREFERRED - CSTGFrontPanelMsgHandler::SetLED @ .text+0xe9f60 (24 bytes,
+ *     FUNC GLOBAL, so kallsyms-visible, and unique as a substring):
+ *         e9f60: 55            push ebp
+ *         e9f61: a1 <reloc &CSTGFrontPanel::sInstance>      <- operand at entry+0x2
+ *     A 2-instruction thunk, far less likely to drift than a 200-byte function.
+ *     ::Beep @ .text+0xe9ee0 has the identical `55 a1 <imm32>` shape as a spare.
+ *
+ * (2) FALLBACK - the +0x25 read above still yields &CSTGGlobal::sInstance, and
+ *     both singletons live in the same .bss (CSTGGlobal::sInstance @ .bss+0x0c,
+ *     CSTGFrontPanel::sInstance @ .bss+0x58). A module's .bss is one contiguous
+ *     allocation, so that 0x4c delta survives relocation exactly the way
+ *     RT_CHORD_TRIGGER_DELTA does for .text.
+ *
+ * Both paths assert the `a1` (mov eax,moffs32) opcode byte before trusting the
+ * immediate, so a silently-shifted offset refuses rather than returning garbage.
+ * sinstance_override= forces the result if a future OS build breaks both. */
+#define SINSTANCE_REL_OFFSET      0x25   /* HandleSwitchEvent+0x25 -> &CSTGGlobal::sInstance */
+#define SINSTANCE_REL_OPCODE_OFF  0x24   /* the `a1` opcode byte guarding it */
+#define CSTGGLOBAL_TO_FRONTPANEL  0x4cUL /* .bss delta: &CSTGGlobal -> &CSTGFrontPanel */
+#define SETLED_SINSTANCE_OFFSET   0x02   /* SetLED+0x2 -> &CSTGFrontPanel::sInstance */
+#define SETLED_OPCODE_OFF         0x01   /* the `a1` opcode byte guarding it */
+#define OPCODE_MOV_EAX_MOFFS32    0xa1
 
-static unsigned long sinstance_addr;   /* &CSTGFrontPanel::sInstance, derived at setup */
+static unsigned long sinstance_addr;    /* &CSTGFrontPanel::sInstance, derived at setup */
+static unsigned long global_sinstance_addr; /* &CSTGGlobal::sInstance - what this module used
+                                             * to (wrongly) pass as `this`. Retained ONLY as
+                                             * the fallback argument for the three
+                                             * `this`-blind handlers, so their behaviour is
+                                             * bit-identical to the shipping, hardware-proven
+                                             * build even if the fix above cannot resolve. */
+static unsigned long sinstance_setled_addr; /* derivation (1), for the status node */
+static unsigned long sinstance_delta_addr;  /* derivation (2), for the status node */
 
 static int kptr_ok(unsigned long p)
 {
     return p >= 0x40000000UL && p < 0xfffff000UL && (p & 3) == 0;
+}
+
+/* Read the 4-byte relocated immediate of a `mov eax, ds:X` at fn+operand_off,
+ * asserting the opcode byte at fn+opcode_off first. Returns 0 on any mismatch. */
+static unsigned long read_moffs32(unsigned long fn, int opcode_off, int operand_off)
+{
+    const unsigned char *p = (const unsigned char *)fn;
+
+    /* Range check only - deliberately NOT kptr_ok(), which also demands 4-byte
+     * alignment. That is correct for the .bss slot we return (a 4-byte-aligned
+     * variable, and callers do run the result through kptr_ok) but wrong for
+     * `fn`: x86 function entry points carry no alignment guarantee, and OA.ko
+     * has plenty of unaligned ones (RT_chord_trigger @0x512842,
+     * Do_KM_note_out_chord_trig @0x55e3fa). Requiring alignment here would
+     * silently drop the derivation if a future OA build shifted these two
+     * functions onto an odd address. */
+    if (fn < 0x40000000UL || fn >= 0xfffff000UL)
+        return 0;
+    if (p[opcode_off] != OPCODE_MOV_EAX_MOFFS32)
+        return 0;
+    /* uint32_t, not unsigned long: the operand of `mov eax,moffs32` is exactly
+     * 4 bytes. Same width on this i386 target either way, but the intent is
+     * the instruction encoding, not the host word size. */
+    return (unsigned long)*(const uint32_t *)(fn + operand_off);
 }
 
 /* Dereference CSTGFrontPanel::sInstance fresh on every call - cheap, and
@@ -288,11 +414,23 @@ static int kptr_ok(unsigned long p)
  *
  * VM-testing path: if fn_sinstance_get is set, call it directly - it
  * already returns CSTGFrontPanel::sInstance's current VALUE (not the
- * address of its storage), so the SINSTANCE_REL_OFFSET indirection below
- * is skipped entirely. */
+ * address of its storage), so the indirection below is skipped entirely. */
 static void *frontpanel_this(void)
 {
+    unsigned long slot;
     void *p;
+
+    /* Checked live on every call, not latched at setup: the whole point of the
+     * override is to retarget a running unit over sysfs (it is 0644) without an
+     * rmmod/insmod cycle on a live synth - same contract eva_mode.ko's
+     * sm_pommi_addr already offers. Takes precedence over everything below. */
+    slot = sinstance_override;
+    if (slot) {
+        if (!kptr_ok(slot))
+            return NULL;
+        p = *(void **)slot;
+        return kptr_ok((unsigned long)p) ? p : NULL;
+    }
     if (fn_sinstance_get) {
         sinstance_get_t g = (sinstance_get_t)fn_sinstance_get;
         p = g();
@@ -302,6 +440,28 @@ static void *frontpanel_this(void)
         return NULL;
     p = *(void **)sinstance_addr;
     return kptr_ok((unsigned long)p) ? p : NULL;
+}
+
+/* The `this` argument for the three handlers that provably never read it
+ * (HandleSwitchEvent / HandleRotary / HandleAnalogController - EAX is destroyed
+ * at entry+0x0a in each). They must not be gated on frontpanel_this(): that
+ * would make BUTTON/WHEEL/analog newly depend on a singleton whose construction
+ * timing relative to MODULE_STATE_LIVE is unverified, and this module loads
+ * deliberately early (OA Live is enough, EVA's UI need not be up). Prefer the
+ * real object when we have it, else the CSTGGlobal pointer this module shipped
+ * with - a valid, mapped, hardware-proven argument for these three paths. */
+static void *blind_this(void)
+{
+    void *p = frontpanel_this();
+
+    if (p)
+        return p;
+    if (global_sinstance_addr) {
+        p = *(void **)global_sinstance_addr;
+        if (kptr_ok((unsigned long)p))
+            return p;
+    }
+    return NULL;
 }
 
 /* ------------------------------------------------------------------ */
@@ -315,7 +475,9 @@ static int inject_button(int code, int pressed)
 
     if (oa_dead || !fn_switch || code < 0 || code > 127)
         return -1;
-    this_ = frontpanel_this();
+    /* blind_this(), not frontpanel_this(): HandleSwitchEvent never reads `this`
+     * (EAX destroyed at entry+0x0a - see the derivation comment above). */
+    this_ = blind_this();
     if (!this_)
         return -1;
     f(this_, code, pressed);
@@ -329,6 +491,10 @@ static int inject_touch(int event_type, int coord)
 
     if (oa_dead || !fn_touch || event_type < 1 || event_type > 3)
         return -1;
+    /* frontpanel_this() (STRICT) - HandleTouchPanel is the one handler of the
+     * four that genuinely dereferences `this`, reading this+0x104/+0x105 and
+     * writing this+0x105/+0x106. A wrong object here corrupts whatever else
+     * lives at those offsets, so refuse rather than inject blind. */
     this_ = frontpanel_this();
     if (!this_)
         return -1;
@@ -343,7 +509,7 @@ static int inject_rotary(int delta)
 
     if (oa_dead || !fn_rotary)
         return -1;
-    this_ = frontpanel_this();
+    this_ = blind_this();       /* HandleRotary never reads `this` */
     if (!this_)
         return -1;
     f(this_, delta);
@@ -366,7 +532,7 @@ static int inject_analog(int dev, unsigned char b0, unsigned char b1)
      * structurally-confirmed out-of-range value does. */
     if (oa_dead || !fn_analog || !fn_invert || dev < 0 || dev > 30)
         return -1;
-    this_ = frontpanel_this();
+    this_ = blind_this();       /* HandleAnalogController never reads `this` */
     if (!this_)
         return -1;
     inv(b0, b1, &out_hi, &out_lo);
@@ -491,13 +657,19 @@ static int status_read_proc(char *page, char **start, off_t off,
     int len = snprintf(page, count,
         "sinstance=0x%lx fn_switch=0x%lx fn_touch=0x%lx fn_rotary=0x%lx "
         "fn_analog=0x%lx fn_invert=0x%lx fn_chord=0x%lx\n"
-        "oa_dead=%d this_resolved=%d\n"
+        "sinstance_setled=0x%lx sinstance_delta=0x%lx agree=%d cstgglobal=0x%lx "
+        "override=0x%lx\n"
+        "oa_dead=%d this_resolved=%d blind_this_resolved=%d\n"
         "onscreen_touch_pad_mode=%d latch=0x%02x stored=0x%02x (rc=%d)\n"
         "counters: btn=%u touch=%u rot=%u analog=%u gated=%u badcmd=%u chord=%u\n"
         "last_chord: pad=%d vel=%d p3=%d p4=%d rc=%d\n"
         "last_cmd=%s\n",
         sinstance_addr, fn_switch, fn_touch, fn_rotary, fn_analog, fn_invert, fn_chord,
-        oa_dead, frontpanel_this() != NULL,
+        sinstance_setled_addr, sinstance_delta_addr,
+        (sinstance_setled_addr && sinstance_delta_addr &&
+         sinstance_setled_addr == sinstance_delta_addr),
+        global_sinstance_addr, sinstance_override,
+        oa_dead, frontpanel_this() != NULL, blind_this() != NULL,
         (int)pad_flag, pad_latch, pad_stored, pad_rc,
         cnt_btn, cnt_touch, cnt_rot, cnt_analog, cnt_gated, cnt_badcmd, cnt_chord,
         last_chord_pad, last_chord_vel, last_chord_p3, last_chord_p4, last_chord_rc,
@@ -535,24 +707,77 @@ static struct notifier_block nks4_nb = {
 
 static void nks4_inject_setup(struct work_struct *work)
 {
+    /* Always derive &CSTGGlobal::sInstance when we can: it is the fallback
+     * `this` for the three handlers that never read it, so BUTTON/WHEEL/analog
+     * keep working bit-identically to the shipping build no matter what
+     * happens to the CSTGFrontPanel derivation below. */
+    if (fn_switch) {
+        unsigned long g = read_moffs32(fn_switch, SINSTANCE_REL_OPCODE_OFF,
+                                        SINSTANCE_REL_OFFSET);
+        if (kptr_ok(g)) {
+            global_sinstance_addr = g;
+            sinstance_delta_addr  = g + CSTGGLOBAL_TO_FRONTPANEL;
+        } else {
+            printk(KERN_WARNING "nks4_inject: HandleSwitchEvent+0x%x is not the expected "
+                   "`mov eax,ds:CSTGGlobal::sInstance` (got 0x%lx) - offsets may be stale "
+                   "for this OA.ko build\n", SINSTANCE_REL_OFFSET, g);
+        }
+    }
+    if (fn_setled) {
+        unsigned long s = read_moffs32(fn_setled, SETLED_OPCODE_OFF,
+                                        SETLED_SINSTANCE_OFFSET);
+        if (kptr_ok(s))
+            sinstance_setled_addr = s;
+        else
+            printk(KERN_WARNING "nks4_inject: SetLED+0x%x is not the expected "
+                   "`mov eax,ds:CSTGFrontPanel::sInstance` (got 0x%lx)\n",
+                   SETLED_SINSTANCE_OFFSET, s);
+    }
+
+    /* NOTE: sinstance_override is deliberately NOT folded into sinstance_addr -
+     * frontpanel_this() consults it live on every call so it can be retargeted
+     * over sysfs after load. Derivation below still runs (and still
+     * cross-checks) so /proc/.nks4inject_status shows what we WOULD have used. */
+    if (sinstance_override)
+        printk(KERN_INFO "nks4_inject: sinstance_override=0x%lx set - it takes "
+               "precedence over both derivations below\n", sinstance_override);
+
     if (fn_sinstance_get) {
         /* VM-testing path: OA reconstruction exposes sInstance via a real
          * accessor function - no offset-read needed, frontpanel_this()
          * calls fn_sinstance_get() directly on every use. */
         printk(KERN_INFO "nks4_inject: fn_sinstance_get=0x%lx set - using VM-testing "
-               "accessor instead of SINSTANCE_REL_OFFSET\n", fn_sinstance_get);
-    } else if (fn_switch) {
-        unsigned long candidate = *(unsigned long *)(fn_switch + SINSTANCE_REL_OFFSET);
-        if (kptr_ok(candidate)) {
-            sinstance_addr = candidate;
-        } else {
-            printk(KERN_ERR "nks4_inject: derived sInstance addr 0x%lx looks bogus - "
-                   "SINSTANCE_REL_OFFSET may be stale for this OA.ko build, "
-                   "injection disabled\n", candidate);
-        }
+               "accessor instead of the .text offset reads\n", fn_sinstance_get);
+    } else if (sinstance_setled_addr && sinstance_delta_addr) {
+        /* Both derivations available - they must agree. Disagreement means OA's
+         * layout moved under one of the two hardcoded offsets, which is exactly
+         * the drift this cross-check exists to catch. Prefer the SetLED anchor
+         * (a 2-instruction thunk; far less likely to shift than a 200-byte
+         * function) but say so loudly. */
+        sinstance_addr = sinstance_setled_addr;
+        if (sinstance_setled_addr != sinstance_delta_addr)
+            printk(KERN_ERR "nks4_inject: sInstance derivations DISAGREE - SetLED anchor "
+                   "0x%lx vs CSTGGlobal+0x%lx 0x%lx. Using the SetLED anchor; re-derive "
+                   "both offsets against this OA.ko and/or set sinstance_override=\n",
+                   sinstance_setled_addr, CSTGGLOBAL_TO_FRONTPANEL, sinstance_delta_addr);
+        else
+            printk(KERN_INFO "nks4_inject: sInstance=0x%lx (both derivations agree)\n",
+                   sinstance_addr);
+    } else if (sinstance_setled_addr) {
+        sinstance_addr = sinstance_setled_addr;
+        printk(KERN_INFO "nks4_inject: sInstance=0x%lx (SetLED anchor only)\n",
+               sinstance_addr);
+    } else if (sinstance_delta_addr) {
+        sinstance_addr = sinstance_delta_addr;
+        printk(KERN_INFO "nks4_inject: sInstance=0x%lx (CSTGGlobal+0x%lx delta only - "
+               "SetLED anchor unavailable)\n", sinstance_addr, CSTGGLOBAL_TO_FRONTPANEL);
     } else {
-        printk(KERN_ERR "nks4_inject: fn_switch not set - cannot derive sInstance, "
-               "injection disabled\n");
+        /* TOUCH is disabled (it hard-requires a real object); BUTTON/WHEEL/
+         * analog still run via blind_this() if global_sinstance_addr resolved. */
+        printk(KERN_ERR "nks4_inject: could not derive CSTGFrontPanel::sInstance - "
+               "TOUCH disabled%s\n",
+               global_sinstance_addr ? " (BUTTON/WHEEL/analog unaffected)"
+                                     : " and no fallback `this` either - all injection disabled");
     }
 
     proc_inject = create_proc_entry(".nks4inject", 0200, NULL);
@@ -567,9 +792,10 @@ static void nks4_inject_setup(struct work_struct *work)
 
     register_module_notifier(&nks4_nb);
 
-    printk(KERN_INFO "nks4_inject: ready - sinstance=0x%lx switch=0x%lx touch=0x%lx "
-           "rotary=0x%lx analog=0x%lx invert=0x%lx\n",
-           sinstance_addr, fn_switch, fn_touch, fn_rotary, fn_analog, fn_invert);
+    printk(KERN_INFO "nks4_inject: ready - sinstance=0x%lx (cstgglobal=0x%lx) switch=0x%lx "
+           "touch=0x%lx rotary=0x%lx analog=0x%lx invert=0x%lx chord=0x%lx\n",
+           sinstance_addr, global_sinstance_addr, fn_switch, fn_touch, fn_rotary,
+           fn_analog, fn_invert, fn_chord);
 }
 
 static int __init nks4_inject_init(void)

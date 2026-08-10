@@ -448,6 +448,8 @@ int main(int argc, char *argv[]) {
         for (i = 0; i < MAX_CLIENTS; i++) {
             if (client_fds[i] < 0 || !FD_ISSET(client_fds[i], &rfds)) continue;
             int n = recv(client_fds[i], buf, sizeof(buf), 0);
+            if (n < 0 && errno == EINTR)
+                continue;   /* signal mid-recv - retry next loop iteration */
             if (n <= 0) {
                 if (debug)
                     fprintf(stderr, "client[%d] disconnected (total=%d)\n",

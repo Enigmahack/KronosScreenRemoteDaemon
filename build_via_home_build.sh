@@ -45,7 +45,7 @@ echo ""
 echo "=== Syncing build artifacts back to ${SRC_ROOT} ==="
 
 # Generated embedded-module headers (xxd -i output consumed by screenremote.c)
-rsync -a "$BUILD_ROOT"/source/*_ko.h "$SRC_ROOT"/source/ 2>/dev/null || true
+rsync -a "$BUILD_ROOT"/source/*_ko.h "$BUILD_ROOT"/source/midi_tcp_bin.h "$SRC_ROOT"/source/ 2>/dev/null || true
 
 # Kernel modules themselves + the final daemon binary
 for mod in vkbd_module midi_module nks4_inject_module eva_mode_module eva_mode_peek_module; do
