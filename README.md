@@ -1,16 +1,5 @@
 # KronosScreenRemoteDaemon
 
-> **USE AT YOUR OWN RISK**
-
-> This software is not affiliated with Korg in any way, and while we have validated it functions correctly with OS 3.2, and some testing has been done with 3.1 and 3.0, we cannot 100% guarantee it will function in every circumstance, though it should. 
->
-> It is distributed **as-is**, without any express or implied warranty of any kind, including but not limited to warranties of merchantability, fitness for a particular purpose, or non-infringement. The authors and contributors make no guarantees regarding stability, correctness, security, or suitability for any use case.
->
-> **No support is offered or implied.** There is no commitment to fix bugs, respond to issues, or maintain compatibility with any hardware or software version. Use of this software is entirely at your own risk. The authors accept no liability for any damage to hardware, data loss, or any other consequence - direct or indirect - arising from the use or misuse of this software.
->
-> By using this software you acknowledge that you understand and accept these terms.
-
-
 Kronos Screen Remote Daemon: A framebuffer streaming daemon with virtual keyboard and MIDI injection kernel modules for the **Korg Kronos** synthesizer. It streams the Kronos display (`/dev/fb1`, 8bpp 800x600) over TCP, accepts remote control commands for touch, buttons, the data wheel, and keyboard input injection, and provides MIDI injection with SysEx request/response support.
 
 > **Shared context**: this daemon is the server-side counterpart to
@@ -409,3 +398,13 @@ Some online file-scanning services and cloud storage providers (including Google
 **Screen capture over TCP.** The core function of the daemon - reading the framebuffer and streaming it over an authenticated TCP connection - matches the behavioral profile of a Remote Access Tool or spyware at the network level. It is, intentionally, a remote screen viewer.
 
 Taken individually each of these patterns has a legitimate explanation. Taken together on a single statically linked binary they push most heuristic classifiers well past their detection threshold. If you need to share the binary through a service that blocks it, archiving it in a password-protected zip (password noted in accompanying text) is usually sufficient to pass it through, since the scanner cannot inspect the contents.
+
+> **USE AT YOUR OWN RISK**
+
+> This software is not affiliated with Korg in any way, and while we have validated it functions correctly with OS 3.2, and some testing has been done with 3.1 and 3.0, we cannot 100% guarantee it will function in every circumstance, though it should. 
+>
+> It is distributed **as-is**, without any express or implied warranty of any kind, including but not limited to warranties of merchantability, fitness for a particular purpose, or non-infringement. The authors and contributors make no guarantees regarding stability, correctness, security, or suitability for any use case.
+>
+> **No support is offered or implied.** There is no commitment to fix bugs, respond to issues, or maintain compatibility with any hardware or software version. Use of this software is entirely at your own risk. The authors accept no liability for any damage to hardware, data loss, or any other consequence - direct or indirect - arising from the use or misuse of this software.
+>
+> By using this software you acknowledge that you understand and accept these terms.
