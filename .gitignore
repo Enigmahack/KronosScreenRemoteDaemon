@@ -57,3 +57,12 @@ chord_probe_module/
 docs/vm_environment.md
 tools/__pycache__/
 tools/*.py
+
+# Local-only test tooling and repo attributes - intentionally untracked.
+# The kernel-safety kit and the network fuzzer are bench/VM instruments that
+# need a live Kronos or the QEMU VM to mean anything, so they stay on disk and
+# out of the repo.  .gitattributes is likewise local now - note that untracking
+# it removed the Git LFS filter rules (*.img/*.iso/*.bin/*.qcow2/*.tar.gz), so
+# restore it before re-adding any of those file types.
+tests/
+.gitattributes

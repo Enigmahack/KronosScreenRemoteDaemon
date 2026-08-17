@@ -416,6 +416,15 @@ static int oa_read32(unsigned long addr, uint32_t *out)
     return probe_kernel_read(out, (void *)addr, sizeof(*out)) == 0;
 }
 
+/* Fault-safe counterpart for the one place this module WRITES OA-owned memory
+ * (the PADMODE diagnostic).  Same argument as the reads above: the target came
+ * from frontpanel_this(), which only range-checks, so a raw store to an
+ * unmapped page is an oops on a board with no console to report it. */
+static int oa_write8(unsigned long addr, uint8_t v)
+{
+    return probe_kernel_write((void *)addr, &v, sizeof(v)) == 0;
+}
+
 /* Read a pointer out of a .bss singleton slot.  Returns NULL if the slot address
  * itself is implausible, if the slot is unmapped, or if the value read back is
  * not a plausible kernel pointer - so callers get one NULL check instead of
@@ -648,12 +657,10 @@ static int inject_write_proc(struct file *file, const char __user *buf,
          * notes) - this exists purely to test whether forcing the flag alone,
          * independent of Eva, is sufficient for TOUCH to reach the KARMA CC path. */
         void *this_ = frontpanel_this();
-        if (this_) {
-            *(unsigned char *)((char *)this_ + 0x104) = (a != 0);
-            rc = 0;
-        } else {
-            rc = -1;
-        }
+        /* probe_kernel_write, not a raw store: frontpanel_this() only proves the
+         * pointer is in range, never that it is mapped (see oa_write8). */
+        rc = (this_ && oa_write8((unsigned long)this_ + 0x104, (uint8_t)(a != 0)))
+             ? 0 : -1;
     } else if (sscanf(kbuf, "PADCHORD %d %d %d %d", &a, &b, &c, &d) == 4) {
         rc = inject_chord(a, b, c, d);
         cnt_chord++;
@@ -679,15 +686,30 @@ static int inject_write_proc(struct file *file, const char __user *buf,
  * the touch position and calls CSTGControllerRTData::SendKarmaCCToKGE()
  * directly. Reading this byte tells us, without guessing, which branch a
  * given injected TOUCH would actually take. */
+/* Returns 0 only when all three bytes were read successfully; -1 if the object
+ * pointer did not resolve, -2 if it resolved but the memory could not be read.
+ *
+ * The distinction matters: a non-zero return is the contract
+ * tests/kernel_safety/t1_nks4_status.sh stage C asserts on.  Returning 0 with
+ * garbage in the out-params would make that regression test pass for the wrong
+ * reason, which is worse than no test at all.  Callers must not read the
+ * out-params unless this returns 0. */
 static int touch_pad_mode_read(unsigned char *flag_out, unsigned char *latch_out,
                                 unsigned char *stored_out)
 {
-    void *this_ = frontpanel_this();
-    if (!this_)
+    unsigned long p = (unsigned long)frontpanel_this();
+
+    if (!p)
         return -1;
-    *flag_out   = *(unsigned char *)((char *)this_ + 0x104);
-    *latch_out  = *(unsigned char *)((char *)this_ + 0x105);
-    *stored_out = *(unsigned char *)((char *)this_ + 0x106);
+    /* probe_kernel_read for every one - these were the four derefs the
+     * 2026-08-17 review found still raw after commit d1f565a moved the rest of
+     * this module's OA accesses onto the fault-safe path.  kptr_ok() cannot
+     * tell a plausible address from an unmapped one (see oa_read8's header),
+     * and this function is reachable from a world-readable /proc node. */
+    if (!oa_read8(p + 0x104, flag_out)  ||
+        !oa_read8(p + 0x105, latch_out) ||
+        !oa_read8(p + 0x106, stored_out))
+        return -2;
     return 0;
 }
 
@@ -695,8 +717,37 @@ static int status_read_proc(char *page, char **start, off_t off,
                              int count, int *eof, void *data)
 {
     unsigned char pad_flag = 0xff, pad_latch = 0xff, pad_stored = 0xff;
-    int pad_rc = touch_pad_mode_read(&pad_flag, &pad_latch, &pad_stored);
-    int len = snprintf(page, count,
+    char last_cmd_copy[sizeof(last_cmd)];
+    int pad_rc, this_ok, blind_ok, dead;
+    unsigned long flags;
+    int len;
+
+    /* Everything that touches OA-owned memory happens under inj_lock, with an
+     * oa_dead check first - exactly what inject_write_proc() already does, and
+     * what this function was missing.  Without it the OA-unload notifier could
+     * set oa_dead and let OA's module memory be freed part-way through the
+     * derefs below, which is the race that made the (previously raw) reads in
+     * touch_pad_mode_read() dangerous rather than merely sloppy.
+     *
+     * The values are snapshotted into locals and formatted AFTER the lock is
+     * dropped: snprintf into a page-sized buffer has no business running inside
+     * a spinlock.  last_cmd comes along for the ride because inject_write_proc
+     * writes it under this same lock. */
+    spin_lock_irqsave(&inj_lock, flags);
+    dead = oa_dead;
+    if (dead) {
+        pad_rc = -1;
+        this_ok = 0;
+        blind_ok = 0;
+    } else {
+        pad_rc   = touch_pad_mode_read(&pad_flag, &pad_latch, &pad_stored);
+        this_ok  = frontpanel_this() != NULL;
+        blind_ok = blind_this() != NULL;
+    }
+    strlcpy(last_cmd_copy, last_cmd, sizeof(last_cmd_copy));
+    spin_unlock_irqrestore(&inj_lock, flags);
+
+    len = snprintf(page, count,
         "sinstance=0x%lx fn_switch=0x%lx fn_touch=0x%lx fn_rotary=0x%lx "
         "fn_analog=0x%lx fn_invert=0x%lx fn_chord=0x%lx\n"
         "sinstance_setled=0x%lx sinstance_delta=0x%lx agree=%d cstgglobal=0x%lx "
@@ -711,11 +762,11 @@ static int status_read_proc(char *page, char **start, off_t off,
         (sinstance_setled_addr && sinstance_delta_addr &&
          sinstance_setled_addr == sinstance_delta_addr),
         global_sinstance_addr, sinstance_override,
-        oa_dead, frontpanel_this() != NULL, blind_this() != NULL,
+        dead, this_ok, blind_ok,
         (int)pad_flag, pad_latch, pad_stored, pad_rc,
         cnt_btn, cnt_touch, cnt_rot, cnt_analog, cnt_gated, cnt_badcmd, cnt_chord,
         last_chord_pad, last_chord_vel, last_chord_p3, last_chord_p4, last_chord_rc,
-        last_cmd);
+        last_cmd_copy);
     *eof = 1;
     return len;
 }

@@ -474,6 +474,7 @@ deps_/home/share/KronosScreenRemoteDaemon/nks4_inject_module/nks4_inject.o := \
   /home/build/linux-kronos/arch/x86/include/asm/fcntl.h \
   include/asm-generic/fcntl.h \
   include/linux/magic.h \
+  include/linux/uaccess.h \
   /home/build/linux-kronos/arch/x86/include/asm/uaccess.h \
     $(wildcard include/config/x86/wp/works/ok.h) \
     $(wildcard include/config/x86/intel/usercopy.h) \

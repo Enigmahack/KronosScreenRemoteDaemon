@@ -181,7 +181,7 @@
 #define KBD_EV_KEY  1
 
 /*  Version */
-#define SCREENREMOTE_VERSION "2.0.9"
+#define SCREENREMOTE_VERSION "2.0.11"
 #ifndef BUILD_ID
 #define BUILD_ID "dev"
 #endif
@@ -253,6 +253,12 @@ static int       shadow_valid = 0;
 
 /* Mirror state */
 static int       mirror_on = 0;
+/* Dirty-row tracking for do_mirror() - see its header comment.  Declared up
+ * here, not next to do_mirror(), because ss_reset() and fb0_open()/fb0_close()
+ * all sit earlier in the file and every one of them has to be able to
+ * invalidate the shadow. */
+static uint8_t  *mirror_shadow = NULL;   /* last frame written to fb0 (frame_bytes) */
+static int       mirror_shadow_valid = 0;/* 0 = repaint every row unconditionally */
 
 /* Screensaver (VGA/fb0 only) */
 #define SS_TIMEOUT_DEF  300   /* seconds idle before blanking; 0=disabled */
@@ -636,7 +642,36 @@ static void set_cloexec(int fd)
  * write_all() call - covers both the EAGAIN leg and the partial-write leg. */
 #define WRITE_ALL_STALL_MS 250
 
+/* Larger budget for frame payloads specifically.
+ *
+ * The stream socket now stays O_NONBLOCK for the whole session (it used to be
+ * flipped back to blocking after the handshake, which made the budget below
+ * unreachable and let one wedged client freeze the daemon for a full
+ * SO_SNDTIMEO - measured at 4.811 s on hardware 2026-08-17).  With a
+ * non-blocking fd the EAGAIN leg becomes the normal path for a peer that is
+ * merely slow rather than dead, so the budget stops being a "peer is wedged"
+ * guard and starts being a "drop the client" threshold.
+ *
+ * 250 ms is too tight for that on a real link: a full 480 KB frame is ~190 ms
+ * of wire time at 20 Mbit/s, so a perfectly healthy Wi-Fi client could be
+ * dropped mid-frame.  Frame sends therefore get a budget with real headroom;
+ * everything else (ctrl replies, injection writes) keeps the tighter one, since
+ * those are small enough that a peer which cannot take them promptly is gone. */
+#define WRITE_ALL_FRAME_STALL_MS 1500
+
+static int write_all_budget(int fd, const void *buf, size_t n, long budget_ms);
+
+/* Frame-payload writes.  Used by every sender that puts framebuffer bytes on
+ * the wire (send_frame_buf / send_row_range / send_frame / send_dirty_rect) and
+ * nowhere else. */
+#define write_all_f(fd, buf, n) write_all_budget((fd), (buf), (n), WRITE_ALL_FRAME_STALL_MS)
+
 static int write_all(int fd, const void *buf, size_t n)
+{
+    return write_all_budget(fd, buf, n, WRITE_ALL_STALL_MS);
+}
+
+static int write_all_budget(int fd, const void *buf, size_t n, long budget_ms)
 {
     const uint8_t *p = buf;
     struct timespec t0, tn;
@@ -651,7 +686,7 @@ static int write_all(int fd, const void *buf, size_t n)
 #define WRITE_ALL_STALLED() \
     (clock_gettime(CLOCK_MONOTONIC, &tn), \
      (tn.tv_sec - t0.tv_sec) * 1000L + (tn.tv_nsec - t0.tv_nsec) / 1000000L \
-        >= WRITE_ALL_STALL_MS)
+        >= budget_ms)
 
     while (n > 0) {
         ssize_t r = write(fd, p, n);
@@ -904,6 +939,10 @@ static int fb0_open(void)
 
     apply_palette_to_fb0();
 
+    /* Freshly mapped fb0 holds whatever fbcon left behind, not our last frame -
+     * force do_mirror()'s next pass to repaint every row. */
+    mirror_shadow_valid = 0;
+
     /* Hide the fbcon text cursor so it doesn't blink over the mirrored frame */
     { int t = open("/dev/tty0", O_WRONLY); if (t >= 0) { write(t, "\033[?25l", 6); close(t); } }
 
@@ -925,6 +964,10 @@ static void fb0_close(void)
         munmap(fb0_map, fb0_stride * fb_h);
         fb0_map = NULL;
     }
+    /* Release the dirty-row shadow with the mapping it describes. */
+    free(mirror_shadow);
+    mirror_shadow = NULL;
+    mirror_shadow_valid = 0;
     if (fb0_fd >= 0) { close(fb0_fd); fb0_fd = -1; }
     /* Restore the fbcon text cursor now that we've released the framebuffer */
     { int t = open("/dev/tty0", O_WRONLY); if (t >= 0) { write(t, "\033[?25h", 6); close(t); } }
@@ -949,17 +992,59 @@ static void ss_reset(time_t now)
     ss_last_chg   = now;
     ss_prev_valid = 0;
     ss_active     = 0;
+    /* Whatever is on fb0 is no longer something do_mirror() put there. */
+    mirror_shadow_valid = 0;
 }
 
-/* Mirror */
+/* Mirror
+ *
+ * Measured on hardware 2026-08-17: with a 15 fps change-mode client attached and
+ * a completely STATIC screen, turning the mirror on took the daemon from 1.42%
+ * to 8.25% CPU - 6.8 points, a 5.8x increase, to repaint a picture that had not
+ * changed.  The old version copied all 480 KB every time it was called, with no
+ * dirty check at all, straight from uncached fb1 into uncached fb0.
+ *
+ * mirror_shadow holds the last frame actually written to fb0.  Rows that match
+ * it are skipped, which drops the expensive half of the work (the uncached fb0
+ * write) to zero on an idle screen; the surviving fb1 read is unavoidable
+ * because it is the only way to know whether anything moved.  The fb0 write is
+ * fed from the shadow (normal cached RAM) rather than a second pass over fb1.
+ *
+ * Anything that writes fb0 behind this function's back MUST clear
+ * mirror_shadow_valid, or the shadow will claim rows are already correct when
+ * they are not and the mirror will stay stale.  There are three such places -
+ * the screensaver blank, fb0_close()'s zeroing, and a freshly-mapped fb0 in
+ * fb0_open() - and all three do so.  The screensaver one is the dangerous one:
+ * it only bites after g_ss_timeout has elapsed, so a missing invalidation there
+ * ships as "VGA output stays black after the screensaver wakes up". */
 static void do_mirror(void)
 {
     uint32_t y;
     if (!fb0_map || !fb1_map) return;
-    for (y = 0; y < fb_h; y++)
-        memcpy(fb0_map + y * fb0_stride,
-               fb1_map + y * fb1_stride,
-               fb_w);
+
+    if (!mirror_shadow) {
+        mirror_shadow = malloc(frame_bytes);
+        mirror_shadow_valid = 0;
+    }
+    if (!mirror_shadow) {
+        /* Out of memory - fall back to the old unconditional copy.  Still
+         * throttled by the caller, so this is the pre-2026-08-17 behaviour and
+         * not a regression past it. */
+        for (y = 0; y < fb_h; y++)
+            memcpy(fb0_map + (size_t)y * fb0_stride,
+                   fb1_map + (size_t)y * fb1_stride, fb_w);
+        return;
+    }
+
+    for (y = 0; y < fb_h; y++) {
+        const uint8_t *src = fb1_map        + (size_t)y * fb1_stride;
+        uint8_t       *shd = mirror_shadow  + (size_t)y * fb_w;
+        if (mirror_shadow_valid && memcmp(shd, src, fb_w) == 0)
+            continue;                       /* unchanged - skip the fb0 write */
+        memcpy(shd, src, fb_w);
+        memcpy(fb0_map + (size_t)y * fb0_stride, shd, fb_w);
+    }
+    mirror_shadow_valid = 1;
 }
 
 static void check_mirror_flag(void)
@@ -1111,7 +1196,7 @@ static int send_frame_buf(int fd, const uint8_t *buf)
     uint8_t hdr[4];
     put_le32(hdr, frame_bytes);
     TCP_CORK_ON(fd);
-    if (write_all(fd, hdr, 4) < 0 || write_all(fd, buf, frame_bytes) < 0) {
+    if (write_all_f(fd, hdr, 4) < 0 || write_all_f(fd, buf, frame_bytes) < 0) {
         TCP_CORK_OFF(fd);
         return -1;
     }
@@ -1188,17 +1273,17 @@ static int send_row_range(int fd, uint32_t start, uint32_t end, uint32_t splash_
     if (split > end)   split = end;
 
     if (split > start &&
-            write_all(fd, g_boot_splash + (size_t)start * fb_w,
+            write_all_f(fd, g_boot_splash + (size_t)start * fb_w,
                        (size_t)(split - start) * fb_w) < 0)
         return -1;
     if (end > split) {
         if (fb1_stride == fb_w) {
-            if (write_all(fd, fb1_map + (size_t)split * fb1_stride,
+            if (write_all_f(fd, fb1_map + (size_t)split * fb1_stride,
                            (size_t)(end - split) * fb_w) < 0)
                 return -1;
         } else {
             for (y = split; y < end; y++)
-                if (write_all(fd, fb1_map + (size_t)y * fb1_stride, fb_w) < 0)
+                if (write_all_f(fd, fb1_map + (size_t)y * fb1_stride, fb_w) < 0)
                     return -1;
         }
     }
@@ -1216,7 +1301,7 @@ static int send_frame(int fd)
 
     put_le32(hdr, frame_bytes);
     TCP_CORK_ON(fd);
-    if (write_all(fd, hdr, 4) < 0) goto fail;
+    if (write_all_f(fd, hdr, 4) < 0) goto fail;
 
     if (!have_bar) {
         /* Unchanged fast path - see this function's own header comment for why
@@ -1224,15 +1309,15 @@ static int send_frame(int fd)
          * common case (BOOT=0, splash_rows=0: this is a single zero-copy write
          * straight from fb1_map). */
         if (splash_rows > 0 &&
-                write_all(fd, g_boot_splash, (size_t)fb_w * splash_rows) < 0)
+                write_all_f(fd, g_boot_splash, (size_t)fb_w * splash_rows) < 0)
             goto fail;
         if (fb1_stride == fb_w) {
-            if (write_all(fd, fb1_map + splash_rows * fb1_stride,
+            if (write_all_f(fd, fb1_map + splash_rows * fb1_stride,
                            frame_bytes - splash_rows * fb_w) < 0)
                 goto fail;
         } else {
             for (y = splash_rows; y < fb_h; y++)
-                if (write_all(fd, fb1_map + y * fb1_stride, fb_w) < 0) goto fail;
+                if (write_all_f(fd, fb1_map + y * fb1_stride, fb_w) < 0) goto fail;
         }
     } else {
         /* Boot progress bar active - see apply_boot_progress_bar()'s own header
@@ -1258,8 +1343,8 @@ static int send_frame(int fd)
         memset(bar_row1 + bg.col + filled, 0xC0, (size_t)(bg.max_width - filled));
 
         if (send_row_range(fd, 0, bg.row, splash_rows) < 0) goto fail;
-        if (write_all(fd, bar_row0, fb_w) < 0) goto fail;
-        if (write_all(fd, bar_row1, fb_w) < 0) goto fail;
+        if (write_all_f(fd, bar_row0, fb_w) < 0) goto fail;
+        if (write_all_f(fd, bar_row1, fb_w) < 0) goto fail;
         if (send_row_range(fd, row1 + 1, fb_h, splash_rows) < 0) goto fail;
     }
 
@@ -1276,7 +1361,6 @@ static int send_frame(int fd)
 
 struct stream_handshake {
     int                fd;
-    int                flags;
     size_t             have, need;
     uint8_t            hello[STREAM_HELLO_MAX];
     struct sockaddr_in peer;
@@ -2820,21 +2904,121 @@ static int nks4_analog_write(int device_code, int value_0_127)
  *
  * Blocks the calling thread for the ramp's duration (worst case ~127 steps),
  * same tradeoff CHORD's hold_ms already makes elsewhere in this file. */
-static void nks4_analog_ramp(int device_code, int target_0_127, int *state)
+/* DEFERRED, not blocking.  The old version ran the whole ramp inline with
+ * usleep(25000) between steps, so a single TEMPO or DAMPER command stopped the
+ * entire single-threaded daemon for up to 127 * 25 ms.  Measured on hardware
+ * 2026-08-17: DAMPER 0->127 took 3.190 s and a concurrent STATE query was
+ * stalled 2.940 s - no frames, no ctrl, no MIDI drain and no stuck-note
+ * watchdog for three seconds, from one client command that could be repeated
+ * back-to-back indefinitely.
+ *
+ * Now a start/pump pair: _start() records the target and returns immediately,
+ * and _pump() emits at most one step per main-loop iteration.  The pacing is
+ * unchanged (RAMP_STEP_MS between steps, every intermediate value visited in
+ * order), so the hardware behaviour this ramp exists for is preserved exactly -
+ * only the waiting moved off the main thread.  The main loop clamps its
+ * select() timeout while a ramp is pending, the same way it already does for a
+ * held CC (see cc_flush/cc_pending). */
+#define RAMP_STEP_MS  25   /* the proven-smooth Damper ramp pace */
+#define RAMP_SLOTS     2   /* TEMPO (dev 26) and DAMPER (dev 29) are the only users */
+
+struct analog_ramp {
+    int              active;       /* slot in use - device_code 0 is a VALID
+                                    * eSTGAnalogDeviceCode, so it can never be
+                                    * the "unused" sentinel */
+    int              device_code;
+    int              target;
+    int             *state;        /* &g_tempo_value / &g_damper_value */
+    struct timespec  next;         /* when this slot's next step is due */
+};
+static struct analog_ramp g_ramps[RAMP_SLOTS];
+
+static void nks4_analog_ramp_start(int device_code, int target_0_127, int *state)
 {
     int target = clampi(target_0_127, 0, 127);
-    int step;
+    int i, free_i = -1;
 
+    /* No known starting point - jump directly, identical to the old first-call
+     * behaviour.  A ramp needs somewhere to ramp *from*. */
     if (*state < 0) {
         nks4_analog_write(device_code, target);
         *state = target;
         return;
     }
-    step = (target >= *state) ? 1 : -1;
-    while (*state != target) {
-        *state += step;
-        nks4_analog_write(device_code, *state);
-        usleep(25000);   /* ~25 ms/step - matches the proven-smooth Damper ramp pace */
+    for (i = 0; i < RAMP_SLOTS; i++) {
+        if (g_ramps[i].active && g_ramps[i].device_code == device_code) {
+            /* Retarget a ramp already in flight: update where it is heading,
+             * leave *state alone so it continues smoothly from where it got to
+             * rather than restarting. */
+            g_ramps[i].target = target;
+            return;
+        }
+        if (!g_ramps[i].active && free_i < 0)
+            free_i = i;
+    }
+    if (*state == target)
+        return;                    /* already there */
+    if (free_i < 0) {              /* can't happen with 2 devices and 2 slots */
+        nks4_analog_write(device_code, target);
+        *state = target;
+        return;
+    }
+    g_ramps[free_i].active      = 1;
+    g_ramps[free_i].device_code = device_code;
+    g_ramps[free_i].target      = target;
+    g_ramps[free_i].state       = state;
+    clock_gettime(CLOCK_MONOTONIC, &g_ramps[free_i].next);   /* first step now */
+}
+
+/* One step per active ramp, at most, per call.  Returns 1 while any ramp is
+ * still running so the caller can shorten its select() timeout. */
+static int nks4_analog_ramp_pump(void)
+{
+    struct timespec now;
+    int i, pending = 0;
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    for (i = 0; i < RAMP_SLOTS; i++) {
+        struct analog_ramp *r = &g_ramps[i];
+        if (!r->active)
+            continue;
+        if (*r->state == r->target) { r->active = 0; continue; }
+        if (now.tv_sec > r->next.tv_sec ||
+                (now.tv_sec == r->next.tv_sec && now.tv_nsec >= r->next.tv_nsec)) {
+            *r->state += (r->target > *r->state) ? 1 : -1;
+            nks4_analog_write(r->device_code, *r->state);
+            r->next = now;
+            r->next.tv_nsec += RAMP_STEP_MS * 1000000L;
+            if (r->next.tv_nsec >= 1000000000L) {
+                r->next.tv_nsec -= 1000000000L;
+                r->next.tv_sec++;
+            }
+            if (*r->state == r->target) { r->active = 0; continue; }
+        }
+        pending = 1;
+    }
+    return pending;
+}
+
+/* Shutdown: land every in-flight ramp on its commanded target immediately.
+ * Without this, exiting mid-ramp leaves the control physically parked at
+ * whatever intermediate value the last step happened to write - a half-pressed
+ * damper pedal, say - which the blocking version could never do because it
+ * always ran to completion.  Writes the target directly rather than continuing
+ * to pace: at shutdown the final position matters, smoothness does not.  Safe
+ * to call when nks4_inject never loaded (nks4_write() checks g_nks4_loaded). */
+static void nks4_analog_ramp_finish_all(void)
+{
+    int i;
+    for (i = 0; i < RAMP_SLOTS; i++) {
+        struct analog_ramp *r = &g_ramps[i];
+        if (!r->active)
+            continue;
+        if (*r->state != r->target) {
+            *r->state = r->target;
+            nks4_analog_write(r->device_code, r->target);
+        }
+        r->active = 0;
     }
 }
 
@@ -4546,7 +4730,9 @@ static void process_ctrl_cmd(const char *line, int fd)
         if (line[0] == 'D') { dev = 29; state = &g_damper_value; }
         else                { dev = 26; state = &g_tempo_value; }
         if (sscanf(line + (line[0] == 'D' ? 7 : 6), "%d", &val) == 1) {
-            nks4_analog_ramp(dev, val, state);
+            /* Returns immediately; the ramp is stepped from the main loop.
+             * OK therefore means "accepted", not "finished" - see docs/api.md. */
+            nks4_analog_ramp_start(dev, val, state);
             REPLY("OK\n", 3);
         } else {
             REPLY("ERR\n", 4);
@@ -4783,6 +4969,156 @@ static int handle_ctrl_persistent_data(void)
  *   header 0x80      -> NOP (never emitted here)
  * Literal scan breaks on runs of 3+ identical bytes.
  * Worst-case output: n + ceil(n/128) bytes (~1.008 x input). */
+/* ── Deferred ctrl accept ───────────────────────────────────────────────────
+ *
+ * The ctrl listener used to accept() and then read the entire first line
+ * INLINE, one byte at a time, with a 200 ms per-byte recv timeout and a 1 s
+ * wall-clock deadline.  That bounded the damage but left the waiting on the
+ * main thread, and connections are serviced one at a time out of a 16-deep
+ * backlog - so any peer that does not promptly send a newline stops the whole
+ * single-threaded daemon.  No credentials required: the accept path runs before
+ * any ownership check.
+ *
+ * Measured on hardware 2026-08-17, STATE round-trip from a second connection:
+ *   baseline                                    0.012 s
+ *   16 connections that connect and send nothing 2.98 s
+ *   4 connections trickling a byte every 150 ms  3.81 s
+ *   16 trickling                                 5.64 s
+ * and it recovers cleanly afterwards, so nothing in the logs records it.
+ *
+ * This is now the same shape the stream listener has always used (see struct
+ * stream_handshake): park the accepted fd non-blocking with a deadline, put it
+ * in the select() set, consume whatever has arrived on each pass, and dispatch
+ * only once a full line is present.  A connection that never completes a line
+ * costs a slot and nothing else. */
+#define CTRL_PEND_MAX        8   /* concurrent half-open ctrl connections */
+#define CTRL_PEND_DEADLINE_S 1   /* unchanged from the old inline deadline */
+
+struct ctrl_pending {
+    int                fd;          /* -1 = free slot */
+    struct sockaddr_in peer;
+    int                len;
+    int                overflow;    /* line exceeded CTRL_LINE_MAX */
+    struct timespec    deadline;
+    char               line[CTRL_LINE_MAX];
+};
+static struct ctrl_pending g_ctrl_pend[CTRL_PEND_MAX];
+
+static void ctrl_pending_init(void)
+{
+    int i;
+    for (i = 0; i < CTRL_PEND_MAX; i++)
+        g_ctrl_pend[i].fd = -1;
+}
+
+/* Free a slot.  close_fd == 0 means the descriptor has been handed to someone
+ * else - CTRL_PERSIST adopts it as ctrl_fd, SYSEX parks it as sysex_resp_fd -
+ * and the slot must forget it WITHOUT closing, or the deadline sweep below
+ * would later close a descriptor that is now a live session. */
+static void ctrl_pending_release(struct ctrl_pending *p, int close_fd)
+{
+    if (p->fd >= 0 && close_fd)
+        close(p->fd);
+    p->fd = -1;
+}
+
+static int ctrl_pending_have_free_slot(void)
+{
+    int i;
+    for (i = 0; i < CTRL_PEND_MAX; i++)
+        if (g_ctrl_pend[i].fd < 0)
+            return 1;
+    return 0;
+}
+
+/* The ownership/allowlist decision, lifted unchanged from the old inline block.
+ * Returns 1 if the fd was handed off (caller must NOT close it), 0 otherwise. */
+static int ctrl_dispatch_line(int cfd, const struct sockaddr_in *cpeer,
+                               const char *firstline, int fl_overflow)
+{
+    struct timeval zero = {0, 0};
+    int is_readonly, owned;
+
+    setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &zero, sizeof(zero));
+
+    if (fl_overflow) {
+        /* Over-length first line - reject explicitly instead of acting on a
+         * silently-truncated command. */
+        write_all(cfd, "ERR LINE_TOO_LONG\n", 18);
+        return 0;
+    }
+
+    is_readonly = cmd_class(firstline) != CMD_MUTATING;
+    owned = (g_ctrl_allowed_ip != 0 &&
+             cpeer->sin_addr.s_addr == g_ctrl_allowed_ip);
+
+    if (is_readonly) {
+        /* Always one-shot regardless of ownership - never upgrades to
+         * CTRL_PERSIST, so it can't steal ctrl_fd from the owning client. */
+        process_ctrl_cmd(firstline, cfd);
+        return 0;
+    }
+    if (owned) {
+        if (strcmp(firstline, "CTRL_PERSIST") == 0) {
+            int flags;
+            /* Replace any previous ctrl_fd via ctrl_fd_close() so a SysEx still
+             * parked on the OLD session can't outlive it holding a stale fd. */
+            ctrl_fd_close();
+            ctrl_fd = cfd;
+            g_ctrl_persist_ip = cpeer->sin_addr.s_addr;
+            ctrl_lb_n = 0;
+            ctrl_lb_overflow = 0;
+            flags = fcntl(ctrl_fd, F_GETFL, 0);
+            fcntl(ctrl_fd, F_SETFL, flags | O_NONBLOCK);
+            fprintf(stderr, "screenremote: persistent ctrl from %s\n",
+                    inet_ntoa(cpeer->sin_addr));
+            return 1;                 /* fd now owned by ctrl_fd */
+        }
+        process_ctrl_cmd(firstline, cfd);
+        /* SYSEX starts an async capture - the fd stays open until
+         * sysex_finish() sends the response and closes it. */
+        if (sysex_pending && sysex_resp_fd == cfd)
+            return 1;
+        return 0;
+    }
+    fprintf(stderr, "screenremote: ctrl rejected from %s\n",
+            inet_ntoa(cpeer->sin_addr));
+    return 0;
+}
+
+/* Consume whatever this connection has sent so far.  Never blocks: the fd is
+ * O_NONBLOCK and we stop at EAGAIN, leaving the slot for the next pass. */
+static void ctrl_pending_service(struct ctrl_pending *p)
+{
+    for (;;) {
+        char c;
+        ssize_t r = recv(p->fd, &c, 1, MSG_DONTWAIT);
+        if (r < 0) {
+            if (errno == EINTR)
+                continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                return;                       /* partial line - wait for more */
+            ctrl_pending_release(p, 1);
+            return;
+        }
+        if (r == 0) {                         /* peer closed before a newline */
+            ctrl_pending_release(p, 1);
+            return;
+        }
+        if (c == '\n') {
+            int handed;
+            p->line[p->len] = '\0';
+            handed = ctrl_dispatch_line(p->fd, &p->peer, p->line, p->overflow);
+            ctrl_pending_release(p, !handed);
+            return;
+        }
+        if (p->len < (int)sizeof(p->line) - 1)
+            p->line[p->len++] = c;
+        else
+            p->overflow = 1;                  /* consume to newline, then reject */
+    }
+}
+
 static uint32_t packbits_encode(const uint8_t *src, uint32_t n, uint8_t *dst)
 {
     uint32_t si = 0, di = 0;
@@ -4852,8 +5188,8 @@ static int send_dirty_rect(int fd, uint32_t first_row, uint32_t row_count)
     put_le16(hdr + 4, (uint16_t)first_row);
     put_le16(hdr + 6, (uint16_t)row_count);
     TCP_CORK_ON(fd);
-    if (write_all(fd, hdr, 8) < 0 ||
-        write_all(fd, rle_buf, enc_size) < 0) {
+    if (write_all_f(fd, hdr, 8) < 0 ||
+        write_all_f(fd, rle_buf, enc_size) < 0) {
         TCP_CORK_OFF(fd);
         return -1;
     }
@@ -5324,12 +5660,15 @@ int main(void)
     int eva_ready_streak = 0;          /* consecutive EVA-UI-detected checks */
     int rebind_module_load = 0;        /* durable .boot guard covers rebind retries */
     struct timespec last_frame = {0, 0};
+    struct timespec last_mirror = {0, 0};   /* frame-cadence throttle for do_mirror() */
     struct stream_handshake handshake = { .fd = -1 };
     ss_last_chg = time(NULL);
 
     signal(SIGPIPE, SIG_IGN);
     signal(SIGTERM, sig_exit);
     signal(SIGINT,  sig_exit);
+
+    ctrl_pending_init();   /* all slots free - MUST run before the select loop */
 
     read_config();
     read_pubid();
@@ -5591,6 +5930,11 @@ int main(void)
          * set while a controller's final value is still held, so we shorten the
          * select() timeout below to deliver it promptly. */
         int cc_pending = cc_flush();
+
+        /* Advance any deferred TEMPO/DAMPER ramp by at most one step.  Same
+         * shape as cc_flush() above: the work is paced by the main loop rather
+         * than by sleeping inside the command handler. */
+        int ramp_pending = nks4_analog_ramp_pump();
 
         /* Boot-state gate - see update_boot_state()'s block comment. Throttled
          * to 1/s (plenty for its 600ms debounce window - the streak clock is
@@ -5867,11 +6211,33 @@ int main(void)
             if (g_ss_timeout > 0 && (now - ss_last_chg) >= g_ss_timeout) {
                 if (!ss_active && fb0_map) {
                     memset(fb0_map, 0, fb0_stride * fb_h);
+                    /* fb0 was just painted black behind do_mirror()'s back.  If
+                     * the shadow stayed "valid", every row would compare equal
+                     * on wake and the VGA output would stay black until
+                     * something on screen happened to change - a bug that only
+                     * appears after g_ss_timeout has elapsed. */
+                    mirror_shadow_valid = 0;
                     ss_active = 1;
                 }
             } else {
+                struct timespec mnow;
+                long mel;
                 ss_active = 0;
-                do_mirror();
+                /* Throttle to the frame cadence.  This used to run once per
+                 * main-loop iteration with no rate limit and no dirty check.
+                 * The loop deliberately free-runs (tv=0) whenever frame work
+                 * overruns its budget, and a held CC shortens the timeout to
+                 * CC_MIN_INTERVAL_MS (7 ms) - so the mirror could fire far
+                 * faster than any display could use.  Measured cost of the
+                 * unthrottled, always-copy version: +6.8 CPU points on a
+                 * static screen (see do_mirror's header). */
+                clock_gettime(CLOCK_MONOTONIC, &mnow);
+                mel = (mnow.tv_sec  - last_mirror.tv_sec)  * 1000000000L
+                    + (mnow.tv_nsec - last_mirror.tv_nsec);
+                if (mel >= frame_interval_ns(client_fps)) {
+                    do_mirror();
+                    last_mirror = mnow;
+                }
             }
         }
 
@@ -5917,9 +6283,22 @@ int main(void)
             FD_SET(stream_listen, &rfds);
             if (stream_listen > maxfd) maxfd = stream_listen;
         }
-        if (ctrl_listen >= 0) {
+        /* Only advertise the ctrl listener while there is somewhere to park the
+         * result.  Accepting with every slot full would mean closing the
+         * connection immediately and leaving the listener readable, which spins
+         * this loop at 100% CPU - the same reason the stream listener above is
+         * gated on handshake.fd < 0. */
+        if (ctrl_listen >= 0 && ctrl_pending_have_free_slot()) {
             FD_SET(ctrl_listen, &rfds);
             if (ctrl_listen > maxfd) maxfd = ctrl_listen;
+        }
+        {
+            int i;
+            for (i = 0; i < CTRL_PEND_MAX; i++) {
+                if (g_ctrl_pend[i].fd < 0) continue;
+                FD_SET(g_ctrl_pend[i].fd, &rfds);
+                if (g_ctrl_pend[i].fd > maxfd) maxfd = g_ctrl_pend[i].fd;
+            }
         }
         if (disc_fd >= 0) {
             FD_SET(disc_fd, &rfds);
@@ -5974,6 +6353,15 @@ int main(void)
                 tv.tv_usec = max_us;
             }
         }
+        /* A ramp step must land on time even when nothing else is happening,
+         * otherwise select() parks for up to 1 s and the ramp crawls. */
+        if (ramp_pending) {
+            long max_us = RAMP_STEP_MS * 1000L;
+            if (tv.tv_sec > 0 || tv.tv_usec > max_us) {
+                tv.tv_sec  = 0;
+                tv.tv_usec = max_us;
+            }
+        }
         if (handshake.fd >= 0) {
             struct timespec hs_now;
             long remaining_us, timeout_us;
@@ -5985,6 +6373,29 @@ int main(void)
             if (remaining_us < timeout_us) {
                 tv.tv_sec = remaining_us / 1000000L;
                 tv.tv_usec = remaining_us % 1000000L;
+            }
+        }
+
+        /* A parked ctrl connection must be able to hit its deadline even when
+         * nothing else is due - otherwise MODE_PULL parks select() for a full
+         * second and a half-open connection outlives CTRL_PEND_DEADLINE_S. */
+        {
+            struct timespec cnow;
+            long timeout_us = tv.tv_sec * 1000000L + tv.tv_usec;
+            int i, any = 0;
+            clock_gettime(CLOCK_MONOTONIC, &cnow);
+            for (i = 0; i < CTRL_PEND_MAX; i++) {
+                long rem;
+                if (g_ctrl_pend[i].fd < 0) continue;
+                any = 1;
+                rem = (g_ctrl_pend[i].deadline.tv_sec  - cnow.tv_sec)  * 1000000L
+                    + (g_ctrl_pend[i].deadline.tv_nsec - cnow.tv_nsec) / 1000L;
+                if (rem < 0) rem = 0;
+                if (rem < timeout_us) timeout_us = rem;
+            }
+            if (any) {
+                tv.tv_sec  = timeout_us / 1000000L;
+                tv.tv_usec = timeout_us % 1000000L;
             }
         }
 
@@ -6016,10 +6427,19 @@ int main(void)
                 if (do_handshake(new_fd, &client_mode, &client_fps, &handshake.peer,
                                  handshake.hello) < 0) {
                     close(new_fd);
-                } else if (fcntl(new_fd, F_SETFL, handshake.flags) < 0) {
-                    perror("screenremote: restore stream socket flags");
-                    close(new_fd);
                 } else {
+                    /* Deliberately NOT restoring the pre-handshake flags: the
+                     * stream socket stays O_NONBLOCK for the whole session.
+                     * Restoring them put it back into blocking mode with
+                     * SO_SNDTIMEO=5 s, which made write_all()'s stall budget
+                     * unreachable - write() had already burned the full socket
+                     * timeout before the budget could ever be evaluated - so a
+                     * single client that stopped reading froze the entire
+                     * single-threaded daemon for ~5 s (measured 4.811 s on
+                     * hardware 2026-08-17, pull mode).  Non-blocking makes the
+                     * EAGAIN leg the normal path, which is what that retry loop
+                     * was written for; see WRITE_ALL_FRAME_STALL_MS for why
+                     * frame writes get a roomier budget than everything else. */
                     if (client_fd >= 0) close(client_fd);
                     shadow_valid = 0;
                     client_fd = new_fd;
@@ -6064,7 +6484,6 @@ int main(void)
                         close(new_fd);
                     } else {
                         handshake.fd = new_fd;
-                        handshake.flags = flags;
                         handshake.have = handshake.need = 0;
                         handshake.peer = peer;
                         clock_gettime(CLOCK_MONOTONIC, &handshake.deadline);
@@ -6089,91 +6508,55 @@ int main(void)
             socklen_t cplen = sizeof(cpeer);
             int cfd = accept(ctrl_listen, (struct sockaddr *)&cpeer, &cplen);
             if (cfd >= 0) {
-                /* Read the first line up front (needed either way: to check
-                 * against the read-only allowlist, or to decide CTRL_PERSIST
-                 * vs one-shot for an owned connection). */
-                char firstline[CTRL_LINE_MAX]; int fl = 0, fl_overflow = 0;
-                struct timeval rto = {0, 200000};  /* 200 ms read timeout */
-                struct timeval sto = {2, 0};        /* 2 s send timeout - unauth replies must not block forever either */
-                struct timespec deadline;
-                set_cloexec(cfd);
-                setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &rto, sizeof(rto));
-                setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &sto, sizeof(sto));
-                /* A per-byte 200 ms recv timeout alone doesn't bound the whole
-                 * read: a client trickling one byte every <200ms with no
-                 * newline keeps every individual recv() succeeding forever,
-                 * freezing this single-threaded daemon's entire main loop
-                 * indefinitely - reachable pre-auth, from any LAN host, no
-                 * credentials (found 2026-07-16). Cap the WHOLE line read to a
-                 * 1 s wall-clock deadline too, independent of per-byte timing. */
-                clock_gettime(CLOCK_MONOTONIC, &deadline);
-                deadline.tv_sec += 1;
-                for (;;) {
-                    char c;
-                    struct timespec now;
-                    clock_gettime(CLOCK_MONOTONIC, &now);
-                    if (now.tv_sec > deadline.tv_sec ||
-                        (now.tv_sec == deadline.tv_sec && now.tv_nsec > deadline.tv_nsec)) {
-                        close(cfd); cfd = -1; break;
-                    }
-                    if (recv(cfd, &c, 1, 0) != 1) { close(cfd); cfd = -1; break; }
-                    if (c == '\n') break;
-                    if (fl < (int)sizeof(firstline) - 1)
-                        firstline[fl++] = c;
-                    else
-                        fl_overflow = 1;   /* consume to newline, then reject */
-                }
-                if (cfd >= 0) {
-                    firstline[fl] = '\0';
-                    struct timeval zero = {0, 0};
-                    setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &zero, sizeof(zero));
-
-                    int is_readonly = cmd_class(firstline) != CMD_MUTATING;
-                    int owned = (g_ctrl_allowed_ip != 0 &&
-                                 cpeer.sin_addr.s_addr == g_ctrl_allowed_ip);
-
-                    if (fl_overflow) {
-                        /* Over-length first line - reject explicitly instead of
-                         * acting on a silently-truncated command. */
-                        write_all(cfd, "ERR LINE_TOO_LONG\n", 18);
+                struct timeval sto = {2, 0};   /* 2 s send timeout - an unauth
+                                                * reply must not block forever */
+                int i, cflags;
+                for (i = 0; i < CTRL_PEND_MAX && g_ctrl_pend[i].fd >= 0; i++)
+                    ;
+                if (i >= CTRL_PEND_MAX) {
+                    /* Unreachable: the listener is only in the select set while
+                     * a slot is free.  Closing here rather than parking keeps
+                     * that invariant from becoming a silent fd leak. */
+                    close(cfd);
+                } else {
+                    set_cloexec(cfd);
+                    setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &sto, sizeof(sto));
+                    cflags = fcntl(cfd, F_GETFL, 0);
+                    if (cflags < 0 || fcntl(cfd, F_SETFL, cflags | O_NONBLOCK) < 0) {
                         close(cfd);
-                    } else if (is_readonly) {
-                        /* Always one-shot regardless of ownership - never
-                         * upgrades to CTRL_PERSIST, so it can't steal ctrl_fd
-                         * from the owning client. */
-                        process_ctrl_cmd(firstline, cfd);
-                        close(cfd);
-                    } else if (owned) {
-                        if (strcmp(firstline, "CTRL_PERSIST") == 0) {
-                            /* Persistent connection: replace any previous ctrl_fd.
-                             * Via ctrl_fd_close() so a SysEx still parked on the
-                             * OLD session can't outlive it holding a stale fd. */
-                            ctrl_fd_close();
-                            ctrl_fd   = cfd;
-                            g_ctrl_persist_ip = cpeer.sin_addr.s_addr;
-                            ctrl_lb_n = 0;
-                            ctrl_lb_overflow = 0;
-                            /* Mark non-blocking so handle_ctrl_persistent_data() never stalls */
-                            int flags = fcntl(ctrl_fd, F_GETFL, 0);
-                            fcntl(ctrl_fd, F_SETFL, flags | O_NONBLOCK);
-                            fprintf(stderr, "screenremote: persistent ctrl from %s\n",
-                                    inet_ntoa(cpeer.sin_addr));
-                        } else {
-                            /* One-shot: firstline already read; process it and close.
-                             * Exception: SYSEX starts an async capture - fd stays open
-                             * until sysex_finish() sends the response and closes it. */
-                            process_ctrl_cmd(firstline, cfd);
-                            if (!(sysex_pending && sysex_resp_fd == cfd))
-                                close(cfd);
-                        }
                     } else {
-                        fprintf(stderr, "screenremote: ctrl rejected from %s\n",
-                                inet_ntoa(cpeer.sin_addr));
-                        close(cfd);
+                        g_ctrl_pend[i].fd       = cfd;
+                        g_ctrl_pend[i].peer     = cpeer;
+                        g_ctrl_pend[i].len      = 0;
+                        g_ctrl_pend[i].overflow = 0;
+                        clock_gettime(CLOCK_MONOTONIC, &g_ctrl_pend[i].deadline);
+                        g_ctrl_pend[i].deadline.tv_sec += CTRL_PEND_DEADLINE_S;
                     }
                 }
             }
         }
+
+        /* Service parked ctrl connections, then expire any that never completed
+         * a line inside CTRL_PEND_DEADLINE_S. */
+        {
+            struct timespec cnow;
+            int i;
+            clock_gettime(CLOCK_MONOTONIC, &cnow);
+            for (i = 0; i < CTRL_PEND_MAX; i++) {
+                struct ctrl_pending *p = &g_ctrl_pend[i];
+                if (p->fd < 0)
+                    continue;
+                if (FD_ISSET(p->fd, &rfds))
+                    ctrl_pending_service(p);
+                if (p->fd < 0)
+                    continue;              /* released by the service call */
+                if (cnow.tv_sec > p->deadline.tv_sec ||
+                        (cnow.tv_sec == p->deadline.tv_sec &&
+                         cnow.tv_nsec >= p->deadline.tv_nsec))
+                    ctrl_pending_release(p, 1);
+            }
+        }
+
 
         /* Ownership may have changed since this persistent session was
          * established (a new stream client took over, the owner disconnected,
@@ -6226,9 +6609,14 @@ int main(void)
     }
 
     /* Clean shutdown: clear fb0 so fbcon can resume, close sockets. */
+    /* Land any in-flight TEMPO/DAMPER ramp on its commanded target first, while
+     * nks4_inject is still loaded - see nks4_analog_ramp_finish_all(). */
+    nks4_analog_ramp_finish_all();
     if (kmsg_pid > 0) { kill(kmsg_pid, SIGTERM); waitpid(kmsg_pid, NULL, 0); kmsg_pid = -1; }
     if (client_fd >= 0) close(client_fd);
     if (handshake.fd >= 0) close(handshake.fd);
+    /* Half-open ctrl connections that never completed a line. */
+    { int i; for (i = 0; i < CTRL_PEND_MAX; i++) ctrl_pending_release(&g_ctrl_pend[i], 1); }
     /* Deliver a still-pending SysEx (captured-so-far, or ERR TIMEOUT) before
      * tearing the socket down, so a waiting client gets an answer instead of a
      * bare EOF - and so a one-shot SysEx fd, which nothing else tracks, is
