@@ -190,7 +190,7 @@
 #include <linux/workqueue.h>
 #include <linux/notifier.h>
 #include <linux/spinlock.h>
-#include <asm/uaccess.h>
+#include <linux/uaccess.h>   /* copy_from_user + probe_kernel_read (see oa_read*) */
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Direct front-panel event injection for Korg Kronos (calls OA.ko's real Handle* methods)");
@@ -385,11 +385,59 @@ static int kptr_ok(unsigned long p)
     return p >= 0x40000000UL && p < 0xfffff000UL && (p & 3) == 0;
 }
 
+/* ---- Fault-safe reads of OA-owned memory --------------------------------
+ *
+ * kptr_ok() only rejects obviously-garbage pointers (null, misaligned, out of
+ * kernel range).  It cannot tell a plausible address from an unmapped one, and
+ * a raw dereference of the latter is an immediate oops - on a production board
+ * that means the synth dies with no console to say why.  That is not
+ * hypothetical: midi_bridge.c hit exactly this on real hardware (2026-07-16,
+ * see the comment above its tap_read32) and fixed it the same way.
+ *
+ * Every address this module dereferences is externally supplied and only ever
+ * range-checked:
+ *   - fn_switch / fn_setled arrive as insmod params that the daemon resolved
+ *     from /proc/kallsyms; OA can be unloaded between that lookup and our read.
+ *   - sinstance_override is module_param(..., 0644), i.e. writable on a LIVE
+ *     synth, so a single mistyped sysfs write would otherwise be fatal.
+ * probe_kernel_read() routes all of these through the kernel's fault exception
+ * tables, turning an oops into a clean "derivation failed" return.
+ *
+ * (The comment on sinstance_override cites eva_mode.ko's sm_pommi_addr as the
+ * precedent for a live-writable address param.  Worth noting that eva_mode
+ * reads that address through a faulting-safe path too - read_eva_u32() - so the
+ * precedent argues for this treatment, not against it.) */
+static int oa_read8(unsigned long addr, uint8_t *out)
+{
+    return probe_kernel_read(out, (void *)addr, sizeof(*out)) == 0;
+}
+static int oa_read32(unsigned long addr, uint32_t *out)
+{
+    return probe_kernel_read(out, (void *)addr, sizeof(*out)) == 0;
+}
+
+/* Read a pointer out of a .bss singleton slot.  Returns NULL if the slot address
+ * itself is implausible, if the slot is unmapped, or if the value read back is
+ * not a plausible kernel pointer - so callers get one NULL check instead of
+ * three separate failure modes. */
+static void *oa_read_ptr(unsigned long slot)
+{
+    unsigned long v;
+
+    if (!kptr_ok(slot))
+        return NULL;
+    if (probe_kernel_read(&v, (void *)slot, sizeof(v)) != 0)
+        return NULL;
+    return kptr_ok(v) ? (void *)v : NULL;
+}
+
 /* Read the 4-byte relocated immediate of a `mov eax, ds:X` at fn+operand_off,
- * asserting the opcode byte at fn+opcode_off first. Returns 0 on any mismatch. */
+ * asserting the opcode byte at fn+opcode_off first. Returns 0 on any mismatch
+ * or on an unreadable address. */
 static unsigned long read_moffs32(unsigned long fn, int opcode_off, int operand_off)
 {
-    const unsigned char *p = (const unsigned char *)fn;
+    uint8_t  opcode;
+    uint32_t imm;
 
     /* Range check only - deliberately NOT kptr_ok(), which also demands 4-byte
      * alignment. That is correct for the .bss slot we return (a 4-byte-aligned
@@ -401,12 +449,14 @@ static unsigned long read_moffs32(unsigned long fn, int opcode_off, int operand_
      * functions onto an odd address. */
     if (fn < 0x40000000UL || fn >= 0xfffff000UL)
         return 0;
-    if (p[opcode_off] != OPCODE_MOV_EAX_MOFFS32)
+    if (!oa_read8(fn + opcode_off, &opcode) || opcode != OPCODE_MOV_EAX_MOFFS32)
         return 0;
     /* uint32_t, not unsigned long: the operand of `mov eax,moffs32` is exactly
      * 4 bytes. Same width on this i386 target either way, but the intent is
      * the instruction encoding, not the host word size. */
-    return (unsigned long)*(const uint32_t *)(fn + operand_off);
+    if (!oa_read32(fn + operand_off, &imm))
+        return 0;
+    return (unsigned long)imm;
 }
 
 /* Dereference CSTGFrontPanel::sInstance fresh on every call - cheap, and
@@ -425,12 +475,8 @@ static void *frontpanel_this(void)
      * rmmod/insmod cycle on a live synth - same contract eva_mode.ko's
      * sm_pommi_addr already offers. Takes precedence over everything below. */
     slot = sinstance_override;
-    if (slot) {
-        if (!kptr_ok(slot))
-            return NULL;
-        p = *(void **)slot;
-        return kptr_ok((unsigned long)p) ? p : NULL;
-    }
+    if (slot)
+        return oa_read_ptr(slot);
     if (fn_sinstance_get) {
         sinstance_get_t g = (sinstance_get_t)fn_sinstance_get;
         p = g();
@@ -438,8 +484,7 @@ static void *frontpanel_this(void)
     }
     if (!sinstance_addr)
         return NULL;
-    p = *(void **)sinstance_addr;
-    return kptr_ok((unsigned long)p) ? p : NULL;
+    return oa_read_ptr(sinstance_addr);
 }
 
 /* The `this` argument for the three handlers that provably never read it
@@ -456,11 +501,8 @@ static void *blind_this(void)
 
     if (p)
         return p;
-    if (global_sinstance_addr) {
-        p = *(void **)global_sinstance_addr;
-        if (kptr_ok((unsigned long)p))
-            return p;
-    }
+    if (global_sinstance_addr)
+        return oa_read_ptr(global_sinstance_addr);
     return NULL;
 }
 

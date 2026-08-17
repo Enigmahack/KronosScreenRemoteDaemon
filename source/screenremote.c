@@ -763,18 +763,45 @@ static int check_auth(const char *user, const char *pass, const char **out_reaso
     return -2;
 }
 
+/* Copy src into dst (always NUL-terminated, at most cap bytes), replacing every
+ * byte that isn't printable ASCII with '.'.
+ *
+ * The log is one record per line, and reason strings can carry attacker-chosen
+ * bytes: do_handshake() builds its failure reason around `user`, which is up to
+ * 64 raw bytes taken straight off the wire and NUL-terminated without any
+ * validation - read BEFORE authentication. Without this, an unauthenticated
+ * remote peer could embed a newline in the username and append arbitrary forged
+ * records to access.log, including plausible ACCEPTED ones, making the log
+ * useless as evidence. Sanitizing here rather than at the call site keeps that
+ * true for every current and future caller. */
+static void log_sanitize(char *dst, size_t cap, const char *src)
+{
+    size_t i;
+
+    if (cap == 0) return;
+    for (i = 0; i + 1 < cap && src[i]; i++) {
+        unsigned char c = (unsigned char)src[i];
+        dst[i] = (c >= 0x20 && c < 0x7f) ? (char)c : '.';
+    }
+    dst[i] = '\0';
+}
+
 static void log_access(const char *ip, int accepted, const char *reason)
 {
     time_t t = time(NULL);
     char ts[32];
+    char safe[256];       /* >= the 192-byte logbuf do_handshake() passes in */
     struct tm *ti = localtime(&t);
     strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", ti);
     FILE *f = fopen(SCREENREMOTE_DIR "/access.log", "a");
     if (!f) return;
+    if (reason)
+        log_sanitize(safe, sizeof(safe), reason);
+    /* ip is always inet_ntoa() output, so it needs no sanitizing. */
     fprintf(f, "%s  %-15s  %s%s%s\n", ts, ip,
             accepted ? "ACCEPTED" : "REJECTED",
             reason   ? "  "       : "",
-            reason   ? reason     : "");
+            reason   ? safe       : "");
     fclose(f);
 }
 
@@ -3386,6 +3413,17 @@ static void kallsyms_resolve(struct sym_probe *probes, int nprobes)
         while (unresolved > 0 && fgets(line, sizeof(line), f)) {
             unsigned long addr; char type, name[256];
             if (sscanf(line, "%lx %c %255s", &addr, &type, name) != 3) continue;
+            /* A zero address is never a usable symbol here, and accepting one
+             * would desync the bookkeeping below: *probes[i].out would stay 0 -
+             * still "unresolved" by the !*probes[i].out test - while `unresolved`
+             * had already been decremented for it. Both loops key off
+             * `unresolved > 0`, so they could exit with probes still unfilled;
+             * worse, the same line matching again in pass 2 would decrement it
+             * past zero. kallsyms renders 0 for restricted reads (kptr_restrict),
+             * which this 2.6.32-as-root context does not produce - so this is
+             * belt-and-braces, kept because both callers treat an unresolved
+             * probe as terminal and non-retryable for the whole boot. */
+            if (addr == 0) continue;
             if (pass == 0 &&
                 type != 't' && type != 'T' && type != 'w' && type != 'W') continue;
             if (is_gcc_clone(name)) continue;

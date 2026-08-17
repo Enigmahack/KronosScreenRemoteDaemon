@@ -1407,7 +1407,7 @@ Every authentication attempt (success or failure) is appended to `/korg/rw/scree
 | Maximum password length | 128 bytes | Enforced during handshake; buffer is zeroed after auth |
 | Maximum concurrent stream clients | 1 | New connection replaces existing client |
 | Maximum concurrent control connections | 1 persistent + transient one-shots | New CTRL_PERSIST replaces previous persistent session |
-| Control line buffer | 2048 bytes | Persistent mode; lines longer than this are silently truncated |
+| Control line buffer | 8320 bytes | Persistent mode; lines longer than this are rejected with `ERR LINE_TOO_LONG\n` rather than silently truncated |
 | Control port first-line deadline | 1 second | Wall-clock, from accept to a complete newline-terminated line; see Section 13 (1.11.2) |
 | Control port reply send timeout | 2 seconds | `SO_SNDTIMEO`; see Section 13 (1.11.2) |
 | Held-pad watchdog | 10 seconds | Force-releases a `TOUCH_DOWN`-triggered chord with no matching `TOUCH_UP`; see Section 7 `PADMAP_OFF` note (1.11.2) |
@@ -1437,7 +1437,7 @@ Every authentication attempt (success or failure) is appended to `/korg/rw/scree
 | SysEx capture timeout | ~5 seconds | Initial 5 s recv timeout, then 1 s for trailing data |
 | MIDI bridge max clients | 8 | Connections beyond this are rejected with no response |
 | MIDI bridge SysEx stream chunk | 1024 bytes | SysEx is flushed to clients in <=1 KB chunks; large objects (e.g. a ~79 KB Set List) stream with no total size cap |
-| MIDI bridge output ring | 16384 bytes | Kernel lock-free single-producer/single-consumer ring; drops only on genuine overflow (unread data preserved); overflow byte count in `/proc/.midi_ports` as `ring_overflow_bytes` |
+| MIDI bridge output ring | 65536 bytes | Kernel lock-free single-producer/single-consumer ring; drops only on genuine overflow (unread data preserved); overflow byte count in `/proc/.midi_ports` as `ring_overflow_bytes` |
 | MIDI bridge client send buffer | 262144 bytes | `SO_SNDBUF` per client socket, so a stalled client can't drop a chunk mid-dump |
 | MIDI bridge inbound buffer | 4096 bytes | Per-write maximum for MIDI injection; split larger payloads across writes |
 | Touch calibration: `touch_x_offset` | 10 | Pixels added to x before ADC scaling |

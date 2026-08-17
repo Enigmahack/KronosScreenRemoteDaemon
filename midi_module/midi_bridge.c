@@ -67,6 +67,7 @@
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 #include <linux/spinlock.h>
+#include <linux/mutex.h>
 #include <linux/notifier.h>
 #include <linux/workqueue.h>
 
@@ -249,8 +250,29 @@ static uint32_t uni_wpos = 0;
 static uint32_t uni_rpos = 0;
 static uint32_t uni_overflow = 0;
 
-/* Drain and consumer both run in the /proc/.midi_ring reader's context (see
- * ring_fops_read), so uni_ring is single-threaded and needs no lock. */
+/* Serializes everything that touches uni_rpos/uni_wpos: ring_fops_read (which
+ * both drains the taps into the ring AND consumes from it) and ring_fops_write
+ * (which resets the read cursor).
+ *
+ * A mutex rather than ring_lock, for two reasons: the consumer's critical
+ * section spans copy_to_user(), which can sleep and therefore cannot run under a
+ * spinlock; and both fops are only ever called from process context on a read()/
+ * write() syscall, where sleeping is fine.
+ *
+ * This used to rely on "the consumer is single-threaded (midi_tcp)" as an
+ * unenforced assumption, leaving `uni_rpos += take` as a non-atomic
+ * read-modify-write outside any lock while ring_fops_write assigned uni_rpos
+ * under ring_lock.  Two concurrent readers would double-advance the cursor
+ * (losing and duplicating bytes), and a reader racing a writer would clobber the
+ * reset.  Nothing but convention stopped a second opener - and /proc/.midi_ring
+ * was mode 0666 at the time, so "convention" meant any local user.
+ *
+ * The codec side keeps ring_lock: tap_claim_slots/tap_release_slots are also
+ * reached from the module notifier and the inject path, which must not sleep.
+ * uni_wpos is written only by tap_drain_one(), reachable only via tap_drain(),
+ * which is called from exactly one place - ring_fops_read() - i.e. only ever
+ * with this mutex already held. */
+static DEFINE_MUTEX(ring_io_mutex);
 
 /* ------------------------------------------------------------------ */
 /*  Out-queue tap: resolve, claim a reader, drain, release            */
@@ -546,6 +568,22 @@ static ssize_t ring_fops_read(struct file *file, char __user *buf,
                               size_t count, loff_t *ppos)
 {
     uint32_t avail, take, off, first;
+    ssize_t  ret;
+
+    /* Whole operation under ring_io_mutex - see its definition.  The cursor
+     * update at the bottom is a read-modify-write that must not interleave with
+     * another reader or with ring_fops_write's reset.
+     *
+     * mutex_lock(), NOT mutex_lock_interruptible(): an interruptible acquire
+     * would hand callers a brand-new -EINTR failure mode, and midi_tcp re-arms
+     * its 1 kHz burst cadence only when read() returns > 0 (see fast_polls in
+     * midi_tcp.c's main loop).  A signal-interrupted read during a SysEx dump
+     * would therefore drop the poller back to the idle cadence mid-burst -
+     * exactly when latency matters.  Nothing here justifies that: the critical
+     * section is bounded (one tap_drain plus at most two copy_to_user chunks),
+     * the uncontended acquire never blocks, and the only contention is the
+     * second-reader case this mutex was added to make safe. */
+    mutex_lock(&ring_io_mutex);
 
     /* Drain the tapped queues into uni_ring first, in this reader's context.
      * ring_lock + oa_dead guard against OA teardown mid-drain.
@@ -554,8 +592,11 @@ static ssize_t ring_fops_read(struct file *file, char __user *buf,
      * doing that 1000x/sec disrupts the RTAI real-time engine under load (confirmed
      * on hardware: killing the poller un-froze EVA).  So take the IRQ-off lock ONLY
      * when there is real work - a dump window is open, or a slot is still held and
-     * needs releasing now that the window closed.  At idle this is a lock-free,
-     * interrupt-safe "ring is empty -> return 0", with no RT impact. */
+     * needs releasing now that the window closed.  At idle this stays an
+     * interrupt-safe "ring is empty -> return 0", with no RT impact: the only
+     * lock taken on that path is ring_io_mutex above, whose uncontended fast
+     * path is a plain atomic op and never disables interrupts - the property
+     * this comment exists to protect is about spin_lock_irqsave specifically. */
     if (tap_shared || time_before(jiffies, drain_until) || slots_held) {
         spin_lock(&ring_lock);
         if (!oa_dead)
@@ -564,23 +605,31 @@ static ssize_t ring_fops_read(struct file *file, char __user *buf,
     }
 
     avail = uni_wpos - uni_rpos;
-    if (avail == 0)
-        return 0;
+    if (avail == 0) {
+        ret = 0;
+        goto out;
+    }
 
     /* Serve up to `count` bytes straight from uni_ring (no bounce buffer, so the
-     * per-read size isn't capped - the daemon can drain multi-MB dumps fast). The
-     * consumer is single-threaded (midi_tcp); copy in at most two chunks to span
-     * the ring wrap. */
+     * per-read size isn't capped - the daemon can drain multi-MB dumps fast).
+     * Copy in at most two chunks to span the ring wrap. */
     take = (avail < count) ? avail : count;
     off  = uni_rpos & UNI_RING_MASK;
     first = UNI_RING_SIZE - off;
     if (first > take) first = take;
-    if (copy_to_user(buf, uni_ring + off, first))
-        return -EFAULT;
-    if (take > first && copy_to_user(buf + first, uni_ring, take - first))
-        return -EFAULT;
+    if (copy_to_user(buf, uni_ring + off, first)) {
+        ret = -EFAULT;
+        goto out;
+    }
+    if (take > first && copy_to_user(buf + first, uni_ring, take - first)) {
+        ret = -EFAULT;
+        goto out;
+    }
     uni_rpos += take;
-    return (ssize_t)take;
+    ret = (ssize_t)take;
+out:
+    mutex_unlock(&ring_io_mutex);
+    return ret;
 }
 
 /* A write means "reset my read cursor" - midi_tcp does this on a new client so it
@@ -590,6 +639,12 @@ static ssize_t ring_fops_write(struct file *file, const char __user *buf,
                                size_t count, loff_t *ppos)
 {
     int i;
+
+    /* Same mutex as the reader (and, per its comment there, uninterruptibly):
+     * this assignment to uni_rpos would otherwise be clobbered by a concurrent
+     * reader's `uni_rpos += take`. */
+    mutex_lock(&ring_io_mutex);
+
     spin_lock(&ring_lock);
     uni_rpos = uni_wpos;
     /* Only resync queues we currently hold a slot on.  When no dump window is open
@@ -615,6 +670,7 @@ static ssize_t ring_fops_write(struct file *file, const char __user *buf,
             probe_kernel_write((void *)(t->ringctl + RC_RCUR0 + t->reader_idx * 4), &t->cursor, sizeof(t->cursor));
         }
     spin_unlock(&ring_lock);
+    mutex_unlock(&ring_io_mutex);
     return (ssize_t)count;
 }
 
@@ -876,14 +932,24 @@ static void midi_setup(struct work_struct *work)
         printk(KERN_WARNING "midi_bridge: regoutport not set - MIDI OUT capture unavailable\n");
     }
 
-    proc_midi_in = create_proc_entry(".midi_in", 0666, NULL);
+    /* 0600, not 0666: writing here injects arbitrary MIDI into the running synth
+     * engine, so it must not be world-writable.  The only openers are the two
+     * root-spawned daemons (midi_tcp.c's "/proc/.midi_in" open and
+     * screenremote.c's midi_in_fd), so nothing legitimate loses access.  Matches
+     * the 0200/0444 convention every other node in this project already uses. */
+    proc_midi_in = create_proc_entry(".midi_in", 0600, NULL);
     if (proc_midi_in)
         proc_midi_in->write_proc = midi_write;
     else
         printk(KERN_ERR "midi_bridge: create_proc_entry(.midi_in) failed\n");
 
     if (have_out) {
-        proc_midi_ring = create_proc_entry(".midi_ring", 0666, NULL);
+        /* 0600, not 0666: reads are destructive (they advance the shared read
+         * cursor) and a write resets it, so an unprivileged opener could starve
+         * or desync midi_tcp's stream.  ring_io_mutex now makes a second reader
+         * safe rather than corrupting, but "safe" still means midi_tcp silently
+         * loses bytes - keep the node to root. */
+        proc_midi_ring = create_proc_entry(".midi_ring", 0600, NULL);
         if (proc_midi_ring)
             proc_midi_ring->proc_fops = &ring_fops;
 
