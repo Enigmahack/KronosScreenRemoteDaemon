@@ -189,7 +189,7 @@
 #include <linux/proc_fs.h>
 #include <linux/workqueue.h>
 #include <linux/notifier.h>
-#include <linux/spinlock.h>
+#include <linux/mutex.h>
 #include <linux/uaccess.h>   /* copy_from_user + probe_kernel_read (see oa_read*) */
 
 MODULE_LICENSE("GPL");
@@ -278,7 +278,26 @@ typedef void *(*sinstance_get_t)(void)
 /*  State                                                              */
 /* ------------------------------------------------------------------ */
 
-static DEFINE_SPINLOCK(inj_lock);
+/* Serializes everything that touches OA-owned memory: the Handle* dispatches in
+ * inject_write_proc(), status_read_proc()'s snapshot, and the OA-unload notifier
+ * that sets oa_dead.
+ *
+ * A MUTEX, not the spin_lock_irqsave this used to be (KERNEL-2).  All three
+ * acquisition sites are process context - a /proc write(2), a /proc read(2), and
+ * blocking_notifier_call_chain() from the delete_module(2) syscall - so nothing
+ * takes it from an interrupt and the irqsave bought nothing.  What it cost was
+ * real: interrupts disabled across an arbitrary OA.ko call, on an RTAI box, which
+ * is both an RT-latency hazard and a hard sleeping-while-atomic bug the moment
+ * any OA handler allocates GFP_KERNEL or takes a mutex of its own.  A mutex
+ * removes that class outright rather than measuring its tail per dispatch path.
+ *
+ * It also closes the same unload race midi_bridge's oa_call_mutex does: this
+ * kernel runs mod->exit() BEFORE the MODULE_STATE_GOING notifier and
+ * free_module() AFTER it (kernel/module.c:871-880), so holding the lock across
+ * the Handle* call makes the notifier wait for an in-flight injection instead of
+ * letting OA's .text be vfree'd underneath it.  (OA's own exit() has still run by
+ * then - see that comment; rmmod OA remains unsupported.) */
+static DEFINE_MUTEX(inj_lock);
 static int oa_dead;
 
 static struct proc_dir_entry *proc_inject;
@@ -619,17 +638,16 @@ static int inject_write_proc(struct file *file, const char __user *buf,
     char kbuf[64];
     size_t n = count < sizeof(kbuf) - 1 ? count : sizeof(kbuf) - 1;
     int a = 0, b = 0, c = 0, d = 0;
-    unsigned long flags;
     int rc = -EINVAL;
 
     if (copy_from_user(kbuf, buf, n))
         return -EFAULT;
     kbuf[n] = '\0';
 
-    spin_lock_irqsave(&inj_lock, flags);
+    mutex_lock(&inj_lock);
     if (oa_dead) {
         cnt_gated++;
-        spin_unlock_irqrestore(&inj_lock, flags);
+        mutex_unlock(&inj_lock);
         return -ENODEV;
     }
     strlcpy(last_cmd, kbuf, sizeof(last_cmd));
@@ -669,7 +687,7 @@ static int inject_write_proc(struct file *file, const char __user *buf,
     } else {
         cnt_badcmd++;
     }
-    spin_unlock_irqrestore(&inj_lock, flags);
+    mutex_unlock(&inj_lock);
 
     return rc == 0 ? (int)count : -EINVAL;
 }
@@ -719,7 +737,6 @@ static int status_read_proc(char *page, char **start, off_t off,
     unsigned char pad_flag = 0xff, pad_latch = 0xff, pad_stored = 0xff;
     char last_cmd_copy[sizeof(last_cmd)];
     int pad_rc, this_ok, blind_ok, dead;
-    unsigned long flags;
     int len;
 
     /* Everything that touches OA-owned memory happens under inj_lock, with an
@@ -730,10 +747,10 @@ static int status_read_proc(char *page, char **start, off_t off,
      * touch_pad_mode_read() dangerous rather than merely sloppy.
      *
      * The values are snapshotted into locals and formatted AFTER the lock is
-     * dropped: snprintf into a page-sized buffer has no business running inside
-     * a spinlock.  last_cmd comes along for the ride because inject_write_proc
-     * writes it under this same lock. */
-    spin_lock_irqsave(&inj_lock, flags);
+     * dropped - no reason to hold it across a page-sized snprintf.  last_cmd
+     * comes along for the ride because inject_write_proc writes it under this
+     * same lock. */
+    mutex_lock(&inj_lock);
     dead = oa_dead;
     if (dead) {
         pad_rc = -1;
@@ -745,7 +762,7 @@ static int status_read_proc(char *page, char **start, off_t off,
         blind_ok = blind_this() != NULL;
     }
     strlcpy(last_cmd_copy, last_cmd, sizeof(last_cmd_copy));
-    spin_unlock_irqrestore(&inj_lock, flags);
+    mutex_unlock(&inj_lock);
 
     len = snprintf(page, count,
         "sinstance=0x%lx fn_switch=0x%lx fn_touch=0x%lx fn_rotary=0x%lx "
@@ -781,10 +798,12 @@ static int nks4_inject_notify(struct notifier_block *nb,
     struct module *mod = data;
     if (action == MODULE_STATE_GOING &&
         (strcmp(mod->name, "OA") == 0 || strcmp(mod->name, "loadmod") == 0)) {
-        unsigned long flags;
-        spin_lock_irqsave(&inj_lock, flags);
+        /* Blocks until any injection already inside OA's .text has returned -
+         * free_module() runs after this notifier, so without the wait it could
+         * vfree code we are still executing. */
+        mutex_lock(&inj_lock);
         oa_dead = 1;
-        spin_unlock_irqrestore(&inj_lock, flags);
+        mutex_unlock(&inj_lock);
         printk(KERN_INFO "nks4_inject: %s unloading, injection disabled\n", mod->name);
     }
     return NOTIFY_OK;

@@ -41,7 +41,7 @@
  *                           -> SYSEX_RESP hex\n  or  ERR TIMEOUT\n
  *   MIDI_STATUS             -> MIDI_LOADED=n\nMIDI_IN=n\nMIDI_CAPTURE=n\nOK\n
  *   SS_TIMEOUT n            - set screensaver timeout at runtime (seconds; 0 = disable)
- *   STATE                   -> MODE=N EDITCTX=E\n
+ *   STATE                   -> MODE=N EDITCTX=E BOOT=B\n
  *                            MODE (0=init/undetected 1=Setlist 2=Combi 3=Program 4=Sequence
  *                              5=Sampling 6=Global 7=Disk) and EDITCTX (0=none 1=Program-edit-
  *                              from-Combi 2=Program-edit-from-Sequence) are read live via
@@ -83,8 +83,22 @@
  * All runtime files live under /korg/rw/screenremote/ (binary, extracted .ko modules, config, flag files).
  *
  * Boot-safety: /korg/rw/HD/ScreenRemote/.boot is written at startup and deleted only once the
- * framebuffer, network, and listeners are all up.  If it exists on entry the previous boot did not
- * complete cleanly, so midi_bridge is skipped for that boot.  Delete the file over FTP to re-enable.
+ * framebuffer, network, and listeners are all up AND every deferred module load has reached a
+ * terminal state.  If it exists on entry the previous boot did not complete cleanly, so the
+ * kernel modules are skipped for that boot and the unit comes up module-free.
+ *
+ * The flag is CLEARED on any successful startup, including that module-free recovery boot - this
+ * is deliberate, not an oversight.  It means a module bug that only bites intermittently costs one
+ * degraded boot and then self-heals, rather than latching the unit into module-free mode until
+ * someone notices and intervenes over FTP.  The trade-off is that a DETERMINISTIC boot-hang (say
+ * an OA build midi_bridge can never tap) produces an alternating brick -> recovery -> brick ->
+ * recovery cycle.  That is the intended failure mode: every other boot is a working, FTP-reachable
+ * unit, which is what makes the escape hatch below usable at all.
+ *
+ * To break out of that cycle permanently, create the /korg/rw/HD/_nomod folder over FTP on one of
+ * the recovery boots (see the kill-switch in main()) - that disables module loading on EVERY boot
+ * until the folder is removed.  Deleting .boot by hand only skips the current boot's guard; it is
+ * not the way to make a fix stick.
  *
  * Front-panel injection (BUTTON, CHORD, the TOUCH commands, WHEEL, SLIDER, KNOB,
  * VSLIDER): as of 1.10.0 these no
@@ -181,7 +195,7 @@
 #define KBD_EV_KEY  1
 
 /*  Version */
-#define SCREENREMOTE_VERSION "2.0.11"
+#define SCREENREMOTE_VERSION "2.1.0"
 #ifndef BUILD_ID
 #define BUILD_ID "dev"
 #endif
@@ -932,6 +946,16 @@ static int fb0_open(void)
                 fvar.xres, fvar.yres, fb_w, fb_h);
         goto fail;
     }
+    /* fb1 is validated as 8bpp at open; do_mirror() copies its bytes across
+     * verbatim and apply_palette_to_fb0() installs a matching 256-entry LUT, so
+     * both only make sense against an 8bpp fb0.  The geometry check above stops
+     * the out-of-bounds write; without this one a fb0 in any other depth still
+     * gets palette-index bytes mirrored into it as garbage. */
+    if (fvar.bits_per_pixel != 8) {
+        fprintf(stderr, "screenremote: fb0 bpp=%u, expected 8 - refusing to mirror\n",
+                fvar.bits_per_pixel);
+        goto fail;
+    }
 
     fb0_map = mmap(NULL, fb0_stride * fb_h,
                    PROT_WRITE, MAP_SHARED, fb0_fd, 0);
@@ -979,11 +1003,20 @@ static void ss_sample(uint8_t *out)
 {
     int i;
     uint32_t step = frame_bytes / SS_SAMPLE_N;
+    /* Walk the VISIBLE image (fb_w x fb_h) and apply the stride only when
+     * converting a (row, col) to an address.  The previous version decomposed a
+     * frame_bytes-derived (i.e. width-space) offset with fb1_stride, which is
+     * only equivalent while stride == width: on any padded framebuffer the
+     * sample points drifted, and every point whose col landed in the padding was
+     * silently forced to 0 instead of sampling a pixel.  Change detection still
+     * worked, but off the wrong points.  fb1_stride >= fb_w is enforced in
+     * fb1_open(), so the two agree on this panel today - this just stops it
+     * being an accident. */
     for (i = 0; i < SS_SAMPLE_N; i++) {
-        uint32_t off = i * step;
-        uint32_t row = off / fb1_stride;
-        uint32_t col = off % fb1_stride;
-        out[i] = (row < fb_h && col < fb_w) ? fb1_map[row * fb1_stride + col] : 0;
+        uint32_t px  = (uint32_t)i * step;   /* pixel index in the visible image */
+        uint32_t row = px / fb_w;
+        uint32_t col = px % fb_w;
+        out[i] = (row < fb_h) ? fb1_map[row * fb1_stride + col] : 0;
     }
 }
 
@@ -3096,11 +3129,17 @@ static int pad_hit_test(int x, int y, int *pad_index, int *vel)
     return 0;
 }
 
-static void send_padchord(int pad, int vel)
+/* Returns 0 if the injection reached OA, -1 if it did not.  nks4_inject answers
+ * a refused injection with -EINVAL/-ENODEV (fn_chord unresolved, oa_dead, a
+ * frontpanel_this() that won't resolve), so "the module is loaded but the event
+ * never fired" is knowable here rather than something the client has to infer.
+ * The note-off/release call sites deliberately ignore it - they are best-effort
+ * cleanup with nothing useful to do about a failure. */
+static int send_padchord(int pad, int vel)
 {
     pad = clampi(pad, 0, 7);
     vel = clampi(vel, 0, 127);
-    nks4_write("PADCHORD %d %d %d %d\n", pad, vel, 1, 1);
+    return nks4_write("PADCHORD %d %d %d %d\n", pad, vel, 1, 1);
 }
 
 /* rtf5 fallback wire writers - see the header comment's "rtf5 fallback" section and
@@ -3119,22 +3158,51 @@ static int rtf5_fd(void)
     return touch_fd;
 }
 
+/* One writer for every rtf5 packet shape: the open-check and the write live in a
+ * single place, and the length comes from the caller's own array instead of a
+ * repeated literal that has to be kept in step with it by hand. */
+static void send_rtf5_packet(const uint32_t *pkt, size_t len)
+{
+    if (rtf5_fd() >= 0)
+        (void)write(touch_fd, pkt, len);
+}
+
 static void send_rtf5_event(uint32_t dev, uint32_t code, uint32_t value)
 {
-    if (rtf5_fd() >= 0) {
-        uint32_t pkt[5] = { 0x00010014u, 0u, dev, code, value };
-        (void)write(touch_fd, pkt, 20);
-    }
+    uint32_t pkt[5] = { 0x00010014u, 0u, dev, code, value };
+    send_rtf5_packet(pkt, sizeof(pkt));
 }
 
 /* WHEEL's rtf5 packet is a distinct 16-byte/4-field shape (device fixed at 0x0d, no
- * separate value field) - not expressible through send_rtf5_event()'s 5-field layout. */
+ * separate value field) - not expressible through send_rtf5_event()'s 5-field layout,
+ * hence its own builder over the shared writer. */
 static void send_rtf5_wheel(uint32_t field3)
 {
-    if (rtf5_fd() >= 0) {
-        uint32_t pkt[4] = { 0x00010010u, 0u, 0x0000000du, field3 };
-        (void)write(touch_fd, pkt, 16);
-    }
+    uint32_t pkt[4] = { 0x00010010u, 0u, 0x0000000du, field3 };
+    send_rtf5_packet(pkt, sizeof(pkt));
+}
+
+/* Throttle helper for main()'s periodic work.  Nine blocks in the select loop
+ * were the same three lines - compare elapsed, stamp the timestamp, do the work -
+ * against nine different timestamp variables, which made the interval easy to
+ * read and the stamping easy to forget.  Returns 1 and stamps when the interval
+ * has elapsed, so a caller reads `if (due(&last_x, now, N))`.
+ *
+ * Deliberately NOT the larger "struct retry { last, t0, backoff }" the review
+ * floated.  The four retrying blocks agree on the throttle and on nothing else:
+ * nks4_inject anchors its give-up clock on its first ATTEMPT, sm_pommi on the
+ * first SIGHTING of the Eva binary (an attempt before the cryptoloop mount
+ * exists must not start the clock), midi_tcp respawn has a geometric backoff and
+ * no deadline at all, and the midi_bridge load has no deadline and a readiness
+ * STREAK rather than a retry count.  Those differences are the load-bearing part
+ * of each block; folding them into one struct would bury them.  So this factors
+ * out only the part that is genuinely identical. */
+static int due(time_t *last, time_t now, time_t interval)
+{
+    if (now - *last < interval)
+        return 0;
+    *last = now;
+    return 1;
 }
 
 /* Called once, the moment nks4_inject.ko is permanently given up on for this boot (see
@@ -3166,7 +3234,12 @@ static void nks4_give_up(const char *reason)
             "to rtf5 injection for this boot (see %s)\n", reason, RTF5_FALLBACK_LOG);
 }
 
-static void inject_touch(int type, int x, int y)
+/* Returns 0 if the touch event reached its injection path, -1 if it did not.
+ * The PADCHORD side effects above are not part of that verdict - a pad chord
+ * that fails to fire is reported through PADMAP_STATE, whereas this return
+ * describes the TOUCH itself.  The rtf5 fallback returns 0: it is a documented
+ * degraded path whose no-ops are not individually knowable (see the header). */
+static int inject_touch(int type, int x, int y)
 {
     x = clampi(x, 0, (int)fb_w - 1);
     y = clampi(y, 0, (int)fb_h - 1);
@@ -3239,9 +3312,12 @@ static void inject_touch(int type, int x, int y)
                    : (uint32_t)(cy * 255 + y_range / 2) / (uint32_t)y_range);
     touch_pace();
     if (g_nks4_loaded)
-        nks4_write("TOUCH %d %u\n", type, v_adc | (h_adc << 8u));
-    else if (g_rtf5_fallback_active)
+        return nks4_write("TOUCH %d %u\n", type, v_adc | (h_adc << 8u));
+    if (g_rtf5_fallback_active) {
         send_rtf5_event(0x11u, (uint32_t)type, v_adc | (h_adc << 8u));
+        return 0;
+    }
+    return -1;   /* neither path available - NKS4_GUARD() already rejects this */
 }
 
 /* Embedded .ko / binary extraction - atomic same-dir temp + rename.
@@ -4070,7 +4146,12 @@ static int sysex_start_async(const uint8_t *sysex, int sysex_len, int resp_fd)
     if (midi_cap_fd < 0 || sysex_pending)
         return 0;
 
-    send(midi_cap_fd, sysex, sysex_len, 0);
+    /* Arming the capture after a failed or short send leaves the client waiting
+     * out the full SYSEX_INITIAL_TIMEOUT_MS (5 s) for a reply to a request that
+     * was never delivered.  Fail immediately instead - the caller answers
+     * ERR SYSEX_FAIL. */
+    if (send(midi_cap_fd, sysex, sysex_len, 0) != sysex_len)
+        return 0;
 
     sysex_pending    = 1;
     sysex_resp_fd    = resp_fd;
@@ -4197,7 +4278,7 @@ static void sysex_poll(int readable)
                 return;
             }
             if (sysex_pending) {
-                int j;
+                int j, captured = 0;
                 for (j = 0; j < n; j++) {
                     uint8_t b = tmp[j];
                     /* Real-time bytes may appear anywhere; skip without
@@ -4211,10 +4292,7 @@ static void sysex_poll(int readable)
                     }
                     if (sysex_in_f0 && sysex_cap_offset < SYSEX_CAP_SIZE) {
                         sysex_capbuf[sysex_cap_offset++] = b;
-                        if (!sysex_got_first) {
-                            sysex_got_first = 1;
-                            clock_gettime(CLOCK_MONOTONIC, &sysex_t0);
-                        }
+                        captured = 1;
                     }
                     /* SysEx end: deliver the captured response, then keep
                      * draining the rest of the buffer (now discarded). */
@@ -4226,6 +4304,30 @@ static void sysex_poll(int readable)
                      * byte resets SysEx tracking (stray non-SysEx MIDI). */
                     if ((b & 0x80) && b != 0xF0)
                         sysex_in_f0 = 0;
+                }
+                /* Re-arm the tail timeout whenever this pass captured anything,
+                 * not just on the first byte ever seen.  sysex_t0 anchors the
+                 * timeout; leaving it at the first byte turns
+                 * SYSEX_TAIL_TIMEOUT_MS into a hard cap on the TOTAL reply, so
+                 * anything still streaming after 1 s is cut mid-dump and
+                 * delivered as a normal SYSEX_RESP the client cannot tell from
+                 * a complete one.  USB in-port routing (~800 KB/s) hides this
+                 * today; a DIN-routed reply (~3.6 KB/s) or a congested USB path
+                 * would truncate any large dump.
+                 *
+                 * Once per read(), not once per byte: a 79 KB dump is ~20 passes
+                 * of this loop but ~79000 bytes, and clock_gettime() on this
+                 * static 32-bit build is not guaranteed to be a vDSO call.  A
+                 * 4 KB granularity on a 1 s timeout is far finer than it needs.
+                 *
+                 * Guarded on sysex_pending because an F7 in this pass already
+                 * called sysex_finish() - re-arming after that would stamp state
+                 * belonging to the next capture.  The SYSEX_CAP_SIZE guard above
+                 * means a full buffer stops re-arming, so a runaway stream still
+                 * terminates on the tail timeout. */
+                if (captured && sysex_pending) {
+                    sysex_got_first = 1;
+                    clock_gettime(CLOCK_MONOTONIC, &sysex_t0);
                 }
             }
             if (n < (int)sizeof(tmp))
@@ -4306,15 +4408,24 @@ static void process_ctrl_cmd(const char *line, int fd)
              * unrecognised command it is. */
             NKS4_GUARD();
             if (sscanf(line + pl, "%d %d", &x, &y) == 2) {
-                inject_touch(touch_cmds[ti].type1, x, y);
-                if (touch_cmds[ti].type2)
-                    inject_touch(touch_cmds[ti].type2, x, y);
-                REPLY("OK\n", 3);
+                int irc = inject_touch(touch_cmds[ti].type1, x, y);
+                if (touch_cmds[ti].type2 &&
+                    inject_touch(touch_cmds[ti].type2, x, y) != 0)
+                    irc = -1;
+                /* Don't answer OK for an event that never fired - see
+                 * send_padchord()'s comment. */
+                if (irc == 0) REPLY("OK\n", 3);
+                else          REPLY("ERR INJECT_FAILED\n", 18);
             } else {
                 REPLY("ERR\n", 4);
             }
             break;
         }
+        /* "TOUCH"-prefixed but not one of the four real commands (e.g.
+         * "TOUCHX 1 2", or a bare "TOUCH"): the loop above falls through with
+         * no reply at all.  See the terminal else at the end of this chain. */
+        if (ti == 4)
+            REPLY("ERR\n", 4);
 
     } else if (strncmp(line, "PADCHORD ", 9) == 0) {
         /* Triggers the real per-pad KARMA chord (RT_chord_trigger), the
@@ -4329,8 +4440,8 @@ static void process_ctrl_cmd(const char *line, int fd)
         int pad = 0, vel = 0;
         NKS4_GUARD_STRICT();
         if (sscanf(line + 9, "%d %d", &pad, &vel) == 2) {
-            send_padchord(pad, vel);
-            REPLY("OK\n", 3);
+            if (send_padchord(pad, vel) == 0) REPLY("OK\n", 3);
+            else                              REPLY("ERR INJECT_FAILED\n", 18);
         } else {
             REPLY("ERR\n", 4);
         }
@@ -4480,9 +4591,12 @@ static void process_ctrl_cmd(const char *line, int fd)
         if (!b->name) {
             REPLY("ERR\n", 4);
         } else if (g_nks4_loaded) {
-            nks4_write("BTN %u\n", b->code);
-            mode_from_btn(b->code);
-            REPLY("OK\n", 3);
+            if (nks4_write("BTN %u\n", b->code) != 0) {
+                REPLY("ERR INJECT_FAILED\n", 18);
+            } else {
+                mode_from_btn(b->code);
+                REPLY("OK\n", 3);
+            }
         } else {
             /* rtf5 fallback: the name exists in btn_table[] (current NKS4 code
              * space) but may not exist in rtf5_btn_table[] (older, smaller code
@@ -4882,6 +4996,22 @@ static void process_ctrl_cmd(const char *line, int fd)
             "MIDI_LOADED=%d\nMIDI_IN=%d\nMIDI_CAPTURE=%d\nOK\n",
             g_midi_loaded, midi_in_fd >= 0 ? 1 : 0, midi_cap_fd >= 0 ? 1 : 0);
         REPLY(resp, rlen);
+
+    } else {
+        /* Terminal arm - nothing matched.  Without it an unrecognised command
+         * got no reply at all: a one-shot ctrl connection saw a bare EOF and a
+         * persistent one blocked until its own timeout.  A typo, or a command
+         * from a client newer than this daemon, now gets a deterministic
+         * answer instead of silence.
+         *
+         * Bare "ERR\n", not a more descriptive "ERR UNKNOWN_CMD\n": clients
+         * (tools/kscr_client.py's send_cmd among them) treat "OK\n" and "ERR\n"
+         * as the terminators that end a response read.  A longer string would
+         * technically be more informative and practically leave those clients
+         * blocked until their own timeout - which is the exact failure this
+         * arm exists to remove.  It also matches the plain "ERR\n" the argument
+         * -parse failures in this same function already return. */
+        REPLY("ERR\n", 4);
     }
 
 #undef REPLY
@@ -4950,6 +5080,8 @@ static int handle_ctrl_persistent_data(void)
         } else {
             if (errno == EAGAIN || errno == EWOULDBLOCK)
                 break;                      /* nothing left to read */
+            if (errno == EINTR)
+                continue;                   /* transient - retry, don't drop the session */
             return -1;                      /* real error */
         }
     }
@@ -5941,15 +6073,13 @@ int main(void)
          * wall-clock-driven via clock_gettime(), not tied to poll cadence) and
          * self-disables once latched (g_boot_active goes 0 and this whole
          * block stops firing). */
-        if (g_boot_active && now - last_boot_chk >= 1) {
+        if (g_boot_active && due(&last_boot_chk, now, 1)) {
             update_boot_state();
-            last_boot_chk = now;
         }
 
         /* Periodic mirror flag check */
-        if (now - last_mirror_chk >= 1) {
+        if (due(&last_mirror_chk, now, 1)) {
             check_mirror_flag();
-            last_mirror_chk = now;
 
             /* Stuck-chord watchdog: overlapping TOUCH_DOWNs and PADMAP_OFF
              * already release a held pad by hand, but a client that simply
@@ -5975,8 +6105,7 @@ int main(void)
          * consecutive seconds.  One-shot: cleared after the first load attempt.
          * Runs regardless of client connections.  In calibration mode we only
          * log the curve and never load (a brick-safe reboot for tuning). */
-        if (g_fbcurve_cal && now - last_eva_chk >= 1) {
-            last_eva_chk = now;
+        if (g_fbcurve_cal && due(&last_eva_chk, now, 1)) {
             int pct = 0, dist = 0;
             fb_metrics(&pct, &dist);
             FILE *cf = fopen(FBCURVE_LOG, "a");
@@ -5985,8 +6114,7 @@ int main(void)
                         (long)(now - g_start_time), pct, dist);
                 fclose(cf);
             }
-        } else if (g_midi_load_pending && !g_midi_loaded && now - last_eva_chk >= 1) {
-            last_eva_chk = now;
+        } else if (g_midi_load_pending && !g_midi_loaded && due(&last_eva_chk, now, 1)) {
             int pct = 0, dist = 0;
             fb_metrics(&pct, &dist);
             if (pct >= EVA_UI_NONBLACK_PCT && dist >= EVA_UI_DISTINCT_MIN) {
@@ -6016,8 +6144,7 @@ int main(void)
          * before we ever retry against a live OA - the exact failure we're
          * fixing.  g_nks4_load_pending is only ever set inside the brick-safe
          * load_mods && !boot_flag_found guard, so this inherits that gating. */
-        if (g_nks4_load_pending && !g_nks4_loaded && now - last_nks4_chk >= 1) {
-            last_nks4_chk = now;
+        if (g_nks4_load_pending && !g_nks4_loaded && due(&last_nks4_chk, now, 1)) {
             if (nks4_retry_t0 == 0)
                 nks4_retry_t0 = now;
             int st = try_load_nks4_inject(1);   /* quick probe: ~100 ms if not Live */
@@ -6072,8 +6199,7 @@ int main(void)
          *      starts once there's actually something to fail at, so a slow
          *      but otherwise-working mount can't eat into the window this
          *      loop gets to actually resolve/write once the file exists. */
-        if (g_sm_pommi_resolve_pending && now - last_sm_pommi_chk >= 1) {
-            last_sm_pommi_chk = now;
+        if (g_sm_pommi_resolve_pending && due(&last_sm_pommi_chk, now, 1)) {
             unsigned long addr = 0;
             int resolved = resolve_eva_sm_pommi_addr(&addr);   /* sets g_sm_pommi_status internally */
             int file_seen = strcmp(g_sm_pommi_status, "not_mounted_yet") != 0;
@@ -6127,8 +6253,7 @@ int main(void)
          * backoff interval instead of stalling the loop here.  See
          * MIDI_RESPAWN_MIN_S/MAX_S for why the interval has to grow. */
         if (g_midi_loaded && midi_cap_fd < 0 &&
-                now - last_midi_respawn_chk >= midi_respawn_backoff_s) {
-            last_midi_respawn_chk = now;
+                due(&last_midi_respawn_chk, now, midi_respawn_backoff_s)) {
             start_midi_capture(1);
             if (midi_cap_fd >= 0) {
                 midi_respawn_backoff_s = MIDI_RESPAWN_MIN_S;   /* recovered - re-arm fast retries */
@@ -6140,8 +6265,7 @@ int main(void)
         }
 
         /* Periodic network check - re-bind if IP changed (DHCP, link down/up) */
-        if (now - last_net_chk >= 10) {
-            last_net_chk = now;
+        if (due(&last_net_chk, now, 10)) {
             uint32_t cur_ip = find_lan_ip();
             if (cur_ip != g_bound_ip) {
                 if (client_fd >= 0) { close(client_fd); client_fd = -1; }
@@ -6197,7 +6321,7 @@ int main(void)
 
         /* Mirror update (screensaver blanks fb0 after idle timeout) */
         if (mirror_on) {
-            if (g_ss_timeout > 0 && now - last_ss_chk >= SS_CHECK_S) {
+            if (g_ss_timeout > 0 && due(&last_ss_chk, now, SS_CHECK_S)) {
                 uint8_t cur[SS_SAMPLE_N];
                 ss_sample(cur);
                 if (!ss_prev_valid || memcmp(cur, ss_prev, SS_SAMPLE_N) != 0) {
@@ -6206,7 +6330,6 @@ int main(void)
                     memcpy(ss_prev, cur, SS_SAMPLE_N);
                     ss_prev_valid = 1;
                 }
-                last_ss_chk = now;
             }
             if (g_ss_timeout > 0 && (now - ss_last_chg) >= g_ss_timeout) {
                 if (!ss_active && fb0_map) {

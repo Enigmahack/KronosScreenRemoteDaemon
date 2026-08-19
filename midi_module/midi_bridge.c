@@ -166,6 +166,11 @@ static const int QUEUE_BUF_OFF[4] = { 0x0c, 0x18, 0x24, 0x30 };
 #define RC_RCUR0  0x10   /* reader cursor[0]    */
 #define RC_RCOUNT 0x20   /* active reader count (byte) */
 #define RC_MAXREADERS 4
+/* Upper bound accepted for a queue capacity (see tap_claim_one's mask check).
+ * Far above any plausible real value - observed queues are KB-scale and the
+ * largest dump we capture is ~79 KB - but low enough that a wild read is
+ * rejected rather than accepted as a "big queue". */
+#define MAX_QUEUE_CAP (1u << 20)
 
 /* ------------------------------------------------------------------ */
 /*  MIDI IN injection state (unchanged from midi_inject)               */
@@ -189,6 +194,31 @@ static struct proc_dir_entry *proc_midi_ports;
  * into (or read) freed OA memory. */
 static DEFINE_SPINLOCK(ring_lock);
 static int oa_dead;
+
+/* Held across the actual call into OA (midi_write's fn()), and taken by the
+ * OA-unload notifier and our own exit path before they set oa_dead.
+ *
+ * Why a SECOND lock rather than just holding ring_lock across fn(): checking
+ * oa_dead under ring_lock and then dropping it before calling is race-free about
+ * the flag but says nothing about the call.  This kernel runs mod->exit() BEFORE
+ * the MODULE_STATE_GOING notifier and free_module() AFTER it (kernel/module.c:
+ * 871-880), so an injection in flight when OA unloads could previously still be
+ * executing inside OA's .text while free_module() vfree'd it.  The notifier now
+ * blocks here until that call returns.
+ *
+ * It does NOT convert ring_lock: screenremote loads this module with
+ * tap_shared=1, so ring_fops_read takes ring_lock on every read at ~1 kHz.
+ * Folding the drain and the OA call into one lock would couple that hot path to
+ * injection latency for no safety gain - the drain never calls into OA.
+ *
+ * Lock order is oa_call_mutex -> ring_lock, never the reverse.  Nothing that
+ * holds ring_lock ever takes this.
+ *
+ * NOTE this is a smaller umbrella than it looks: OA's own exit() has already run
+ * by the time our notifier fires, so a call that overlaps OA teardown still
+ * touches torn-down (if mapped) state.  rmmod OA remains unsupported; this only
+ * removes the use-after-free. */
+static DEFINE_MUTEX(oa_call_mutex);
 
 /* ------------------------------------------------------------------ */
 /*  MIDI OUT tap state                                                 */
@@ -235,6 +265,14 @@ static int tap_read32(unsigned long addr, uint32_t *out)
 static int tap_read8(unsigned long addr, uint8_t *out)
 {
     return probe_kernel_read(out, (void *)addr, sizeof(*out)) == 0;
+}
+/* Block form, for the setup-time byte-pattern scans over OA .text/.bss.  Those
+ * run in a window where OA has just been confirmed Live, but they are the same
+ * fault class as everything above and there is no reason for the module to be
+ * half-safe. */
+static int tap_readn(unsigned long addr, void *out, size_t n)
+{
+    return probe_kernel_read(out, (void *)addr, n) == 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -284,7 +322,8 @@ static DEFINE_MUTEX(ring_io_mutex);
  * pattern-scanning `fn`'s compiled bytes - see fn_outports_get above. */
 static unsigned long resolve_out_ports(unsigned long fn)
 {
-    const uint8_t *p = (const uint8_t *)fn;
+    uint8_t  op[7];
+    uint32_t disp;
 
     if (fn_outports_get) {
         ports_get_t g = (ports_get_t)fn_outports_get;
@@ -292,10 +331,16 @@ static unsigned long resolve_out_ports(unsigned long fn)
     }
 
     if (!fn) return 0;
-    if (p[0] != 0x0f || p[1] != 0xbe || p[2] != 0x50 || p[3] != 0x04 ||
-        p[4] != 0x89 || p[5] != 0x04 || p[6] != 0x95)
+    /* Fault-safe even though OA was just confirmed Live - same class as every
+     * other OA-memory read in this module (see tap_read32's comment). */
+    if (!tap_readn(fn, op, sizeof(op)))
         return 0;
-    return (unsigned long)*(const uint32_t *)(p + 7);
+    if (op[0] != 0x0f || op[1] != 0xbe || op[2] != 0x50 || op[3] != 0x04 ||
+        op[4] != 0x89 || op[5] != 0x04 || op[6] != 0x95)
+        return 0;
+    if (!tap_readn(fn + 7, &disp, sizeof(disp)))
+        return 0;
+    return (unsigned long)disp;
 }
 
 /* Resolve one queue slot of the given out-port object into a tapq entry WITHOUT
@@ -308,17 +353,52 @@ static int tap_claim_one(unsigned long portp, int qslot)
 {
     unsigned long qptr, qbuf;
     struct tapq *t;
+    uint32_t v, mask;
 
-    qptr = *(uint32_t *)(portp + QUEUE_PTR_OFF[qslot]);
-    qbuf = *(uint32_t *)(portp + QUEUE_BUF_OFF[qslot]);
+    /* taps[] holds 6 (2 shared + 4 per-port) and tap_claim_reader() never asks
+     * for more - but that is an invariant of the caller, not of this function. */
+    if (ntaps >= (int)(sizeof(taps) / sizeof(taps[0])))
+        return -1;
+
+    if (!tap_readn(portp + QUEUE_PTR_OFF[qslot], &v, sizeof(v)))
+        return -1;
+    qptr = v;
+    if (!tap_readn(portp + QUEUE_BUF_OFF[qslot], &v, sizeof(v)))
+        return -1;
+    qbuf = v;
     if (!kptr_ok(qptr) || !kptr_ok(qbuf))
         return -1;
+    if (!tap_read32(qptr + RC_MASK, &mask))
+        return -1;
+    /* mask is capacity-1, so a valid one is nonzero and 2^n - 1.
+     *
+     * This is NOT about out-of-bounds access: every use of mask is `& mask`,
+     * comparison, or subtraction, and x & m <= m for any m, so even a wild value
+     * keeps the cursor arithmetic inside the buffer it describes.  The two real
+     * failure modes are both silent:
+     *
+     *   mask = 0xffffffff -> cap = 0 -> the `avail > t->cap` resync in
+     *   tap_drain_one() fires on every call, take is always 0, and the tap
+     *   no-ops forever while still holding a reader slot on OA's queue.
+     *
+     *   A plausible-but-wrong mask is worse: the cursor stays in bounds but
+     *   indexes the WRONG positions, so we broadcast corrupted MIDI to every
+     *   hub client with no fault and nothing in the log.
+     *
+     * Refuse the queue instead, loudly - a future OS build that changes this
+     * field's offset should show up as a missing tap in the setup log, not as
+     * garbage on the wire. */
+    if (mask == 0 || (mask & (mask + 1)) != 0 || mask + 1 > MAX_QUEUE_CAP) {
+        printk(KERN_WARNING "midi_bridge: queue at 0x%lx has implausible mask "
+               "0x%08x - not tapping (offset drift?)\n", qptr, mask);
+        return -1;
+    }
 
     t = &taps[ntaps++];
     t->ringctl    = qptr;
     t->buf        = qbuf;
-    t->mask       = *(uint32_t *)(qptr + RC_MASK);
-    t->cap        = t->mask + 1;
+    t->mask       = mask;
+    t->cap        = mask + 1;
     t->reader_idx = -1;   /* unclaimed - claimed on demand while a dump window is open */
     t->cursor     = 0;
     return 0;
@@ -422,7 +502,9 @@ static int tap_claim_reader(void)
 
     /* First activated out-port carries the shared queue pointers. */
     for (i = 0; i < 4; i++) {
-        unsigned long v = *(uint32_t *)(out_ports + i * 4);
+        uint32_t v;
+        if (!tap_read32(out_ports + i * 4, &v))
+            continue;
         if (kptr_ok(v)) { p0 = v; break; }
     }
     if (!p0)
@@ -437,7 +519,9 @@ static int tap_claim_reader(void)
 
     /* Per-port bulk-dump queue (q3) from every activated out-port. */
     for (i = 0; i < 4; i++) {
-        unsigned long v = *(uint32_t *)(out_ports + i * 4);
+        uint32_t v;
+        if (!tap_read32(out_ports + i * 4, &v))
+            continue;
         if (kptr_ok(v))
             tap_claim_one(v, 3);
     }
@@ -469,7 +553,7 @@ static void tap_release_reader(void)
  * throttle OA's real output. */
 static void tap_drain_one(struct tapq *t)
 {
-    uint32_t wpos, avail, space, used, take, i;
+    uint32_t wpos, avail, space, used, take, done;
 
     if (!t->ringctl || t->reader_idx < 0 || !t->buf)
         return;
@@ -503,9 +587,33 @@ static void tap_drain_one(struct tapq *t)
     space = (used < UNI_RING_SIZE) ? (UNI_RING_SIZE - used) : 0;
     take  = (avail < space) ? avail : space;
 
-    for (i = 0; i < take; i++)
-        uni_ring[(uni_wpos + i) & UNI_RING_MASK] =
-            *(const uint8_t *)(t->buf + ((t->cursor + i) & t->mask));
+    /* Fault-safe, wrap-split copy.  t->buf points into the codec's ioremapped
+     * region and is captured once at setup - exactly the staleness class that
+     * oopsed on a raw t->ringctl deref (2026-07-16).  A plain C load here has no
+     * exception-table entry, so if that region is unmapped between the (safe)
+     * wpos read above and this copy it is an oops in process context, while
+     * holding ring_lock, on a board with no console.
+     *
+     * BOTH wraps have to be split, not just the source: uni_ring is a fixed
+     * 64 KB array, so a copy sized only against the queue's own wrap can run off
+     * its end.  At most three iterations.  Bytes already copied before a fault
+     * are kept (uni_wpos/cursor advance by `done`) rather than dropped. */
+    done = 0;
+    while (done < take) {
+        uint32_t soff = (t->cursor + done) & t->mask;
+        uint32_t doff = (uni_wpos  + done) & UNI_RING_MASK;
+        uint32_t n    = take - done;
+        if (n > t->cap - soff)        n = t->cap - soff;
+        if (n > UNI_RING_SIZE - doff) n = UNI_RING_SIZE - doff;
+        if (probe_kernel_read(uni_ring + doff, (void *)(t->buf + soff), n) != 0) {
+            uni_wpos  += done;
+            t->cursor += done;
+            t->ringctl = 0;   /* data region gone - retire the tap */
+            t->reader_idx = -1;
+            return;
+        }
+        done += n;
+    }
     uni_wpos  += take;
     t->cursor += take;
 
@@ -722,9 +830,19 @@ static int ports_read_proc(char *page, char **start, off_t off,
 /*  MIDI IN: port discovery + injection (unchanged from midi_inject)   */
 /* ------------------------------------------------------------------ */
 
+/* Read sMidiInPorts[idx] fault-safely.  Returns 0 (never a valid port) both for
+ * an absent entry and an unreadable one - callers already treat 0 as "skip". */
+static uint32_t inport_at(int idx)
+{
+    uint32_t addr;
+    if (!ports_array || !tap_read32((unsigned long)&ports_array[idx], &addr))
+        return 0;
+    return addr;
+}
+
 static void *find_port_object(void)
 {
-    uint8_t *fn_bytes;
+    uint8_t fn_bytes[11];
     int i;
 
     /* VM-testing path: skip the RegisterMidiInPort byte-pattern scan entirely
@@ -736,30 +854,37 @@ static void *find_port_object(void)
     } else {
         if (!register_fn) return NULL;
 
-        fn_bytes = (uint8_t *)register_fn;
+        /* Fault-safe read of the opcode bytes AND the disp32 that follows -
+         * see tap_read32's comment for why nothing here dereferences raw. */
+        if (!tap_readn(register_fn, fn_bytes, sizeof(fn_bytes))) {
+            printk(KERN_ERR "midi_bridge: RegisterMidiInPort unreadable\n");
+            return NULL;
+        }
         if (fn_bytes[0] != 0x0f || fn_bytes[1] != 0xbe ||
             fn_bytes[4] != 0x89 || fn_bytes[5] != 0x04 || fn_bytes[6] != 0x95) {
             printk(KERN_ERR "midi_bridge: RegisterMidiInPort pattern mismatch\n");
             return NULL;
         }
 
-        ports_array = (uint32_t *)*(uint32_t *)(fn_bytes + 7);
+        ports_array = (uint32_t *)(unsigned long)
+                      *(uint32_t *)(fn_bytes + 7);   /* local copy - safe */
         printk(KERN_INFO "midi_bridge: sMidiInPorts at %p\n", ports_array);
     }
 
     /* Enumerate for diagnosis: type (+0x25), active-flag (+0x26 bit1), vtable. */
     for (i = 0; i < 8; i++) {
-        uint32_t addr = ports_array[i];
-        if (addr > 0x40000000) {
-            uint8_t *p = (uint8_t *)(unsigned long)addr;
+        uint32_t addr = inport_at(i), vtbl;
+        uint8_t type, flags;
+        if (addr > 0x40000000 &&
+            tap_read8(addr + 0x25, &type) && tap_read8(addr + 0x26, &flags) &&
+            tap_read32(addr, &vtbl))
             printk(KERN_INFO "midi_bridge:   inport[%d]=%08x type=0x%02x flags=0x%02x vtbl=%08x\n",
-                   i, addr, p[0x25], p[0x26], *(uint32_t *)p);
-        }
+                   i, addr, type, flags, vtbl);
     }
 
     /* Explicit index override (diagnostics). */
     if (in_port >= 0 && in_port < 8) {
-        uint32_t addr = ports_array[in_port];
+        uint32_t addr = inport_at(in_port);
         if (addr > 0x40000000) {
             printk(KERN_INFO "midi_bridge: injecting into sMidiInPorts[%d]=%08x (forced)\n",
                    in_port, addr);
@@ -775,12 +900,13 @@ static void *find_port_object(void)
      * SysEx DURING boot injects into the USB codec mid-init and wedges EVA - so
      * injection is gated by eva_ready (set by screenremote once the UI is drawn). */
     for (i = 0; i < 8; i++) {
-        uint32_t addr = ports_array[i];
-        if (addr > 0x40000000) {
-            uint8_t *p = (uint8_t *)(unsigned long)addr;
-            if ((p[0x26] & 0x02) && p[0x25] == (uint8_t)in_type) {
+        uint32_t addr = inport_at(i);
+        uint8_t type, flags;
+        if (addr > 0x40000000 &&
+            tap_read8(addr + 0x25, &type) && tap_read8(addr + 0x26, &flags)) {
+            if ((flags & 0x02) && type == (uint8_t)in_type) {
                 printk(KERN_INFO "midi_bridge: injecting into USB in-port sMidiInPorts[%d]=%08x (type=0x%02x)\n",
-                       i, addr, p[0x25]);
+                       i, addr, type);
                 return (void *)(unsigned long)addr;
             }
         }
@@ -788,9 +914,9 @@ static void *find_port_object(void)
 
     /* Fallback: first active in-port (legacy behaviour, e.g. DIN). */
     for (i = 0; i < 8; i++) {
-        uint32_t addr = ports_array[i];
-        if (addr > 0x40000000) {
-            uint8_t flags = ((uint8_t *)(unsigned long)addr)[0x26];
+        uint32_t addr = inport_at(i);
+        uint8_t flags;
+        if (addr > 0x40000000 && tap_read8(addr + 0x26, &flags)) {
             if (flags & 0x02) {
                 printk(KERN_INFO "midi_bridge: no USB in-port (type 0x%02x); "
                        "falling back to first active sMidiInPorts[%d]=%08x\n", in_type, i, addr);
@@ -820,19 +946,11 @@ static int midi_write(struct file *f, const char __user *buf,
         return count;
     }
 
-    spin_lock(&ring_lock);
-    if (oa_dead || !port_obj || !receive_fn) {
-        spin_unlock(&ring_lock);
-        return -ENODEV;
-    }
-    fn  = (receive_fn_t)receive_fn;
-    obj = port_obj;
-    spin_unlock(&ring_lock);
-
     if (len <= 0)
         return count;
-    /* Per-call buffer: /proc/.midi_in is world-writable, concurrent writers must
-     * not share one buffer (would tear a multi-byte MIDI/SysEx frame). */
+    /* Per-call buffer: concurrent writers must not share one buffer (would tear a
+     * multi-byte MIDI/SysEx frame).  Allocated and filled BEFORE oa_call_mutex -
+     * both can sleep, and neither needs to be serialized against OA teardown. */
     kbuf = kmalloc(len, GFP_KERNEL);
     if (!kbuf)
         return -ENOMEM;
@@ -840,6 +958,21 @@ static int midi_write(struct file *f, const char __user *buf,
         kfree(kbuf);
         return -EFAULT;
     }
+
+    /* Everything from the oa_dead check through the call itself is one critical
+     * section - see oa_call_mutex's comment.  This also merges what used to be
+     * two separate ring_lock sections (the target snapshot and the drain-window
+     * open), closing the gap where oa_dead could be set between them. */
+    mutex_lock(&oa_call_mutex);
+    spin_lock(&ring_lock);
+    if (oa_dead || !port_obj || !receive_fn) {
+        spin_unlock(&ring_lock);
+        mutex_unlock(&oa_call_mutex);
+        kfree(kbuf);
+        return -ENODEV;
+    }
+    fn  = (receive_fn_t)receive_fn;
+    obj = port_obj;
     inject_first = kbuf[0];
     inject_ok++;
     inject_bytes += len;
@@ -847,14 +980,23 @@ static int midi_write(struct file *f, const char __user *buf,
      * request - so the slot is held from before OA starts replying and the whole
      * dump is captured losslessly even though the drainer may poll slowly (20 ms)
      * at idle.  Claiming here (not lazily in the drain) avoids missing the reply's
-     * first bytes.  Under ring_lock, serialized with the drain's claim/release. */
-    spin_lock(&ring_lock);
+     * first bytes. */
     drain_until = jiffies + msecs_to_jiffies(DRAIN_OPEN_MS);
-    if (!oa_dead && !slots_held) { tap_claim_slots(); slots_held = 1; }
+    if (!slots_held) { tap_claim_slots(); slots_held = 1; }
     spin_unlock(&ring_lock);
+
     fn(obj, kbuf, len);
+    mutex_unlock(&oa_call_mutex);
+
     kfree(kbuf);
-    return count;
+    /* Report what was actually injected, not what was offered.  A write larger
+     * than MIDI_INJECT_MAX is clamped to `len` above, and returning `count`
+     * told the caller the whole thing went through while silently dropping the
+     * tail.  A short write is the correct write(2) answer - callers that use
+     * write_all() (screenremote, midi_tcp) then send the remainder.  Neither
+     * currently exceeds the cap, so this changes no existing behaviour; it stops
+     * a direct writer from losing bytes with no indication. */
+    return len;
 }
 
 /* ------------------------------------------------------------------ */
@@ -871,11 +1013,16 @@ static int midi_module_notify(struct notifier_block *nb,
          * disable injection and the tap. No .text to restore, no trampoline to
          * leak - the hook-free design has nothing to undo here beyond releasing
          * our reader slot while OA memory is still valid. */
+        /* oa_call_mutex first: blocks until any injection already inside OA's
+         * .text has returned, so free_module() (which runs after this notifier)
+         * cannot vfree code we are still executing. */
+        mutex_lock(&oa_call_mutex);
         spin_lock(&ring_lock);
         oa_dead   = 1;
         port_obj  = NULL;
         tap_release_reader();
         spin_unlock(&ring_lock);
+        mutex_unlock(&oa_call_mutex);
         printk(KERN_INFO "midi_bridge: %s unloading, MIDI disabled\n", mod->name);
     }
     return NOTIFY_OK;
@@ -983,12 +1130,14 @@ static void __exit midi_bridge_exit(void)
 
     /* Release our reader slot while OA memory is still valid (unless OA already
      * went away, in which case the notifier already released it). */
+    mutex_lock(&oa_call_mutex);   /* wait out any in-flight injection - see its comment */
     spin_lock(&ring_lock);
     if (!oa_dead)
         tap_release_reader();
     oa_dead  = 1;
     port_obj = NULL;
     spin_unlock(&ring_lock);
+    mutex_unlock(&oa_call_mutex);
 
     if (proc_midi_ports)
         remove_proc_entry(".midi_ports", NULL);

@@ -178,6 +178,10 @@ struct eva_candidate {
  * it (same contract as before this change). */
 #define EVA_CANDIDATE_MAX 256
 
+/* Set when find_eva_mm() aborted before scanning (candidate-array allocation
+ * failed) rather than scanning and finding no Eva - see its use below. */
+static int eva_scan_failed;
+
 static struct mm_struct *find_eva_mm(pid_t *out_pid)
 {
     struct task_struct *p;
@@ -185,9 +189,18 @@ static struct mm_struct *find_eva_mm(pid_t *out_pid)
     int ncand = 0, i, best = -1;
     struct mm_struct *result;
 
+    if (out_pid)
+        *out_pid = 0;
     cand = kmalloc(EVA_CANDIDATE_MAX * sizeof(*cand), GFP_KERNEL);
-    if (!cand)
-        return NULL;   /* extremely unlikely - caller treats as unresolved, same as any other miss */
+    if (!cand) {
+        /* Distinguish "couldn't even look" from "looked and found nothing".
+         * Both used to surface as STAGE=find_task, which on a console-less unit
+         * reads as "Eva isn't running" and sends the reader down the wrong
+         * diagnostic path entirely. */
+        eva_scan_failed = 1;
+        return NULL;
+    }
+    eva_scan_failed = 0;
 
     rcu_read_lock();
     list_for_each_entry_rcu(p, &current->tasks, tasks) {
@@ -255,7 +268,8 @@ static int eva_mode_read_proc(char *page, char **start, off_t off,
          * which used to be indistinguishable from this one (both just printed
          * RESOLVED=0) - see docs/EVA_ModeManager_probe.md's STAGE= field on
          * eva_mode_peek.c, the diagnostic this was trimmed from originally. */
-        len = snprintf(page, count, "RESOLVED=0\nSTAGE=find_task\n");
+        len = snprintf(page, count, "RESOLVED=0\nSTAGE=%s\n",
+                       eva_scan_failed ? "alloc" : "find_task");
         *eof = 1;
         return len;
     }

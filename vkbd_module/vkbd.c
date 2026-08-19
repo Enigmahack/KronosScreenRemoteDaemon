@@ -101,6 +101,7 @@
 #include <linux/input.h>
 #include <linux/proc_fs.h>
 #include <linux/workqueue.h>
+#include <linux/delay.h>
 #include <linux/list.h>
 #include <linux/slab.h>
 #include <asm/uaccess.h>
@@ -124,6 +125,28 @@ static struct vkbd_ext_dev *vkbd_current_ext;   /* NULL => target is vkbd_dev */
 static int vkbd_initial_scan_done;
 static int vkbd_relay_registered;
 static struct work_struct vkbd_reclaim_work;
+
+/* TEST-ONLY, default 0 = zero production behaviour change.  Delays the start of
+ * the deferred setup work so the unload-vs-setup race in vkbd_exit() becomes
+ * deterministic instead of depending on whether keventd happens to win.
+ *
+ * The window is between vkbd_init()'s schedule_work() and vkbd_setup() actually
+ * running: an unload landing inside it used to skip input_unregister_handler()
+ * (the flag it tests is set BY that work) and then have flush_scheduled_work()
+ * register the handler on the way out - leaving a function pointer into freed
+ * module text on the global input_handler_list.  On an idle box keventd almost
+ * always wins, so tests/kernel_safety/t3_vkbd_leak reported "not reproduced"
+ * without clearing the code path at all.  Load with setup_delay_ms=500 and the
+ * race is guaranteed: the bug reproduces on the old ordering, and the fixed
+ * ordering stays clean.  See that test's README section. */
+static int setup_delay_ms;
+module_param(setup_delay_ms, int, 0444);
+MODULE_PARM_DESC(setup_delay_ms, "test-only: ms to delay deferred setup (default 0)");
+/* Set by vkbd_exit() before it detaches the handler.  Stops disconnect() from
+ * queueing reclaim work during teardown - that work re-registers vkbd_dev, which
+ * exit is about to tear down anyway, and it only widens the window exit's final
+ * flush has to drain. Best-effort: the flush is the actual guarantee. */
+static int vkbd_exiting;
 
 /* Allocates, configures, and registers a fresh "Kronos Virtual Keyboard"
  * input_dev, publishing it as the new vkbd_dev.  Shared by the initial
@@ -178,6 +201,9 @@ static int vkbd_register_self(void)
 static void vkbd_reclaim_fn(struct work_struct *work)
 {
 	struct input_dev *old;
+
+	if (vkbd_exiting)
+		return;   /* teardown in progress - see vkbd_exiting */
 
 	spin_lock(&vkbd_target_lock);
 	if (vkbd_current_ext) {
@@ -280,7 +306,7 @@ static void vkbd_relay_disconnect(struct input_handle *handle)
 
 	/* Deferred to a workqueue - see vkbd_reclaim_fn()'s comment for why
 	 * this can't run directly here. */
-	if (need_reclaim)
+	if (need_reclaim && !vkbd_exiting)
 		schedule_work(&vkbd_reclaim_work);
 }
 
@@ -313,6 +339,31 @@ static int vkbd_write_proc(struct file *file, const char __user *buf,
 	    code == 0 || code >= KEY_CNT || value > 1)
 		return -EINVAL;
 
+	/* KNOWN LIMITATION - injection into a device that is mid-teardown.
+	 *
+	 * vkbd_target_lock makes the target selection and the input_event() below
+	 * atomic against vkbd_relay_disconnect(), which clears vkbd_current_ext
+	 * under this same lock.  So once our disconnect() has run for a device, no
+	 * further injection can reach it.
+	 *
+	 * What the lock does NOT cover is the window BEFORE that: a USB unplug
+	 * starts input_unregister_device() on the departing device, and our
+	 * disconnect() is only called part-way through that teardown.  An
+	 * input_event() landing in between goes to a device that has begun
+	 * unregistering.
+	 *
+	 * Left as a documented limitation rather than fixed, because the exposure
+	 * is genuinely small: the input core does not free the device until every
+	 * handle has detached, and our disconnect() IS one of those detaches - so
+	 * the device is still allocated for the whole window.  Closing it properly
+	 * would mean taking the kernel's global input_mutex on the injection path,
+	 * which is both far heavier than the risk justifies and deadlock-prone
+	 * (disconnect() callbacks already run with that mutex held - see
+	 * vkbd_reclaim_fn()'s comment).
+	 *
+	 * Practical trigger: unplugging a USB keyboard at the exact moment a client
+	 * injects a keystroke.  Worst realistic outcome is a dropped or misdelivered
+	 * key event, not a fault. */
 	spin_lock(&vkbd_target_lock);
 	target = vkbd_current_ext ? vkbd_current_ext->handle.dev : vkbd_dev;
 	if (!target) {
@@ -329,6 +380,9 @@ static int vkbd_write_proc(struct file *file, const char __user *buf,
 static void vkbd_setup(struct work_struct *work)
 {
 	int err;
+
+	if (setup_delay_ms)
+		msleep(setup_delay_ms);   /* test-only - see setup_delay_ms */
 
 	if (vkbd_register_self() != 0)
 		return;
@@ -369,27 +423,46 @@ static int __init vkbd_init(void)
 
 static void __exit vkbd_exit(void)
 {
-	/* Unregister the relay handler FIRST, before any flush. Real hotplug
-	 * disconnect()s can call schedule_work(&vkbd_reclaim_work) at any
-	 * time up until the handler is detached - a flush_scheduled_work()
-	 * done only up front (the original, crashing version of this
-	 * function) can return clean and then race a disconnect() landing a
-	 * moment later, scheduling reclaim work AFTER the flush already
-	 * finished. If the module unload proceeds to completion before that
-	 * freshly-scheduled work runs, the kernel later jumps into
-	 * vkbd_reclaim_fn() inside memory that's already been freed -
-	 * confirmed live 2026-07-19: a real captured oops in device_del()/
-	 * sysfs_remove_group(), from a kernel workqueue thread, right after
-	 * "last unloaded: vkbd" - textbook module-unload-vs-pending-work
-	 * use-after-free. input_unregister_handler() detaches us from every
-	 * device and removes us from the global handler list, so once it
-	 * returns, connect()/disconnect() can never fire for us again -
-	 * nothing can schedule new reclaim work after this point. The one
-	 * flush below only has to wait out whatever's already in flight,
-	 * including the synchronous disconnect() calls input_unregister_handler()
-	 * itself just made for any devices still attached when we got here. */
+	/* Four steps, and the order of every one of them is load-bearing.
+	 *
+	 * 1. Flush FIRST.  vkbd_relay_registered is set by vkbd_setup(), which
+	 *    runs from the schedule_work() in vkbd_init().  An unload landing
+	 *    between that schedule_work() and the worker actually running finds
+	 *    the flag still 0, skips the unregister in step 3 - and then the
+	 *    flush itself runs vkbd_setup(), which calls input_register_handler()
+	 *    and puts vkbd_relay_handler on the global input_handler_list moments
+	 *    before this module's text is freed.  The next event on any input
+	 *    device then calls a function pointer into freed memory.  Flushing
+	 *    first guarantees setup has either completed or will never run before
+	 *    the flag is read.  (This is why testing the flag before the flush -
+	 *    the previous shape of this function - was wrong.)
+	 *
+	 * 2. Latch vkbd_exiting so disconnect() stops queueing reclaim work.
+	 *
+	 * 3. Unregister the handler.  Real hotplug disconnect()s can call
+	 *    schedule_work(&vkbd_reclaim_work) at any time up until the handler
+	 *    is detached - a flush done ONLY up front (the original, crashing
+	 *    version of this function) can return clean and then race a
+	 *    disconnect() landing a moment later, scheduling reclaim work AFTER
+	 *    the flush already finished.  If the unload proceeds to completion
+	 *    before that work runs, the kernel later jumps into vkbd_reclaim_fn()
+	 *    inside memory that's already been freed - confirmed live 2026-07-19:
+	 *    a real captured oops in device_del()/sysfs_remove_group(), from a
+	 *    kernel workqueue thread, right after "last unloaded: vkbd".
+	 *    input_unregister_handler() detaches us from every device and removes
+	 *    us from the global handler list, so once it returns,
+	 *    connect()/disconnect() can never fire for us again.
+	 *
+	 * 4. Flush AGAIN to wait out whatever is still in flight, including the
+	 *    synchronous disconnect() calls step 3 just made for any devices
+	 *    still attached when we got here. */
+	flush_scheduled_work();
+
+	vkbd_exiting = 1;
+
 	if (vkbd_relay_registered)
 		input_unregister_handler(&vkbd_relay_handler);
+
 	flush_scheduled_work();
 	if (vkbd_proc)
 		remove_proc_entry(".vkbd", NULL);
