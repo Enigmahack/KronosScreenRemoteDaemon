@@ -195,7 +195,7 @@
 #define KBD_EV_KEY  1
 
 /*  Version */
-#define SCREENREMOTE_VERSION "2.1.0"
+#define SCREENREMOTE_VERSION "2.2.1"
 #ifndef BUILD_ID
 #define BUILD_ID "dev"
 #endif
@@ -1001,22 +1001,31 @@ static void fb0_close(void)
 /* Screensaver helpers */
 static void ss_sample(uint8_t *out)
 {
-    int i;
-    uint32_t step = frame_bytes / SS_SAMPLE_N;
-    /* Walk the VISIBLE image (fb_w x fb_h) and apply the stride only when
-     * converting a (row, col) to an address.  The previous version decomposed a
-     * frame_bytes-derived (i.e. width-space) offset with fb1_stride, which is
-     * only equivalent while stride == width: on any padded framebuffer the
-     * sample points drifted, and every point whose col landed in the padding was
-     * silently forced to 0 instead of sampling a pixel.  Change detection still
-     * worked, but off the wrong points.  fb1_stride >= fb_w is enforced in
-     * fb1_open(), so the two agree on this panel today - this just stops it
-     * being an accident. */
+    uint32_t band = (fb_h + SS_SAMPLE_N - 1) / SS_SAMPLE_N;  /* rows per digest byte */
+    uint32_t i, row, col;
+
+    /* Each output byte digests a horizontal BAND of the visible image, so EVERY
+     * pixel contributes to the comparison.  This used to read SS_SAMPLE_N lone
+     * pixels - 16 points out of ~480,000 - which is why the screensaver stayed
+     * blanked through real work on the panel: a value field, a page change or a
+     * meter moving essentially never lands on one of 16 fixed points, so the
+     * 5 s change check saw "still idle" forever.  Reading the whole visible
+     * image once every SS_CHECK_S is cheap next to do_mirror(), which already
+     * reads all of fb1 on every mirrored frame - and while the screensaver is
+     * blanked do_mirror() isn't running at all.
+     *
+     * Addresses are built as (row, col) and only then scaled by fb1_stride: the
+     * stride applies to the padding, not to the visible width, and conflating
+     * them silently sampled padding bytes on any framebuffer where the two
+     * differ.  fb1_open() enforces fb1_stride >= fb_w. */
     for (i = 0; i < SS_SAMPLE_N; i++) {
-        uint32_t px  = (uint32_t)i * step;   /* pixel index in the visible image */
-        uint32_t row = px / fb_w;
-        uint32_t col = px % fb_w;
-        out[i] = (row < fb_h) ? fb1_map[row * fb1_stride + col] : 0;
+        uint32_t acc = (uint32_t)i * 2654435761u;   /* keep band index in the hash */
+        for (row = i * band; row < (i + 1) * band && row < fb_h; row++) {
+            const uint8_t *p = fb1_map + (size_t)row * fb1_stride;
+            for (col = 0; col < fb_w; col++)
+                acc = acc * 31u + p[col];
+        }
+        out[i] = (uint8_t)(acc ^ (acc >> 8) ^ (acc >> 16) ^ (acc >> 24));
     }
 }
 
@@ -1027,6 +1036,45 @@ static void ss_reset(time_t now)
     ss_active     = 0;
     /* Whatever is on fb0 is no longer something do_mirror() put there. */
     mirror_shadow_valid = 0;
+}
+
+/* Report a discrete activity EVENT (MIDI traffic in either direction, an EVA
+ * mode/edit-context change) so the screensaver wakes on it instead of waiting
+ * up to SS_CHECK_S for ss_sample() to notice the screen moved.
+ *
+ * Deliberately NOT ss_reset() in the common case.  ss_reset() clears
+ * mirror_shadow_valid, which forces do_mirror() to repaint all of fb0 on its
+ * next pass; calling it on every MIDI burst would defeat the dirty-row check
+ * that do_mirror()'s header documents as worth 6.8 CPU points.  While the
+ * screen is already awake there is nothing to repaint, so pushing the idle
+ * deadline out is the whole job.  The full reset happens only on an actual
+ * wake from a blanked panel, where the repaint is exactly what's wanted.
+ *
+ * Callers must be EVENTS, never polls: anything that runs every main-loop
+ * iteration would hold ss_last_chg at "now" forever and the screensaver would
+ * never blank at all. */
+static void ss_activity(void)
+{
+    if (!mirror_on || g_ss_timeout <= 0) return;
+    if (ss_active) ss_reset(time(NULL));
+    else           ss_last_chg = time(NULL);
+}
+
+/* EVA activity, expressed as a CHANGE rather than a poll.  get_mode_state() is
+ * the single place MODE/EDITCTX are read, but it runs on every client STATE
+ * poll - calling ss_activity() from there unconditionally would pin the idle
+ * clock and the screensaver would never blank.  Only a transition counts.
+ * Seeded from the first reading (last_mode < 0), so daemon startup is not
+ * itself treated as activity. */
+static int ss_last_mode = -1, ss_last_editctx = -1;
+
+static void ss_note_mode_state(int mode, int editctx)
+{
+    if (ss_last_mode < 0) { ss_last_mode = mode; ss_last_editctx = editctx; return; }
+    if (mode == ss_last_mode && editctx == ss_last_editctx) return;
+    ss_last_mode    = mode;
+    ss_last_editctx = editctx;
+    ss_activity();
 }
 
 /* Mirror
@@ -2262,11 +2310,13 @@ static void get_mode_state(int *out_mode, int *out_editctx, const char **out_sou
 {
     if (eva_mode_read(out_mode, out_editctx, NULL, NULL)) {
         *out_source = "eva";
+        ss_note_mode_state(*out_mode, *out_editctx);
         return;
     }
     *out_mode    = current_ui_mode();
     *out_editctx = detect_program_edit_context();
     *out_source  = "pixel";
+    ss_note_mode_state(*out_mode, *out_editctx);
 }
 
 /* Reads the front-panel NKS4 driver's own live boot-progress-bar percentage from
@@ -3951,7 +4001,7 @@ static long ts_ms_diff(const struct timespec *a, const struct timespec *b)
 static void cc_inject(int status, int ctrl, uint8_t val)
 {
     uint8_t mb[3] = { (uint8_t)status, (uint8_t)ctrl, val };
-    if (midi_in_fd >= 0) (void)write(midi_in_fd, mb, 3);
+    if (midi_in_fd >= 0) { (void)write(midi_in_fd, mb, 3); ss_activity(); }
 }
 
 /* If `mb` is a 3-byte Control Change, rate-limit it and return 1 (handled,
@@ -4277,6 +4327,11 @@ static void sysex_poll(int readable)
                 midi_capture_down();       /* real error - treat as helper gone */
                 return;
             }
+            /* midi_tcp forwards ALL MIDI the Kronos emits, not just SysEx
+             * replies, so bytes arriving here mean someone is playing the
+             * keyboard or moving a controller - wake the VGA screensaver now
+             * rather than waiting for ss_sample()'s next 5 s pass. */
+            ss_activity();
             if (sysex_pending) {
                 int j, captured = 0;
                 for (j = 0; j < n; j++) {
@@ -4965,6 +5020,7 @@ static void process_ctrl_cmd(const char *line, int fd)
                  * Everything else (notes, bend, multi-byte) injects as-is. */
                 if (!cc_throttle(mb, mlen))
                     (void)write(midi_in_fd, mb, mlen);
+                ss_activity();   /* injected MIDI is activity too - wake the mirror */
                 REPLY("OK\n", 3);
             } else {
                 REPLY("ERR BAD_HEX\n", 12);
