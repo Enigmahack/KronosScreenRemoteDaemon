@@ -203,7 +203,20 @@ static struct mm_struct *find_eva_mm(pid_t *out_pid)
     eva_scan_failed = 0;
 
     rcu_read_lock();
-    list_for_each_entry_rcu(p, &current->tasks, tasks) {
+    /* for_each_process(p), not list_for_each_entry_rcu(p, &current->tasks,
+     * tasks): &current->tasks is a NODE in the list, not its head, so the
+     * original form enumerated every task except current and terminated
+     * only by chance (encountering current's own node again). Harmless
+     * today because screenremote (this module's only caller) is always a
+     * thread-group leader, whose `tasks` node stays correctly linked - but
+     * wrong by construction: a non-leader caller's `tasks` field holds
+     * stale pointers from dup_task_struct() that were never re-linked, and
+     * the walk would never re-encounter its own start node at all, saved
+     * from spinning only by the incidental EVA_CANDIDATE_MAX cap below.
+     * for_each_process() is init_task-anchored (EXPORT_SYMBOL'd on this
+     * kernel, confirmed) and correct regardless of which task is current
+     * (found 2026-09-19). */
+    for_each_process(p) {
         struct mm_struct *mm;
         if (ncand >= EVA_CANDIDATE_MAX)
             break;

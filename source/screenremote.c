@@ -1,8 +1,11 @@
 /*
- * screenremote.c  - Kronos framebuffer streaming daemon
- * Not yet tested on Nautilus, but should work with minor tweaks if needed.
+ * screenremote.c  - Kronos/Nautilus framebuffer streaming daemon
+ * Validated on real Nautilus hardware 2026-09-18. fb1 there is a genuine
+ * 16-bit-per-pixel buffer (palette index in the low byte) rather than the
+ * Kronos family's plain 8bpp - see fb1_native_bpp's block comment and
+ * kronosology/docs/hardware/nautilus_fb1_16bpp.md.
  *
- * Streams /dev/fb1 (8bpp, 800x600) over TCP port 7373 (default; set by config).
+ * Streams /dev/fb1 (800x600, 8bpp on Kronos / 16bpp-indexed on Nautilus) over TCP port 7373 (default; set by config).
  * Mirrors fb1 to /dev/fb0 (VGA out) when /korg/rw/screenremote/.mirror_enable exists.
  *
  * Stream handshake (TCP port 7373):
@@ -195,7 +198,7 @@
 #define KBD_EV_KEY  1
 
 /*  Version */
-#define SCREENREMOTE_VERSION "2.2.1"
+#define SCREENREMOTE_VERSION "3.0.0"
 #ifndef BUILD_ID
 #define BUILD_ID "dev"
 #endif
@@ -245,6 +248,24 @@ static uint32_t  fb1_stride, fb0_stride;
 static uint32_t  fb_w, fb_h;           /* 800, 600 */
 static uint32_t  frame_bytes;          /* fb_w * fb_h */
 
+/* Nautilus fb1 quirk (found 2026-09-18, see kronosology/docs/hardware/nautilus_fb1_16bpp.md):
+ * the Kronos family's fb1 is a real 8bpp indexed buffer, but on the Nautilus
+ * (OmapVideoModule build for the N3160/J3160 board) FBIOGET_VSCREENINFO reports
+ * bits_per_pixel=16 while ffix.line_length is stale 8bpp-era metadata (pixel
+ * count, not byte count). The actual hardware layout is 2 bytes/pixel with the
+ * same 0-255 palette index living in the low byte of each little-endian cell
+ * and the high byte always 0 - confirmed against live panel content on real
+ * hardware. fb1_native_bpp/fb1_hw_map/fb1_hw_stride hold the raw device mapping
+ * in that case; fb1_map/fb1_stride keep meaning exactly what they always have
+ * (a byte-per-pixel, fb_w-strided buffer) by pointing at fb1_shadow, a
+ * synthesized de-interleaved copy kept fresh once per main-loop tick by
+ * fb1_refresh_shadow(). Every existing fb1_map reader in this file - Kronos or
+ * Nautilus - is therefore unmodified and unaware of the distinction. */
+static int       fb1_native_bpp = 8;
+static uint8_t  *fb1_hw_map = NULL;
+static uint32_t  fb1_hw_stride = 0;
+static uint8_t  *fb1_shadow = NULL;
+
 /* Boot-splash compositing state (see apply_boot_splash()/load_boot_splash()/
  * send_frame(), all further down) - declared up here alongside the other
  * framebuffer state since send_frame() (pull mode's direct sender, defined
@@ -286,11 +307,19 @@ static time_t   last_ss_chk   = 0;
 static uint8_t  ss_prev[SS_SAMPLE_N];
 static int      ss_prev_valid = 0;
 
-/* Touch calibration */
+/* Touch calibration - values below are the Kronos-family defaults (empirically
+ * tuned against real Kronos hardware, per this project's own history). Overridable
+ * via screenremote.cfg; see g_touch_y_range_from_config below for why that matters
+ * on a Nautilus. */
 static int g_touch_x_offset = 10;   /* pixels added to x before ADC scaling      */
 static int g_touch_x_range  = 813;  /* total pixel span -> ADC 0-255             */
 static int g_touch_y_offset = 20;   /* pixels added to y before ADC scaling      */
 static int g_touch_y_range  = 638;  /* total pixel span -> ADC 0-255             */
+/* 1 once read_config() has seen an explicit touch_y_range= line - main() checks
+ * this after fb1_open() to decide whether it's still safe to apply the Nautilus
+ * proportional-scaling default below (never override an operator's explicit
+ * config value, on either device). */
+static int g_touch_y_range_from_config = 0;
 
 /* Pad-tap detection: touch (x,y) in framebuffer pixel space -> PADCHORD.
  * Regions calibrated 2026-07-14 against real hardware: 32 corner taps (4 per
@@ -868,6 +897,25 @@ static void apply_palette_to_fb0(void)
     ioctl(fb0_fd, FBIOPUTCMAP, &cmap);
 }
 
+/* De-interleaves fb1_hw_map (real device memory, 2 bytes/pixel, index in the
+ * low byte - see the fb1_native_bpp block comment up top) into fb1_shadow (a
+ * plain contiguous byte-per-pixel buffer) so every other fb1_map reader in
+ * this file keeps working unchanged. Called once from fb1_open() to seed the
+ * buffer, then once per main-loop iteration (top of the loop, before anything
+ * reads fb1_map) so both the staging path and the zero-copy "pull mode" reads
+ * see an at-most-one-tick-stale frame. No-op on Kronos (fb1_native_bpp==8). */
+static void fb1_refresh_shadow(void)
+{
+    uint32_t y, x;
+    if (!fb1_hw_map || !fb1_shadow) return;
+    for (y = 0; y < fb_h; y++) {
+        const uint8_t *src = fb1_hw_map + (size_t)y * fb1_hw_stride;
+        uint8_t *dst = fb1_shadow + (size_t)y * fb_w;
+        for (x = 0; x < fb_w; x++)
+            dst[x] = src[x * 2];
+    }
+}
+
 /* Framebuffer open/close */
 static int fb1_open(void)
 {
@@ -882,17 +930,32 @@ static int fb1_open(void)
         ioctl(fb1_fd, FBIOGET_VSCREENINFO, &fvar) < 0) {
         perror("fb1 ioctl"); return -1;
     }
-    if (fvar.bits_per_pixel != 8) {
-        fprintf(stderr, "screenremote: fb1 bpp=%u, expected 8\n",
+    if (fvar.bits_per_pixel != 8 && fvar.bits_per_pixel != 16) {
+        fprintf(stderr, "screenremote: fb1 bpp=%u, expected 8 or 16\n",
                 fvar.bits_per_pixel);
         return -1;
     }
-    fb_w        = fvar.xres;
-    fb_h        = fvar.yres;
-    fb1_stride  = ffix.line_length;
-    if (fb_w == 0 || fb_h == 0 || fb1_stride < fb_w) {
-        fprintf(stderr, "screenremote: fb1 bad geometry %ux%u stride=%u\n",
-                fb_w, fb_h, fb1_stride);
+    /* The 16bpp (Nautilus) path further requires the "index in the low byte"
+     * layout documented above - all three channel fields folded onto the same
+     * low 8 bits is the signature we measured on real hardware. A device that
+     * reports a genuine spread-out RGB565/RGB555 field layout is NOT this
+     * quirk (real truecolor, no per-pixel palette index to extract) and is
+     * refused rather than silently mis-decoded. */
+    if (fvar.bits_per_pixel == 16 &&
+        !(fvar.red.offset == 0 && fvar.red.length == 8 &&
+          fvar.green.offset == 0 && fvar.green.length == 8 &&
+          fvar.blue.offset == 0 && fvar.blue.length == 8)) {
+        fprintf(stderr, "screenremote: fb1 bpp=16 but channel layout isn't the "
+                "known index-in-low-byte quirk (red off=%u len=%u, green off=%u "
+                "len=%u, blue off=%u len=%u) - refusing rather than guessing\n",
+                fvar.red.offset, fvar.red.length, fvar.green.offset,
+                fvar.green.length, fvar.blue.offset, fvar.blue.length);
+        return -1;
+    }
+    fb_w = fvar.xres;
+    fb_h = fvar.yres;
+    if (fb_w == 0 || fb_h == 0) {
+        fprintf(stderr, "screenremote: fb1 bad geometry %ux%u\n", fb_w, fb_h);
         return -1;
     }
     frame_bytes = fb_w * fb_h;
@@ -907,12 +970,56 @@ static int fb1_open(void)
         }
     }
 
-    fb1_map = mmap(NULL, fb1_stride * fb_h,
-                   PROT_READ, MAP_SHARED, fb1_fd, 0);
-    if (fb1_map == MAP_FAILED) { perror("mmap fb1"); return -1; }
+    if (fvar.bits_per_pixel == 8) {
+        fb1_native_bpp = 8;
+        fb1_stride = ffix.line_length;
+        if (fb1_stride < fb_w) {
+            fprintf(stderr, "screenremote: fb1 bad stride=%u for width=%u\n",
+                    fb1_stride, fb_w);
+            return -1;
+        }
+        fb1_map = mmap(NULL, fb1_stride * fb_h,
+                       PROT_READ, MAP_SHARED, fb1_fd, 0);
+        if (fb1_map == MAP_FAILED) { perror("mmap fb1"); return -1; }
 
-    fprintf(stderr, "screenremote: fb1 %ux%u bpp=8 stride=%u\n",
-            fb_w, fb_h, fb1_stride);
+        fprintf(stderr, "screenremote: fb1 %ux%u bpp=8 stride=%u\n",
+                fb_w, fb_h, fb1_stride);
+        return 0;
+    }
+
+    /* bpp == 16: ffix.line_length is unreliable (observed reporting fb_w, the
+     * old 8bpp pixel count, instead of the real 2-bytes/pixel byte stride) -
+     * trust it only if it's already at least wide enough for 16bpp, else
+     * compute the real stride ourselves. */
+    fb1_native_bpp = 16;
+    fb1_hw_stride = (ffix.line_length >= fb_w * 2) ? ffix.line_length : fb_w * 2;
+    {
+        size_t hw_size = (size_t)fb1_hw_stride * fb_h;
+        /* fb1_refresh_shadow() always reads the full fb1_hw_stride*fb_h range -
+         * a short mmap here (e.g. if smem_len is ALSO stale 8bpp-era metadata,
+         * same as line_length above) would make that an out-of-bounds mmap
+         * read (SIGBUS) on the very first refresh. Refuse rather than
+         * silently truncating the mapping to something the refresh can't
+         * honor - same "refuse rather than guess" policy as the bpp/line_length
+         * checks above (found 2026-09-19). */
+        if (ffix.smem_len && ffix.smem_len < hw_size) {
+            fprintf(stderr, "screenremote: fb1 smem_len=%u < required %zu for "
+                    "16bpp %ux%u stride=%u - refusing rather than mapping short\n",
+                    ffix.smem_len, hw_size, fb_w, fb_h, fb1_hw_stride);
+            return -1;
+        }
+        fb1_hw_map = mmap(NULL, hw_size, PROT_READ, MAP_SHARED, fb1_fd, 0);
+    }
+    if (fb1_hw_map == MAP_FAILED) { perror("mmap fb1 (16bpp)"); fb1_hw_map = NULL; return -1; }
+
+    fb1_shadow = malloc(frame_bytes);
+    if (!fb1_shadow) { perror("malloc fb1_shadow"); return -1; }
+    fb1_map    = fb1_shadow;
+    fb1_stride = fb_w;   /* fb1_map is always a contiguous byte-per-pixel buffer */
+    fb1_refresh_shadow();
+
+    fprintf(stderr, "screenremote: fb1 %ux%u native bpp=16 (index-in-low-byte), "
+            "hw_stride=%u, shadow stride=%u\n", fb_w, fb_h, fb1_hw_stride, fb1_stride);
     return 0;
 }
 
@@ -1189,8 +1296,10 @@ static void read_config(void)
            g_touch_x_range = v;
         else if (sscanf(line, "touch_y_offset=%d", &v) == 1)
            g_touch_y_offset = v;
-        else if (sscanf(line, "touch_y_range=%d", &v) == 1 && v > 0)
+        else if (sscanf(line, "touch_y_range=%d", &v) == 1 && v > 0) {
            g_touch_y_range = v;
+           g_touch_y_range_from_config = 1;
+        }
     }
     fclose(f);
     /* stream and ctrl are both TCP listeners, so equal ports make the second
@@ -1380,6 +1489,15 @@ static int send_frame(int fd)
     int      have_bar = fb_w <= BOOT_BAR_MAX_FB_W && boot_progress_bar_state(&bg, &filled);
     uint8_t  bar_row0[BOOT_BAR_MAX_FB_W], bar_row1[BOOT_BAR_MAX_FB_W];
 
+    /* Nautilus only: the main loop's top-of-tick refresh is enough for the
+     * mirror/screensaver/boot-gate consumers, but MODE_PULL calls straight
+     * into this function from inside select()'s idle wait (up to a full
+     * second, see PULL's select() timeout) - without a refresh right here, a
+     * pull-mode client sees a frame as stale as its own poll interval rather
+     * than "at most one main-loop tick" (found 2026-09-19). Idempotent/cheap
+     * if the top-of-loop refresh already ran this tick. */
+    if (fb1_native_bpp == 16) fb1_refresh_shadow();
+
     put_le32(hdr, frame_bytes);
     TCP_CORK_ON(fd);
     if (write_all_f(fd, hdr, 4) < 0) goto fail;
@@ -1517,21 +1635,16 @@ static int do_handshake(int fd, uint8_t *mode_out, uint8_t *fps_out,
 
     memcpy(fail, MAGIC, 4);
 
-    if (memcmp(hdr, MAGIC, 4) != 0 || hdr[4] != 0x02) {
-        fail[4] = 0x01;
-        write_all(fd, fail, 5);
-        log_access(peer_ip, 0, "bad magic/version");
-        return -1;
-    }
-
+    /* Magic/version and credential-length are NOT re-checked here: do_handshake()
+     * has exactly one caller, and it's only ever reached with a `hello` that
+     * stream_handshake_read() already validated on both counts (its own
+     * "bad magic/version"/"bad credential lengths" rejects, right above)
+     * before returning 1 - re-checking here would be dead code (confirmed
+     * unreachable, not just unlikely; removed 2026-09-19). ulen/plen are
+     * still trusted from hdr since that's exactly what stream_handshake_read()
+     * already bounded to [1,64]/[0,128] before sizing hs->need. */
     ulen = hdr[7];
     plen = hdr[8];
-    if (ulen == 0 || ulen > 64 || plen > 128) {
-        fail[4] = 0x01;
-        write_all(fd, fail, 5);
-        log_access(peer_ip, 0, "bad credential lengths");
-        return -1;
-    }
 
     memcpy(user, hdr + STREAM_HELLO_SIZE, ulen);
     if (plen)
@@ -1881,6 +1994,31 @@ static const int g_eva_sysmode_to_pub[7] = {
     1, /* 6 = Setlist  */
 };
 
+/* Shared by eva_mode_read()/eva_mode_stage() below - both used to carry an
+ * identical copy of this open+read+NUL-terminate sequence. Returns 1 with
+ * buf NUL-terminated on a successful (nonempty) read, 0 (buf untouched) if
+ * eva_mode.ko isn't loaded, its /proc node isn't there, or the read failed -
+ * callers already treat all of those the same way (return 0, don't touch
+ * *out_*). Read fresh every call (no caching), same live-read philosophy as
+ * on_pads_page()/toggle_is_on() against fb1_map (found 2026-09-19). */
+static int eva_mode_slurp(char *buf, size_t cap)
+{
+    int fd;
+    ssize_t n;
+
+    if (!g_eva_mode_loaded)
+        return 0;
+    fd = open("/proc/.eva_mode", O_RDONLY);
+    if (fd < 0)
+        return 0;
+    n = read(fd, buf, cap - 1);
+    close(fd);
+    if (n <= 0)
+        return 0;
+    buf[n] = '\0';
+    return 1;
+}
+
 /* Reads eva_mode.ko's /proc/.eva_mode - a single line, read fresh every
  * call (no caching), same live-read philosophy as on_pads_page()/
  * toggle_is_on() against fb1_map. Returns 1 and fills *out_mode (public
@@ -1896,20 +2034,11 @@ static const int g_eva_sysmode_to_pub[7] = {
  * second independent /proc scan. */
 static int eva_mode_read(int *out_mode, int *out_editctx, int *out_slot, int *out_pid)
 {
-    int fd, resolved = 0, sysmode = -1, editctx = 0, slot = -1, pid = -1;
+    int resolved = 0, sysmode = -1, editctx = 0, slot = -1, pid = -1;
     char buf[128];
-    ssize_t n;
 
-    if (!g_eva_mode_loaded)
+    if (!eva_mode_slurp(buf, sizeof(buf)))
         return 0;
-    fd = open("/proc/.eva_mode", O_RDONLY);
-    if (fd < 0)
-        return 0;
-    n = read(fd, buf, sizeof(buf) - 1);
-    close(fd);
-    if (n <= 0)
-        return 0;
-    buf[n] = '\0';
 
     if (sscanf(buf, "RESOLVED=%d EVA_PID=%d SYS_MODE=%d EDITCTX_RAW=%d EDITCTX_SLOT=%d",
                &resolved, &pid, &sysmode, &editctx, &slot) != 5 || !resolved)
@@ -1954,20 +2083,11 @@ static int eva_mode_read(int *out_mode, int *out_editctx, int *out_slot, int *ou
  * callers should gate on eva_resolved instead, same as MODE_DETAIL does). */
 static int eva_mode_stage(char *out_stage, size_t cap)
 {
-    int fd, resolved = 0;
+    int resolved = 0;
     char buf[128], stage[32];
-    ssize_t n;
 
-    if (!g_eva_mode_loaded)
+    if (!eva_mode_slurp(buf, sizeof(buf)))
         return 0;
-    fd = open("/proc/.eva_mode", O_RDONLY);
-    if (fd < 0)
-        return 0;
-    n = read(fd, buf, sizeof(buf) - 1);
-    close(fd);
-    if (n <= 0)
-        return 0;
-    buf[n] = '\0';
 
     if (sscanf(buf, "RESOLVED=%d", &resolved) != 1 || resolved)
         return 0;
@@ -3261,6 +3381,35 @@ static int due(time_t *last, time_t now, time_t interval)
  * an FTP-visible, append-across-boots log file, since a silently-degraded unit (buttons
  * appear to work but sequencer transport/tempo quietly don't - see header comment) is far
  * worse than a loud one. */
+/* Counterpart to nks4_give_up(): called when nks4_inject loads successfully
+ * on a LATER retry after an earlier one already gave up and latched
+ * g_rtf5_fallback_active for this boot (possible via the IP-rebind path,
+ * which re-arms g_nks4_load_pending). Without this, the FTP-visible
+ * rtf5_fallback.log - the only evidence a console-less operator has - keeps
+ * asserting a DEGRADED state that no longer applies once the real path is
+ * back (found 2026-09-19). No-op if the flag was never set. */
+static void nks4_recovered(void)
+{
+    time_t t;
+    char ts[32];
+    struct tm *ti;
+    FILE *f;
+
+    if (!g_rtf5_fallback_active) return;
+    g_rtf5_fallback_active = 0;
+
+    t = time(NULL);
+    ti = localtime(&t);
+    strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", ti);
+    f = fopen(RTF5_FALLBACK_LOG, "a");
+    if (f) {
+        fprintf(f, "%s  nks4_inject loaded - RECOVERED: rtf5 fallback no longer "
+                "in use for this boot\n", ts);
+        fclose(f);
+    }
+    fprintf(stderr, "screenremote: nks4_inject loaded - rtf5 fallback recovered\n");
+}
+
 static void nks4_give_up(const char *reason)
 {
     time_t t = time(NULL);
@@ -3430,6 +3579,22 @@ static void si_parse_cpu(const char *line, cpu_snap_t *s)
            &s->iowait, &s->irq, &s->softirq);
 }
 
+/* statvfs(path) -> free/total MB, shared by sysinfo_collect()'s /korg/rw,
+ * /korg/rw2, and per-USB-drive fields below (previously the same 3-line
+ * conversion copy-pasted at each site). Returns 0 and leaves *free_mb/
+ * *total_mb untouched on a failed statvfs (caller already treats that as
+ * "omit this field"). */
+static int disk_mb(const char *path, unsigned long *free_mb, unsigned long *total_mb)
+{
+    struct statvfs sv;
+
+    if (statvfs(path, &sv) != 0)
+        return 0;
+    *free_mb  = (unsigned long)((unsigned long long)sv.f_bavail * sv.f_bsize >> 20);
+    *total_mb = (unsigned long)((unsigned long long)sv.f_blocks * sv.f_bsize >> 20);
+    return 1;
+}
+
 /* Build a SYSINFO response into out[outsz].  Returns bytes written.
  * Updates g_si_prev so successive calls yield accurate CPU deltas.
  * Must only be called when a client is connected (no background polling). */
@@ -3440,9 +3605,18 @@ static int sysinfo_collect(char *out, int outsz)
     int         ncpu = 0, i, n = 0;
     FILE       *f;
     char        line[256];
+    /* Every field below is budgeted against outsz-4, not outsz: 4 bytes
+     * ("OK\n" + snprintf's own NUL) are reserved so the terminal OK\n below
+     * always fits even if every field above it truncates. Without this, a
+     * SYSINFO reply that happened to fill the buffer would silently drop its
+     * OK\n - the client reads until OK\n (the same convention the ctrl ERR\n
+     * path exists to preserve), so a truncated-with-no-terminator reply
+     * would just hang the caller until their own timeout rather than
+     * anything visibly wrong on this end (found 2026-09-19; not reachable at
+     * today's ~700-byte typical output, but the field list only grows). */
 #define SI_APPEND(...) do { \
-    if (n < outsz) n += snprintf(out + n, outsz - n, __VA_ARGS__); \
-    if (n >= outsz) n = outsz - 1; \
+    if (n < outsz - 4) n += snprintf(out + n, (outsz - 4) - n, __VA_ARGS__); \
+    if (n >= outsz - 4) n = outsz - 4; \
 } while (0)
 
     /*  /proc/stat - CPU delta */
@@ -3543,22 +3717,16 @@ static int sysinfo_collect(char *out, int outsz)
 
     /*  /korg/rw disk space (SSD 1) */
     {
-        struct statvfs sv;
-        if (statvfs("/korg/rw", &sv) == 0) {
-            unsigned long free_mb  = (unsigned long)((unsigned long long)sv.f_bavail * sv.f_bsize >> 20);
-            unsigned long total_mb = (unsigned long)((unsigned long long)sv.f_blocks * sv.f_bsize >> 20);
+        unsigned long free_mb, total_mb;
+        if (disk_mb("/korg/rw", &free_mb, &total_mb))
             SI_APPEND("DISK_FREE_MB=%lu\nDISK_TOTAL_MB=%lu\n", free_mb, total_mb);
-        }
     }
 
     /*  /korg/rw2 disk space (SSD 2) */
     {
-        struct statvfs sv;
-        if (statvfs("/korg/rw2", &sv) == 0) {
-            unsigned long free_mb  = (unsigned long)((unsigned long long)sv.f_bavail * sv.f_bsize >> 20);
-            unsigned long total_mb = (unsigned long)((unsigned long long)sv.f_blocks * sv.f_bsize >> 20);
+        unsigned long free_mb, total_mb;
+        if (disk_mb("/korg/rw2", &free_mb, &total_mb))
             SI_APPEND("RW2_FREE_MB=%lu\nRW2_TOTAL_MB=%lu\n", free_mb, total_mb);
-        }
     }
 
     /* USB drives (/proc/mounts - /dev/sdc+ are USB storage) */
@@ -3572,10 +3740,8 @@ static int sysinfo_collect(char *out, int outsz)
                 char dev[64], mnt[128], fst[32];
                 if (sscanf(mline, "%63s %127s %31s", dev, mnt, fst) != 3) continue;
                 if (strncmp(dev, "/dev/sd", 7) != 0 || dev[7] < 'c' || dev[7] > 'z') continue;
-                struct statvfs sv;
-                if (statvfs(mnt, &sv) != 0) continue;
-                unsigned long free_mb  = (unsigned long)((unsigned long long)sv.f_bavail * sv.f_bsize >> 20);
-                unsigned long total_mb = (unsigned long)((unsigned long long)sv.f_blocks * sv.f_bsize >> 20);
+                unsigned long free_mb, total_mb;
+                if (!disk_mb(mnt, &free_mb, &total_mb)) continue;
                 SI_APPEND("USB%d_MNT=%s\nUSB%d_FREE_MB=%lu\nUSB%d_TOTAL_MB=%lu\n",
                     usb_n, mnt, usb_n, free_mb, usb_n, total_mb);
                 usb_n++;
@@ -3640,7 +3806,10 @@ static int sysinfo_collect(char *out, int outsz)
     /* Boot gate - see update_boot_state() */
     SI_APPEND("BOOT=%d\n", g_boot_active);
 
-    SI_APPEND("OK\n");
+    /* Not SI_APPEND: n is guaranteed <= outsz-4 here, so outsz-n >= 4 always
+     * has room for "OK\n" + NUL, unconditionally - see the reservation
+     * comment on SI_APPEND's definition above. */
+    n += snprintf(out + n, outsz - n, "OK\n");
 #undef SI_APPEND
     return n;
 }
@@ -3807,7 +3976,8 @@ static void resolve_nks4_kallsyms(unsigned long *fn_switch, unsigned long *fn_to
                                    unsigned long *fn_rotary, unsigned long *fn_analog,
                                    unsigned long *fn_invert, unsigned long *fn_chord,
                                    unsigned long *fn_setled,
-                                   unsigned long *fn_sinstance_get)
+                                   unsigned long *fn_sinstance_get,
+                                   unsigned long *fn_recv_trigger)
 {
     unsigned long km_note_out = 0, chord_direct = 0, chord_delta = 0;
     /* "ShortInvertNkS4AnalogValue" must NOT match ShortInvertNkS4RawAnalogValue
@@ -3834,6 +4004,18 @@ static void resolve_nks4_kallsyms(unsigned long *fn_switch, unsigned long *fn_to
         { "Do_KM_note_out_chord_trig", &km_note_out },
         { "CSTGFrontPanelMsgHandler6SetLED", fn_setled },
         { "CSTGFrontPanel_GetInstanceForTest", fn_sinstance_get },
+        /* ALTERNATE PADCHORD path for an OA.ko build with no RT_chord_trigger
+         * at all (confirmed on a real Nautilus, 2026-09-18 - neither
+         * _Z16RT_chord_triggerhhhh nor Do_KM_note_out_chord_trig appear
+         * anywhere in that unit's kallsyms). CSTGDrumPadInterface::
+         * ReceiveTriggerEvent is the real, multi-caller public entry point
+         * the KARMA pad-trigger path is routed through on that build instead -
+         * see nks4_inject.c's fn_recv_trigger comment and
+         * kronosology/docs/hardware/nautilus_padchord.md. Harmless to always
+         * probe for on Kronos too (just resolves to a spare, unused pointer
+         * there since fn_chord already works). */
+        { "_ZN20CSTGDrumPadInterface19ReceiveTriggerEventE22STGDrumPadTriggerEvent",
+          fn_recv_trigger },
     };
     kallsyms_resolve(probes, (int)(sizeof(probes) / sizeof(probes[0])));
 
@@ -3954,6 +4136,25 @@ static int hex_decode(const char *hex, uint8_t *out, int maxlen)
         if (!*hex) break;
         unsigned int b;
         int consumed = 0;
+        /* %2x inherits strtoul(base 16)'s sign/prefix leniency: "-1"/"+7F"
+         * parse as 0xFFFFFFFF/0x7F (rejected by the isxdigit check below),
+         * but a leading "0x"/"0X" is worse than either - it's a *documented*
+         * part of %x's own grammar (C99 7.19.6.2p10: an optional 0x/0X
+         * prefix is recognized for the x conversion), not implementation
+         * looseness, so isxdigit(*hex) alone doesn't catch it: '0' IS a
+         * valid hex digit, so the guard passes, and %2x then consumes "0x"
+         * as its (empty) prefix - "success", 2 chars consumed, b=0 - rather
+         * than failing or reading "0" as a lone nibble. "0x90 40" therefore
+         * silently decoded to three bytes {0x00, 0x90, 0x40} instead of
+         * either the two the client meant or a clean BAD_HEX (found
+         * 2026-09-19 while verifying the isxdigit fix above on real
+         * hardware - the fix above alone was insufficient). Reject the
+         * two-character "0x"/"0X" prefix explicitly, on top of the
+         * plain-hex-digit check. */
+        if (!isxdigit((unsigned char)*hex))
+            return -1;
+        if (hex[0] == '0' && (hex[1] == 'x' || hex[1] == 'X'))
+            return -1;
         /* %n records how many chars %2x actually consumed (1 for a lone final
          * hex nibble, 2 normally) - advancing by a hardcoded 2 regardless steps
          * past the string's NUL on an odd-length tail, reading whatever
@@ -4222,7 +4423,7 @@ static void sysex_send_response(void)
         sysex_hexbuf[rlen++] = '\n';
         write_all(sysex_resp_fd, sysex_hexbuf, rlen);
     } else if (sysex_resp_fd >= 0) {
-        write_all(sysex_resp_fd, "ERR TIMEOUT\n", 12);
+        write_all(sysex_resp_fd, "ERR TIMEOUT\n", sizeof("ERR TIMEOUT\n") - 1);
     }
 }
 
@@ -4407,15 +4608,24 @@ static void sysex_poll(int readable)
 static void process_ctrl_cmd(const char *line, int fd)
 {
 #define REPLY(msg, len) do { if (fd >= 0) write_all(fd, (msg), (len)); } while (0)
+/* For a string-literal reply, sizeof(s)-1 computes the length at compile
+ * time instead of it being hand-counted at every call site - every such
+ * count in this function was independently verified correct as of
+ * 2026-09-19, but a hand count is a fresh opportunity to get it wrong on
+ * every new reply added, and a wrong one fails silently (short = a
+ * truncated reply the client waits out; long = a stray byte of adjacent
+ * stack on the wire). REPLY(msg, len) itself stays available for the
+ * handful of call sites building a reply into a local buffer at runtime. */
+#define REPLY_S(s) REPLY((s), sizeof(s) - 1)
 
 /* Front-panel-injection availability guards.  NKS4_GUARD also allows the
  * degraded rtf5 fallback; NKS4_GUARD_STRICT is for commands that have no
  * rtf5 equivalent at all (added after rtf5 was retired - see header comment). */
 #define NKS4_GUARD() do { \
-    if (!g_nks4_loaded && !g_rtf5_fallback_active) { REPLY("ERR NKS4_NOT_LOADED\n", 20); return; } \
+    if (!g_nks4_loaded && !g_rtf5_fallback_active) { REPLY_S("ERR NKS4_NOT_LOADED\n"); return; } \
 } while (0)
 #define NKS4_GUARD_STRICT() do { \
-    if (!g_nks4_loaded) { REPLY("ERR NKS4_NOT_LOADED\n", 20); return; } \
+    if (!g_nks4_loaded) { REPLY_S("ERR NKS4_NOT_LOADED\n"); return; } \
 } while (0)
 
     /* Hard read-only enforcement during boot (see update_boot_state()'s block
@@ -4423,7 +4633,7 @@ static void process_ctrl_cmd(const char *line, int fd)
      * whether it arrived through the one-shot accept path or an established
      * CTRL_PERSIST session.  See cmd_class() for why each class is what it is. */
     if (g_boot_active && cmd_class(line) != CMD_RO_ALWAYS) {
-        REPLY("ERR BOOTING\n", 12);
+        REPLY_S("ERR BOOTING\n");
         return;
     }
 
@@ -4431,12 +4641,12 @@ static void process_ctrl_cmd(const char *line, int fd)
         int f = open(MIRROR_FLAG, O_CREAT | O_WRONLY, 0644);
         if (f >= 0) close(f);
         check_mirror_flag();
-        REPLY("OK\n", 3);
+        REPLY_S("OK\n");
 
     } else if (strcmp(line, "MIRROR_OFF") == 0) {
         unlink(MIRROR_FLAG);
         check_mirror_flag();
-        REPLY("OK\n", 3);
+        REPLY_S("OK\n");
 
     } else if (strncmp(line, "TOUCH", 5) == 0) {
         /* All four touch forms share one parse+inject path - the command word
@@ -4469,10 +4679,10 @@ static void process_ctrl_cmd(const char *line, int fd)
                     irc = -1;
                 /* Don't answer OK for an event that never fired - see
                  * send_padchord()'s comment. */
-                if (irc == 0) REPLY("OK\n", 3);
-                else          REPLY("ERR INJECT_FAILED\n", 18);
+                if (irc == 0) REPLY_S("OK\n");
+                else          REPLY_S("ERR INJECT_FAILED\n");
             } else {
-                REPLY("ERR\n", 4);
+                REPLY_S("ERR\n");
             }
             break;
         }
@@ -4480,7 +4690,7 @@ static void process_ctrl_cmd(const char *line, int fd)
          * "TOUCHX 1 2", or a bare "TOUCH"): the loop above falls through with
          * no reply at all.  See the terminal else at the end of this chain. */
         if (ti == 4)
-            REPLY("ERR\n", 4);
+            REPLY_S("ERR\n");
 
     } else if (strncmp(line, "PADCHORD ", 9) == 0) {
         /* Triggers the real per-pad KARMA chord (RT_chord_trigger), the
@@ -4495,10 +4705,10 @@ static void process_ctrl_cmd(const char *line, int fd)
         int pad = 0, vel = 0;
         NKS4_GUARD_STRICT();
         if (sscanf(line + 9, "%d %d", &pad, &vel) == 2) {
-            if (send_padchord(pad, vel) == 0) REPLY("OK\n", 3);
-            else                              REPLY("ERR INJECT_FAILED\n", 18);
+            if (send_padchord(pad, vel) == 0) REPLY_S("OK\n");
+            else                              REPLY_S("ERR INJECT_FAILED\n");
         } else {
-            REPLY("ERR\n", 4);
+            REPLY_S("ERR\n");
         }
 
     } else if (strncmp(line, "PADMAP ", 7) == 0) {
@@ -4514,9 +4724,9 @@ static void process_ctrl_cmd(const char *line, int fd)
             g_pad_regions[pad].y0 = y0;
             g_pad_regions[pad].x1 = x1;
             g_pad_regions[pad].y1 = y1;
-            REPLY("OK\n", 3);
+            REPLY_S("OK\n");
         } else {
-            REPLY("ERR\n", 4);
+            REPLY_S("ERR\n");
         }
 
     } else if (strcmp(line, "PADMAP_LIST") == 0) {
@@ -4531,7 +4741,7 @@ static void process_ctrl_cmd(const char *line, int fd)
 
     } else if (strcmp(line, "PADMAP_ON") == 0) {
         g_padmap_enabled = 1;
-        REPLY("OK\n", 3);
+        REPLY_S("OK\n");
 
     } else if (strcmp(line, "PADMAP_OFF") == 0) {
         g_padmap_enabled = 0;
@@ -4542,7 +4752,7 @@ static void process_ctrl_cmd(const char *line, int fd)
             send_padchord(g_active_pad, 0);
             g_active_pad = -1;
         }
-        REPLY("OK\n", 3);
+        REPLY_S("OK\n");
 
     } else if (strcmp(line, "LASTTOUCH") == 0) {
         char resp[48];
@@ -4610,10 +4820,10 @@ static void process_ctrl_cmd(const char *line, int fd)
                 rlen += snprintf(resp + rlen, sizeof(resp) - (size_t)rlen, "\n");
                 REPLY(resp, (size_t)rlen);
             } else {
-                REPLY("ERR\n", 4);
+                REPLY_S("ERR\n");
             }
         } else {
-            REPLY("ERR\n", 4);
+            REPLY_S("ERR\n");
         }
 
     } else if (strncmp(line, "PIXEL ", 6) == 0) {
@@ -4631,7 +4841,7 @@ static void process_ctrl_cmd(const char *line, int fd)
                                  (unsigned)fb1_map[py * (int)fb1_stride + px]);
             REPLY(resp, (size_t)rlen);
         } else {
-            REPLY("ERR\n", 4);
+            REPLY_S("ERR\n");
         }
 
     } else if (strncmp(line, "BUTTON ", 7) == 0) {
@@ -4644,13 +4854,13 @@ static void process_ctrl_cmd(const char *line, int fd)
         /* Unknown button name: nothing sensible to snap to, so reject outright
          * rather than silently pick some other button. */
         if (!b->name) {
-            REPLY("ERR\n", 4);
+            REPLY_S("ERR\n");
         } else if (g_nks4_loaded) {
             if (nks4_write("BTN %u\n", b->code) != 0) {
-                REPLY("ERR INJECT_FAILED\n", 18);
+                REPLY_S("ERR INJECT_FAILED\n");
             } else {
                 mode_from_btn(b->code);
-                REPLY("OK\n", 3);
+                REPLY_S("OK\n");
             }
         } else {
             /* rtf5 fallback: the name exists in btn_table[] (current NKS4 code
@@ -4658,12 +4868,12 @@ static void process_ctrl_cmd(const char *line, int fd)
              * space) - see the header comment and rtf5_btn_table's own comment. */
             const struct rtf5_btn_def *rb = rtf5_find_btn(bname);
             if (!rb) {
-                REPLY("ERR RTF5_UNSUPPORTED\n", 21);
+                REPLY_S("ERR RTF5_UNSUPPORTED\n");
             } else {
                 send_rtf5_event(rb->dev, rb->code, 0x7fu);
                 send_rtf5_event(rb->dev, rb->code, 0x00u);
                 mode_from_btn(b->code);
-                REPLY("OK\n", 3);
+                REPLY_S("OK\n");
             }
         }
 
@@ -4715,12 +4925,12 @@ static void process_ctrl_cmd(const char *line, int fd)
                     for (int i = count - 1; i >= 0; i--)
                         send_rtf5_event(rbtns[i]->dev, rbtns[i]->code, 0x00u);
                 }
-                REPLY("OK\n", 3);
+                REPLY_S("OK\n");
             } else {
-                REPLY("ERR\n", 4);   /* one or more unknown/unsupported button names */
+                REPLY_S("ERR\n");   /* one or more unknown/unsupported button names */
             }
         } else {
-            REPLY("ERR\n", 4);       /* fewer than 2 buttons is not a chord */
+            REPLY_S("ERR\n");       /* fewer than 2 buttons is not a chord */
         }
 
     } else if (strncmp(line, "WHEEL ", 6) == 0) {
@@ -4735,12 +4945,12 @@ static void process_ctrl_cmd(const char *line, int fd)
         NKS4_GUARD();
         if (strcmp(dir, "CW") == 0)       delta = 0x00000100;
         else if (strcmp(dir, "CCW") == 0) delta = 0x0000FF00;
-        else { REPLY("ERR\n", 4); return; }
+        else { REPLY_S("ERR\n"); return; }
         if (g_nks4_loaded)
             nks4_write("ROT %d\n", delta);
         else
             send_rtf5_wheel((uint32_t)delta);   /* rtf5's field3 uses the identical encoding */
-        REPLY("OK\n", 3);
+        REPLY_S("OK\n");
 
     } else if (strncmp(line, "SLIDER ", 7) == 0) {
         /* Physical Slider n, device code 16 + (n-1).  idx and val are each
@@ -4759,9 +4969,9 @@ static void process_ctrl_cmd(const char *line, int fd)
                  * nks4_analog_write()'s byte0=val*2 transform, which is specific to
                  * ShortInvertNkS4AnalogValue on the nks4_inject path. */
                 send_rtf5_event(0x0eu, (uint32_t)(idx - 1), (uint32_t)val);
-            REPLY("OK\n", 3);
+            REPLY_S("OK\n");
         } else {
-            REPLY("ERR\n", 4);
+            REPLY_S("ERR\n");
         }
 
     } else if (strncmp(line, "KNOB ", 5) == 0) {
@@ -4772,9 +4982,9 @@ static void process_ctrl_cmd(const char *line, int fd)
         if (sscanf(line + 5, "%d %d", &idx, &val) == 2) {
             idx = clampi(idx, 1, 8);
             nks4_analog_write(8 + (idx - 1), val);
-            REPLY("OK\n", 3);
+            REPLY_S("OK\n");
         } else {
-            REPLY("ERR\n", 4);
+            REPLY_S("ERR\n");
         }
 
     } else if (strncmp(line, "VSLIDER ", 8) == 0) {
@@ -4789,9 +4999,9 @@ static void process_ctrl_cmd(const char *line, int fd)
             else
                 /* rtf5's VSLIDER packet, like SLIDER, takes the raw 0-127 value directly. */
                 send_rtf5_event(0x0fu, 0x09u, (uint32_t)val);
-            REPLY("OK\n", 3);
+            REPLY_S("OK\n");
         } else {
-            REPLY("ERR\n", 4);
+            REPLY_S("ERR\n");
         }
 
     /* --- JOYSTICK / VECTOR / RIBBON / AFTERTOUCH / PEDAL / FOOTSWITCH / DAMPER ---
@@ -4840,9 +5050,9 @@ static void process_ctrl_cmd(const char *line, int fd)
         }
         if (dev >= 0) {
             nks4_analog_write(dev, val);
-            REPLY("OK\n", 3);
+            REPLY_S("OK\n");
         } else {
-            REPLY("ERR\n", 4);
+            REPLY_S("ERR\n");
         }
 
     } else if (strncmp(line, "AFTERTOUCH ", 11) == 0 ||
@@ -4873,9 +5083,9 @@ static void process_ctrl_cmd(const char *line, int fd)
         }
         if (dev >= 0) {
             nks4_analog_write(dev, val);
-            REPLY("OK\n", 3);
+            REPLY_S("OK\n");
         } else {
-            REPLY("ERR\n", 4);
+            REPLY_S("ERR\n");
         }
 
     } else if (strncmp(line, "DAMPER ", 7) == 0 || strncmp(line, "TEMPO ", 6) == 0) {
@@ -4902,9 +5112,9 @@ static void process_ctrl_cmd(const char *line, int fd)
             /* Returns immediately; the ramp is stepped from the main loop.
              * OK therefore means "accepted", not "finished" - see docs/api.md. */
             nks4_analog_ramp_start(dev, val, state);
-            REPLY("OK\n", 3);
+            REPLY_S("OK\n");
         } else {
-            REPLY("ERR\n", 4);
+            REPLY_S("ERR\n");
         }
 
     } else if (strncmp(line, "KEY ", 4) == 0) {
@@ -4912,15 +5122,15 @@ static void process_ctrl_cmd(const char *line, int fd)
         if (sscanf(line + 4, "%d %d", &code, &val) == 2 &&
                 code > 0 && code < 512 && (val == 0 || val == 1)) {
             inject_key(code, val);
-            REPLY("OK\n", 3);
+            REPLY_S("OK\n");
         } else {
-            REPLY("ERR\n", 4);
+            REPLY_S("ERR\n");
         }
 
     } else if (strcmp(line, "REFRESH") == 0) {
         /* Force change-driven mode to resend the current frame on the next tick */
         shadow_valid = 0;
-        REPLY("OK\n", 3);
+        REPLY_S("OK\n");
 
     } else if (strcmp(line, "STATE") == 0) {
         char resp[48];
@@ -5004,13 +5214,13 @@ static void process_ctrl_cmd(const char *line, int fd)
         if (sscanf(line + 11, "%d", &v) == 1 && v >= 0) {
             g_ss_timeout = v;
             ss_reset(time(NULL));
-            REPLY("OK\n", 3);
+            REPLY_S("OK\n");
         } else {
-            REPLY("ERR\n", 4);
+            REPLY_S("ERR\n");
         }
 
     } else if (strncmp(line, "MIDI_SEND ", 10) == 0) {
-        if (midi_in_fd < 0) { REPLY("ERR MIDI_NOT_LOADED\n", 20); }
+        if (midi_in_fd < 0) { REPLY_S("ERR MIDI_NOT_LOADED\n"); }
         else {
             uint8_t mb[4096];
             int mlen = hex_decode(line + 10, mb, sizeof(mb));
@@ -5021,27 +5231,27 @@ static void process_ctrl_cmd(const char *line, int fd)
                 if (!cc_throttle(mb, mlen))
                     (void)write(midi_in_fd, mb, mlen);
                 ss_activity();   /* injected MIDI is activity too - wake the mirror */
-                REPLY("OK\n", 3);
+                REPLY_S("OK\n");
             } else {
-                REPLY("ERR BAD_HEX\n", 12);
+                REPLY_S("ERR BAD_HEX\n");
             }
         }
 
     } else if (strncmp(line, "SYSEX ", 6) == 0) {
         if (midi_in_fd < 0 || midi_cap_fd < 0) {
-            REPLY("ERR MIDI_NOT_LOADED\n", 20);
+            REPLY_S("ERR MIDI_NOT_LOADED\n");
         } else if (sysex_pending) {
-            REPLY("ERR SYSEX_BUSY\n", 15);
+            REPLY_S("ERR SYSEX_BUSY\n");
         } else {
             uint8_t sb[4096];
             int slen = hex_decode(line + 6, sb, sizeof(sb));
             if (slen <= 0 || sb[0] != 0xF0) {
-                REPLY("ERR BAD_SYSEX\n", 14);
+                REPLY_S("ERR BAD_SYSEX\n");
             } else {
                 /* Start async capture - response sent by sysex_poll/sysex_finish
                  * in a later select iteration.  fd is kept open until then. */
                 if (!sysex_start_async(sb, slen, fd))
-                    REPLY("ERR SYSEX_FAIL\n", 15);
+                    REPLY_S("ERR SYSEX_FAIL\n");
                 /* Caller must NOT close fd if sysex_pending && sysex_resp_fd == fd */
             }
         }
@@ -5067,7 +5277,7 @@ static void process_ctrl_cmd(const char *line, int fd)
          * blocked until their own timeout - which is the exact failure this
          * arm exists to remove.  It also matches the plain "ERR\n" the argument
          * -parse failures in this same function already return. */
-        REPLY("ERR\n", 4);
+        REPLY_S("ERR\n");
     }
 
 #undef REPLY
@@ -5106,7 +5316,7 @@ static int handle_ctrl_persistent_data(void)
                     if (ctrl_lb_overflow) {
                         /* Line exceeded ctrl_lb - reject explicitly rather than
                          * dispatch a silently-truncated (corrupt) command. */
-                        write_all(ctrl_fd, "ERR LINE_TOO_LONG\n", 18);
+                        write_all(ctrl_fd, "ERR LINE_TOO_LONG\n", sizeof("ERR LINE_TOO_LONG\n") - 1);
                     } else if (ctrl_lb_n > 0) {
                         ctrl_lb[ctrl_lb_n] = '\0';
                         if (strncmp(ctrl_lb, "TOUCH_MOVE ", 11) == 0 &&
@@ -5232,7 +5442,7 @@ static int ctrl_dispatch_line(int cfd, const struct sockaddr_in *cpeer,
     if (fl_overflow) {
         /* Over-length first line - reject explicitly instead of acting on a
          * silently-truncated command. */
-        write_all(cfd, "ERR LINE_TOO_LONG\n", 18);
+        write_all(cfd, "ERR LINE_TOO_LONG\n", sizeof("ERR LINE_TOO_LONG\n") - 1);
         return 0;
     }
 
@@ -5275,13 +5485,33 @@ static int ctrl_dispatch_line(int cfd, const struct sockaddr_in *cpeer,
 }
 
 /* Consume whatever this connection has sent so far.  Never blocks: the fd is
- * O_NONBLOCK and we stop at EAGAIN, leaving the slot for the next pass. */
+ * O_NONBLOCK/MSG_DONTWAIT throughout and we stop at EAGAIN, leaving the slot
+ * for the next pass.
+ *
+ * Bulk peek-then-consume instead of one recv() per byte: MSG_PEEK finds the
+ * next newline (or confirms there isn't one yet) without consuming, then a
+ * second recv() consumes exactly what was found - either the whole line
+ * (peek hit a newline) or everything peeked so far (no newline yet - loop
+ * and peek more). This never reads past a line's terminating newline, so -
+ * unlike a naive "drain everything, THEN scan" rewrite - there is no
+ * leftover-bytes-past-the-newline case to rehome when the fd changes hands
+ * right after (CTRL_PERSIST adopts it as ctrl_fd, SYSEX parks it as
+ * sysex_resp_fd): any bytes still sitting in the kernel socket buffer just
+ * stay there for whichever function reads that fd next, exactly as before.
+ * Was 1 recv() per byte - up to ~8200 for one large MIDI_SEND/SYSEX line -
+ * now O(line_length / 512) (found 2026-09-19; this is the same cost class
+ * the deferred-accept rework this function is part of already fixed one
+ * layer up - see that rework's own 2026-08-17 header comment/measurements). */
 static void ctrl_pending_service(struct ctrl_pending *p)
 {
     for (;;) {
-        char c;
-        ssize_t r = recv(p->fd, &c, 1, MSG_DONTWAIT);
-        if (r < 0) {
+        char peek[512];
+        ssize_t pn, cn;
+        char *nl;
+        int take, has_nl, i, n;
+
+        pn = recv(p->fd, peek, sizeof(peek), MSG_DONTWAIT | MSG_PEEK);
+        if (pn < 0) {
             if (errno == EINTR)
                 continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK)
@@ -5289,21 +5519,39 @@ static void ctrl_pending_service(struct ctrl_pending *p)
             ctrl_pending_release(p, 1);
             return;
         }
-        if (r == 0) {                         /* peer closed before a newline */
+        if (pn == 0) {                        /* peer closed before a newline */
             ctrl_pending_release(p, 1);
             return;
         }
-        if (c == '\n') {
+
+        nl = memchr(peek, '\n', (size_t)pn);
+        take = nl ? (int)(nl - peek) + 1 : (int)pn;
+
+        /* Actually consume (not MSG_PEEK) exactly what was just found. Known
+         * available a moment ago and nothing else touches this fd (single-
+         * threaded), so a short/empty read here isn't expected - handled
+         * defensively (treat as closed) rather than assumed away. */
+        cn = recv(p->fd, peek, (size_t)take, MSG_DONTWAIT);
+        if (cn <= 0) {
+            ctrl_pending_release(p, 1);
+            return;
+        }
+
+        has_nl = nl && cn == take;
+        n = has_nl ? (int)cn - 1 : (int)cn;   /* exclude the newline itself */
+        for (i = 0; i < n; i++) {
+            if (p->len < (int)sizeof(p->line) - 1)
+                p->line[p->len++] = peek[i];
+            else
+                p->overflow = 1;              /* consume to newline, then reject */
+        }
+        if (has_nl) {
             int handed;
             p->line[p->len] = '\0';
             handed = ctrl_dispatch_line(p->fd, &p->peer, p->line, p->overflow);
             ctrl_pending_release(p, !handed);
             return;
         }
-        if (p->len < (int)sizeof(p->line) - 1)
-            p->line[p->len++] = c;
-        else
-            p->overflow = 1;                  /* consume to newline, then reject */
     }
 }
 
@@ -5394,6 +5642,10 @@ static int send_dirty_rect(int fd, uint32_t first_row, uint32_t row_count)
  * the just-sent frame without an extra copy. */
 static int capture_to_staging(void)
 {
+    /* Same rationale as send_frame()'s identical guard: this can run after
+     * select() has blocked for a while, so the top-of-loop refresh alone
+     * isn't enough to guarantee freshness at the actual read below. */
+    if (fb1_native_bpp == 16) fb1_refresh_shadow();
     if (fb1_stride == fb_w) {
         memcpy(staging, fb1_map, frame_bytes);
     } else {
@@ -5535,7 +5787,10 @@ static int try_load_nks4_inject(int live_wait_ds)
     unsigned long fn_chord = 0, fn_setled = 0;
     /* VM-testing-only (see resolve_nks4_kallsyms()): 0/unset on real hardware. */
     unsigned long fn_sinstance_get = 0;
-    char params[384];
+    /* ALTERNATE PADCHORD path - see resolve_nks4_kallsyms()'s comment on this
+     * probe. Only used by nks4_inject.c when fn_chord is 0. */
+    unsigned long fn_recv_trigger = 0;
+    char params[448];
     long ret;
 
     if (g_nks4_loaded)
@@ -5544,7 +5799,7 @@ static int try_load_nks4_inject(int live_wait_ds)
         return 0;                            /* OA not Live yet - caller may retry */
 
     resolve_nks4_kallsyms(&fn_switch, &fn_touch, &fn_rotary, &fn_analog, &fn_invert, &fn_chord,
-                           &fn_setled, &fn_sinstance_get);
+                           &fn_setled, &fn_sinstance_get, &fn_recv_trigger);
     if (!fn_switch || !fn_touch || !fn_rotary || !fn_analog || !fn_invert) {
         fprintf(stderr, "screenremote: missing NKS4 symbols in kallsyms "
                 "(switch=%s touch=%s rotary=%s analog=%s invert=%s) - "
@@ -5561,11 +5816,15 @@ static int try_load_nks4_inject(int live_wait_ds)
      * (inject_chord() checks fn_chord itself) - doesn't block the other 5. */
     snprintf(params, sizeof(params),
              "fn_switch=0x%lx fn_touch=0x%lx fn_rotary=0x%lx fn_analog=0x%lx fn_invert=0x%lx "
-             "fn_chord=0x%lx fn_setled=0x%lx fn_sinstance_get=0x%lx",
+             "fn_chord=0x%lx fn_setled=0x%lx fn_sinstance_get=0x%lx fn_recv_trigger=0x%lx",
              fn_switch, fn_touch, fn_rotary, fn_analog, fn_invert, fn_chord, fn_setled,
-             fn_sinstance_get);
-    if (!fn_chord)
-        fprintf(stderr, "screenremote: fn_chord not resolved - PADCHORD will be unavailable\n");
+             fn_sinstance_get, fn_recv_trigger);
+    if (!fn_chord && !fn_recv_trigger)
+        fprintf(stderr, "screenremote: neither fn_chord nor fn_recv_trigger resolved - "
+                "PADCHORD will be unavailable\n");
+    else if (!fn_chord)
+        fprintf(stderr, "screenremote: fn_chord not resolved, using fn_recv_trigger "
+                "fallback for PADCHORD (see nks4_inject.c)\n");
     /* Not fatal: nks4_inject falls back to deriving CSTGFrontPanel::sInstance from
      * fn_switch's own relocated .text, and BUTTON/WHEEL/analog never need it at all
      * (only the TOUCH commands dereference `this`). See nks4_inject.c. */
@@ -5754,6 +6013,23 @@ static long frame_interval_ns(int fps)
 {
     if (fps <= 0 || fps > FPS_MAX) fps = FPS_MAX;
     return 1000000000L / fps;
+}
+
+/* Shrink *tv so it represents at most max_us, leaving it alone if it already
+ * does - the main loop's select() timeout is computed once from the frame/
+ * mirror cadence, then narrowed by up to four independent deadlines (a held
+ * CC, a ramp step, an in-progress handshake, a parked ctrl connection) that
+ * must each fire on time even when the screen is otherwise idle and select()
+ * would happily park for a full second. All four narrowings were the same
+ * three-line "if bigger, overwrite" shape with a different bound; factored
+ * 2026-09-19 so a future fifth deadline is one call instead of another copy. */
+static void tv_clamp_us(struct timeval *tv, long max_us)
+{
+    long cur_us = tv->tv_sec * 1000000L + tv->tv_usec;
+    if (cur_us > max_us) {
+        tv->tv_sec  = max_us / 1000000L;
+        tv->tv_usec = max_us % 1000000L;
+    }
 }
 
 /* Pin ourselves - and, by inheritance across fork+exec, our streaming children and
@@ -6029,6 +6305,35 @@ int main(void)
         }
     }
     if (fb1_open() < 0) { graceful_shutdown(kmsg_pid); return 1; }
+
+    /* Nautilus touch Y-range: BEST-EFFORT proportional scaling, NOT verified
+     * against real hardware - see
+     * kronosology/docs/hardware/nautilus_touch_calibration.md for the full
+     * story and why. Short version: the Kronos-tuned g_touch_y_range default
+     * (638) empirically cancels out CSTGFrontPanel::HandleTouchPanel's own
+     * ADC<->pixel conversion for a Kronos-family unit's physical touch
+     * digitizer. The Nautilus's physical screen is reported as 800x480 (vs.
+     * Kronos's 800x600) while the logical fb1 render canvas stays 800x600 on
+     * both (confirmed via FBIOGET_VSCREENINFO and a real screen capture), so
+     * a touch position in that SAME 800x600 client-visible coordinate space
+     * needs a proportionally SMALLER ADC range to land correctly on the
+     * physically-shorter panel. Disassembling this Nautilus OA.ko's own
+     * HandleTouchPanel found it architecturally different from what the
+     * Kronos-tuned constant was derived against (no reference to the
+     * on-screen-touch-mode fields the Kronos version reads) - so this linear
+     * approximation (638 * 480/600 ~= 510) is a starting point, not a
+     * confirmed-correct value. Only applied when the operator hasn't already
+     * set touch_y_range= explicitly, on either device. */
+    if (fb1_native_bpp == 16 && !g_touch_y_range_from_config) {
+        int scaled = (int)((long)g_touch_y_range * 480L /
+                            (fb_h ? (long)fb_h : 600L));
+        fprintf(stderr, "screenremote: Nautilus detected - scaling touch_y_range "
+                "%d -> %d (800x480 physical vs 800x%u logical canvas, BEST-EFFORT, "
+                "not hardware-verified - override with touch_y_range= in "
+                "screenremote.cfg if this is wrong)\n", g_touch_y_range, scaled, fb_h);
+        g_touch_y_range = scaled;
+    }
+
     load_boot_splash();   /* optional - missing/invalid file just leaves compositing off */
 
     shadow = malloc(frame_bytes);
@@ -6103,6 +6408,11 @@ int main(void)
         int maxfd, r, client_just_connected = 0;
 
         if (g_exit) break;
+
+        /* Nautilus only (fb1_native_bpp==16): resync the shadow fb1_map from
+         * the real 16bpp device memory before anything below reads it. See
+         * fb1_refresh_shadow()'s comment. */
+        if (fb1_native_bpp == 16) fb1_refresh_shadow();
 
         if (handshake.fd >= 0) {
             struct timespec hs_now;
@@ -6208,6 +6518,7 @@ int main(void)
                 fprintf(stderr, "screenremote: nks4_inject loaded on retry "
                         "(%lds after retries began)\n", (long)(now - nks4_retry_t0));
                 g_nks4_load_pending = 0;
+                nks4_recovered();
             } else if (st < 0) {
                 g_nks4_load_pending = 0;   /* permanent failure - already logged the cause */
                 nks4_give_up("permanent load failure on retry");
@@ -6525,34 +6836,20 @@ int main(void)
 
         /* A held CC must land within the throttle interval even when the screen
          * is idle (MODE_PULL parks select() for up to 1 s). */
-        if (cc_pending) {
-            long max_us = CC_MIN_INTERVAL_MS * 1000L;
-            if (tv.tv_sec > 0 || tv.tv_usec > max_us) {
-                tv.tv_sec  = 0;
-                tv.tv_usec = max_us;
-            }
-        }
+        if (cc_pending)
+            tv_clamp_us(&tv, CC_MIN_INTERVAL_MS * 1000L);
         /* A ramp step must land on time even when nothing else is happening,
          * otherwise select() parks for up to 1 s and the ramp crawls. */
-        if (ramp_pending) {
-            long max_us = RAMP_STEP_MS * 1000L;
-            if (tv.tv_sec > 0 || tv.tv_usec > max_us) {
-                tv.tv_sec  = 0;
-                tv.tv_usec = max_us;
-            }
-        }
+        if (ramp_pending)
+            tv_clamp_us(&tv, RAMP_STEP_MS * 1000L);
         if (handshake.fd >= 0) {
             struct timespec hs_now;
-            long remaining_us, timeout_us;
+            long remaining_us;
             clock_gettime(CLOCK_MONOTONIC, &hs_now);
             remaining_us = (handshake.deadline.tv_sec - hs_now.tv_sec) * 1000000L +
                            (handshake.deadline.tv_nsec - hs_now.tv_nsec) / 1000L;
             if (remaining_us < 0) remaining_us = 0;
-            timeout_us = tv.tv_sec * 1000000L + tv.tv_usec;
-            if (remaining_us < timeout_us) {
-                tv.tv_sec = remaining_us / 1000000L;
-                tv.tv_usec = remaining_us % 1000000L;
-            }
+            tv_clamp_us(&tv, remaining_us);
         }
 
         /* A parked ctrl connection must be able to hit its deadline even when
@@ -6560,7 +6857,7 @@ int main(void)
          * second and a half-open connection outlives CTRL_PEND_DEADLINE_S. */
         {
             struct timespec cnow;
-            long timeout_us = tv.tv_sec * 1000000L + tv.tv_usec;
+            long min_rem = tv.tv_sec * 1000000L + tv.tv_usec;
             int i, any = 0;
             clock_gettime(CLOCK_MONOTONIC, &cnow);
             for (i = 0; i < CTRL_PEND_MAX; i++) {
@@ -6570,12 +6867,10 @@ int main(void)
                 rem = (g_ctrl_pend[i].deadline.tv_sec  - cnow.tv_sec)  * 1000000L
                     + (g_ctrl_pend[i].deadline.tv_nsec - cnow.tv_nsec) / 1000L;
                 if (rem < 0) rem = 0;
-                if (rem < timeout_us) timeout_us = rem;
+                if (rem < min_rem) min_rem = rem;
             }
-            if (any) {
-                tv.tv_sec  = timeout_us / 1000000L;
-                tv.tv_usec = timeout_us % 1000000L;
-            }
+            if (any)
+                tv_clamp_us(&tv, min_rem);
         }
 
         if (maxfd < 0) { usleep(500000); continue; }

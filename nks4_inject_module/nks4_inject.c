@@ -191,6 +191,7 @@
 #include <linux/notifier.h>
 #include <linux/mutex.h>
 #include <linux/uaccess.h>   /* copy_from_user + probe_kernel_read (see oa_read*) */
+#include "../common/oa_safe.h"
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Direct front-panel event injection for Korg Kronos (calls OA.ko's real Handle* methods)");
@@ -228,6 +229,25 @@ static unsigned long fn_chord = 0;         /* RT_chord_trigger(uchar,uchar,uchar
                                              * ESCommonKarmaCommon_GetChordMemory with the same
                                              * slot-index convention. */
 module_param(fn_chord, ulong, 0444);
+
+static unsigned long fn_recv_trigger = 0;  /* CSTGDrumPadInterface::ReceiveTriggerEvent(this,
+                                             * event) - ALTERNATE PADCHORD path for an OA.ko
+                                             * build where RT_chord_trigger (fn_chord above)
+                                             * doesn't exist at all - confirmed on a real
+                                             * Nautilus unit 2026-09-18 (no _Z16RT_chord_trigger*
+                                             * or Do_KM_note_out_chord_trig symbol anywhere in
+                                             * kallsyms; the whole KARMA pad-trigger path is
+                                             * routed through this class instead). Public,
+                                             * designed for exactly this - multiple unrelated
+                                             * MIDI/message-handler classes already call it as
+                                             * their own pad-trigger producer. Resolved directly
+                                             * via kallsyms as
+                                             * _ZN20CSTGDrumPadInterface19ReceiveTriggerEventE22STGDrumPadTriggerEvent
+                                             * - see resolve_nks4_kallsyms() in screenremote.c.
+                                             * Used only when fn_chord is 0 - see inject_chord().
+                                             * Full writeup:
+                                             * kronosology/docs/hardware/nautilus_padchord.md */
+module_param(fn_recv_trigger, ulong, 0444);
 
 static unsigned long fn_setled = 0;        /* CSTGFrontPanelMsgHandler::SetLED - NEVER called.
                                              * Resolved purely as an address anchor: the 4
@@ -270,6 +290,12 @@ typedef void (*short_invert_t)(unsigned char byte0, unsigned char byte1,
     __attribute__((regparm(3)));
 typedef void (*rt_chord_trigger_t)(unsigned char pad_index, unsigned char velocity,
                                     unsigned char param3, unsigned char param4)
+    __attribute__((regparm(3)));
+/* event: low byte = 0x90|pad_index (matches CSTGDrumPadInterface::ResetAllPads'
+ * own 0x90..0x97 sweep - real ground truth, not a guess), high byte = velocity
+ * (0 = release). Only the low 16 bits of EDX are used by the real function
+ * (a `mov [this+idx*2], dx` ring-buffer push) - see fn_recv_trigger's comment. */
+typedef void (*recv_trigger_event_t)(void *this_, unsigned short event)
     __attribute__((regparm(3)));
 typedef void *(*sinstance_get_t)(void)
     __attribute__((regparm(3)));
@@ -389,6 +415,22 @@ static char last_cmd[64];
 #define SETLED_OPCODE_OFF         0x01   /* the `a1` opcode byte guarding it */
 #define OPCODE_MOV_EAX_MOFFS32    0xa1
 
+/* CSTGDrumPadInterface::ReceiveTriggerEvent's OWN entry is its own anchor for
+ * &CSTGDrumPadInterface::sInstance - no separate thunk needed, unlike the
+ * CSTGFrontPanel derivation above. Real bytes (Nautilus OA.ko, 2026-09-18):
+ *     +0x0: 8b 0d <reloc &CSTGDrumPadInterface::sInstance>   mov ecx,ds:sInstance
+ *     +0x6: 53                                               push ebx
+ *     +0x7: 80 79 48 00                                      cmpb $0,0x48(ecx)
+ * This is the `8b /r` ModRM-absolute encoding (mod=00,reg=ecx,rm=101,disp32),
+ * NOT the single-byte `a1 moffs32` form the CSTGFrontPanel derivation above
+ * uses - hence the separate opcode+modrm check in read_modrm_abs32() rather
+ * than reusing read_moffs32(). */
+#define RECVTRIGGER_SINSTANCE_OPCODE_OFF  0x0  /* the `8b` opcode byte */
+#define RECVTRIGGER_SINSTANCE_MODRM_OFF   0x1  /* the `0d` ModRM byte (ecx, disp32, no base) */
+#define RECVTRIGGER_SINSTANCE_OFFSET      0x2  /* the disp32 itself */
+#define OPCODE_MOV_R32_MODRM              0x8b
+#define MODRM_MOV_ECX_DISP32              0x0d
+
 static unsigned long sinstance_addr;    /* &CSTGFrontPanel::sInstance, derived at setup */
 static unsigned long global_sinstance_addr; /* &CSTGGlobal::sInstance - what this module used
                                              * to (wrongly) pass as `this`. Retained ONLY as
@@ -399,19 +441,18 @@ static unsigned long global_sinstance_addr; /* &CSTGGlobal::sInstance - what thi
 static unsigned long sinstance_setled_addr; /* derivation (1), for the status node */
 static unsigned long sinstance_delta_addr;  /* derivation (2), for the status node */
 
-static int kptr_ok(unsigned long p)
-{
-    return p >= 0x40000000UL && p < 0xfffff000UL && (p & 3) == 0;
-}
+static unsigned long drumpad_sinstance_addr; /* &CSTGDrumPadInterface::sInstance, derived at
+                                               * setup from fn_recv_trigger's own entry bytes -
+                                               * see RECVTRIGGER_SINSTANCE_OFFSET above. */
 
 /* ---- Fault-safe reads of OA-owned memory --------------------------------
  *
- * kptr_ok() only rejects obviously-garbage pointers (null, misaligned, out of
- * kernel range).  It cannot tell a plausible address from an unmapped one, and
- * a raw dereference of the latter is an immediate oops - on a production board
- * that means the synth dies with no console to say why.  That is not
- * hypothetical: midi_bridge.c hit exactly this on real hardware (2026-07-16,
- * see the comment above its tap_read32) and fixed it the same way.
+ * kptr_ok()/oa_read8/oa_read32/oa_write8/oa_read_ptr now come from
+ * ../common/oa_safe.h (byte-identical to what midi_bridge.c independently
+ * grew for the same reason - merged 2026-09-19; see that header for the full
+ * "why probe_kernel_read/write, not a raw deref" rationale and the real
+ * oops it's fixing). Kept as macros over the shared oa_probe_* names rather
+ * than renaming every call site in this file.
  *
  * Every address this module dereferences is externally supplied and only ever
  * range-checked:
@@ -419,69 +460,71 @@ static int kptr_ok(unsigned long p)
  *     from /proc/kallsyms; OA can be unloaded between that lookup and our read.
  *   - sinstance_override is module_param(..., 0644), i.e. writable on a LIVE
  *     synth, so a single mistyped sysfs write would otherwise be fatal.
- * probe_kernel_read() routes all of these through the kernel's fault exception
- * tables, turning an oops into a clean "derivation failed" return.
  *
  * (The comment on sinstance_override cites eva_mode.ko's sm_pommi_addr as the
  * precedent for a live-writable address param.  Worth noting that eva_mode
  * reads that address through a faulting-safe path too - read_eva_u32() - so the
- * precedent argues for this treatment, not against it.) */
-static int oa_read8(unsigned long addr, uint8_t *out)
-{
-    return probe_kernel_read(out, (void *)addr, sizeof(*out)) == 0;
-}
-static int oa_read32(unsigned long addr, uint32_t *out)
-{
-    return probe_kernel_read(out, (void *)addr, sizeof(*out)) == 0;
-}
-
-/* Fault-safe counterpart for the one place this module WRITES OA-owned memory
- * (the PADMODE diagnostic).  Same argument as the reads above: the target came
- * from frontpanel_this(), which only range-checks, so a raw store to an
- * unmapped page is an oops on a board with no console to report it. */
-static int oa_write8(unsigned long addr, uint8_t v)
-{
-    return probe_kernel_write((void *)addr, &v, sizeof(v)) == 0;
-}
-
-/* Read a pointer out of a .bss singleton slot.  Returns NULL if the slot address
- * itself is implausible, if the slot is unmapped, or if the value read back is
- * not a plausible kernel pointer - so callers get one NULL check instead of
- * three separate failure modes. */
-static void *oa_read_ptr(unsigned long slot)
-{
-    unsigned long v;
-
-    if (!kptr_ok(slot))
-        return NULL;
-    if (probe_kernel_read(&v, (void *)slot, sizeof(v)) != 0)
-        return NULL;
-    return kptr_ok(v) ? (void *)v : NULL;
-}
+ * precedent argues for this treatment, not against it.)
+ *
+ * oa_write8 is this module's one place that WRITES OA-owned memory (the
+ * PADMODE diagnostic) - same argument as the reads: the target came from
+ * frontpanel_this(), which only range-checks, so a raw store to an unmapped
+ * page is an oops on a board with no console to report it. */
+#define oa_read8    oa_probe_read8
+#define oa_read32   oa_probe_read32
+#define oa_write8   oa_probe_write8
+#define oa_read_ptr oa_probe_read_ptr
 
 /* Read the 4-byte relocated immediate of a `mov eax, ds:X` at fn+operand_off,
  * asserting the opcode byte at fn+opcode_off first. Returns 0 on any mismatch
  * or on an unreadable address. */
+/* Range check only, shared by read_moffs32()/read_modrm_abs32() below -
+ * deliberately NOT kptr_ok(), which also demands 4-byte alignment. That is
+ * correct for the .bss slot they return (a 4-byte-aligned variable, and
+ * callers do run the result through kptr_ok) but wrong for `fn`: x86
+ * function entry points carry no alignment guarantee, and OA.ko has plenty
+ * of unaligned ones (RT_chord_trigger @0x512842, Do_KM_note_out_chord_trig
+ * @0x55e3fa). Requiring alignment here would silently drop the derivation if
+ * a future OA build shifted these functions onto an odd address. */
+static int oa_text_ok(unsigned long fn)
+{
+    return fn >= 0x40000000UL && fn < 0xfffff000UL;
+}
+
 static unsigned long read_moffs32(unsigned long fn, int opcode_off, int operand_off)
 {
     uint8_t  opcode;
     uint32_t imm;
 
-    /* Range check only - deliberately NOT kptr_ok(), which also demands 4-byte
-     * alignment. That is correct for the .bss slot we return (a 4-byte-aligned
-     * variable, and callers do run the result through kptr_ok) but wrong for
-     * `fn`: x86 function entry points carry no alignment guarantee, and OA.ko
-     * has plenty of unaligned ones (RT_chord_trigger @0x512842,
-     * Do_KM_note_out_chord_trig @0x55e3fa). Requiring alignment here would
-     * silently drop the derivation if a future OA build shifted these two
-     * functions onto an odd address. */
-    if (fn < 0x40000000UL || fn >= 0xfffff000UL)
+    if (!oa_text_ok(fn))
         return 0;
     if (!oa_read8(fn + opcode_off, &opcode) || opcode != OPCODE_MOV_EAX_MOFFS32)
         return 0;
     /* uint32_t, not unsigned long: the operand of `mov eax,moffs32` is exactly
      * 4 bytes. Same width on this i386 target either way, but the intent is
      * the instruction encoding, not the host word size. */
+    if (!oa_read32(fn + operand_off, &imm))
+        return 0;
+    return (unsigned long)imm;
+}
+
+/* Same idea as read_moffs32() above, for the `8b /r` ModRM-absolute encoding
+ * (`mov r32, [disp32]`, no base register) instead of the single-byte `a1
+ * moffs32` form - see RECVTRIGGER_SINSTANCE_* above for why fn_recv_trigger
+ * needs this second form. Asserts both the opcode AND the ModRM byte before
+ * trusting the operand, same "refuse rather than guess" contract. */
+static unsigned long read_modrm_abs32(unsigned long fn, int opcode_off, int modrm_off,
+                                       int operand_off, uint8_t expect_modrm)
+{
+    uint8_t  opcode, modrm;
+    uint32_t imm;
+
+    if (!oa_text_ok(fn))
+        return 0;
+    if (!oa_read8(fn + opcode_off, &opcode) || opcode != OPCODE_MOV_R32_MODRM)
+        return 0;
+    if (!oa_read8(fn + modrm_off, &modrm) || modrm != expect_modrm)
+        return 0;
     if (!oa_read32(fn + operand_off, &imm))
         return 0;
     return (unsigned long)imm;
@@ -610,19 +653,62 @@ static int inject_analog(int dev, unsigned char b0, unsigned char b1)
     return 0;
 }
 
+/* &CSTGDrumPadInterface::sInstance dereferenced fresh on every call, same
+ * rationale as frontpanel_this() - cheap, and avoids caching a stale object
+ * pointer across an OA reload. No override/VM-testing indirection here (yet):
+ * this path only exists for the fn_chord-absent case, so there's no shipped
+ * behaviour it could regress. */
+static void *drumpad_this(void)
+{
+    if (!drumpad_sinstance_addr)
+        return NULL;
+    return oa_read_ptr(drumpad_sinstance_addr);
+}
+
+/* ALTERNATE PADCHORD path for an OA.ko build with no RT_chord_trigger free
+ * function at all (see fn_recv_trigger's comment above and
+ * kronosology/docs/hardware/nautilus_padchord.md for the full derivation).
+ * CSTGDrumPadInterface::ReceiveTriggerEvent(this, event) pushes a 2-byte
+ * MIDI-note-style event into the singleton's 32-slot ring buffer, which the
+ * KARMA engine itself drains and plays - same real firmware path a genuine
+ * touch or USB drum-pad event takes, just entered one call earlier than
+ * fn_chord's more direct (but, on this OA.ko build, nonexistent) shortcut. */
+static int inject_chord_recv(int pad_index, int velocity)
+{
+    recv_trigger_event_t f = (recv_trigger_event_t)fn_recv_trigger;
+    void *this_;
+    unsigned short event;
+
+    if (oa_dead || !fn_recv_trigger || pad_index < 0 || pad_index > 7)
+        return -1;
+    this_ = drumpad_this();
+    if (!this_)
+        return -1;
+    event = (unsigned short)(0x90 | pad_index) |
+            (unsigned short)((velocity & 0xff) << 8);
+    f(this_, event);
+    return 0;
+}
+
 /* EXPERIMENTAL: RT_chord_trigger is a plain (non-member) function - no "this"
  * pointer, no frontpanel_this() gate. pad_index 0-7 selects the KARMA chord-
  * memory slot (confirmed via CESProgTask::GetPad1-8 -> ESCommonKarmaCommon_
  * GetChordMemory using the same 0-based slot convention). velocity!=0 plays
  * the chord (per-voice Do_KM_note_out_chord_trig calls); velocity==0 releases
  * it. param3/param4 mirror the real caller's own (bank-flag, this!=0) args -
- * best-effort guess (0, 1), not yet hardware-confirmed to matter. */
+ * best-effort guess (0, 1), not yet hardware-confirmed to matter.
+ *
+ * Falls back to inject_chord_recv() (param3/param4 dropped - not needed by
+ * that path) when fn_chord wasn't resolved at all, rather than just failing -
+ * see fn_recv_trigger's comment for which OA.ko builds need the fallback. */
 static int inject_chord(int pad_index, int velocity, int param3, int param4)
 {
     rt_chord_trigger_t f = (rt_chord_trigger_t)fn_chord;
 
-    if (oa_dead || !fn_chord || pad_index < 0 || pad_index > 7)
+    if (oa_dead || pad_index < 0 || pad_index > 7)
         return -1;
+    if (!fn_chord)
+        return inject_chord_recv(pad_index, velocity);
     f((unsigned char)pad_index, (unsigned char)velocity,
       (unsigned char)param3, (unsigned char)param4);
     return 0;
@@ -712,10 +798,14 @@ static int inject_write_proc(struct file *file, const char __user *buf,
  * garbage in the out-params would make that regression test pass for the wrong
  * reason, which is worse than no test at all.  Callers must not read the
  * out-params unless this returns 0. */
-static int touch_pad_mode_read(unsigned char *flag_out, unsigned char *latch_out,
-                                unsigned char *stored_out)
+/* this_ptr: caller-resolved frontpanel_this() result, not re-derived here -
+ * its one caller (status_read_proc()) already needs its own copy of that
+ * same resolution for this_ok, and a second independent frontpanel_this()
+ * call here was pure duplication of the identical probe (found 2026-09-19). */
+static int touch_pad_mode_read(void *this_ptr, unsigned char *flag_out,
+                                unsigned char *latch_out, unsigned char *stored_out)
 {
-    unsigned long p = (unsigned long)frontpanel_this();
+    unsigned long p = (unsigned long)this_ptr;
 
     if (!p)
         return -1;
@@ -757,9 +847,17 @@ static int status_read_proc(char *page, char **start, off_t off,
         this_ok = 0;
         blind_ok = 0;
     } else {
-        pad_rc   = touch_pad_mode_read(&pad_flag, &pad_latch, &pad_stored);
-        this_ok  = frontpanel_this() != NULL;
-        blind_ok = blind_this() != NULL;
+        /* Resolved once and reused for both this_ok and touch_pad_mode_read();
+         * blind_ok derives from it too rather than calling blind_this() (which
+         * would just re-derive the same frontpanel_this() result internally
+         * before falling back) - three independent probes of the same .bss
+         * slot collapsed to one, plus a fallback probe only when it's
+         * actually needed (found 2026-09-19). */
+        void *this_ = frontpanel_this();
+        this_ok  = (this_ != NULL);
+        pad_rc   = touch_pad_mode_read(this_, &pad_flag, &pad_latch, &pad_stored);
+        blind_ok = this_ ? 1 :
+                   (global_sinstance_addr && oa_read_ptr(global_sinstance_addr) != NULL);
     }
     strlcpy(last_cmd_copy, last_cmd, sizeof(last_cmd_copy));
     mutex_unlock(&inj_lock);
@@ -769,6 +867,8 @@ static int status_read_proc(char *page, char **start, off_t off,
         "fn_analog=0x%lx fn_invert=0x%lx fn_chord=0x%lx\n"
         "sinstance_setled=0x%lx sinstance_delta=0x%lx agree=%d cstgglobal=0x%lx "
         "override=0x%lx\n"
+        "fn_recv_trigger=0x%lx drumpad_sinstance=0x%lx (PADCHORD fallback - used "
+        "only when fn_chord=0)\n"
         "oa_dead=%d this_resolved=%d blind_this_resolved=%d\n"
         "onscreen_touch_pad_mode=%d latch=0x%02x stored=0x%02x (rc=%d)\n"
         "counters: btn=%u touch=%u rot=%u analog=%u gated=%u badcmd=%u chord=%u\n"
@@ -779,6 +879,7 @@ static int status_read_proc(char *page, char **start, off_t off,
         (sinstance_setled_addr && sinstance_delta_addr &&
          sinstance_setled_addr == sinstance_delta_addr),
         global_sinstance_addr, sinstance_override,
+        fn_recv_trigger, drumpad_sinstance_addr,
         dead, this_ok, blind_ok,
         (int)pad_flag, pad_latch, pad_stored, pad_rc,
         cnt_btn, cnt_touch, cnt_rot, cnt_analog, cnt_gated, cnt_badcmd, cnt_chord,
@@ -845,6 +946,23 @@ static void nks4_inject_setup(struct work_struct *work)
                    "`mov eax,ds:CSTGFrontPanel::sInstance` (got 0x%lx)\n",
                    SETLED_SINSTANCE_OFFSET, s);
     }
+    if (fn_recv_trigger) {
+        unsigned long d = read_modrm_abs32(fn_recv_trigger,
+                                            RECVTRIGGER_SINSTANCE_OPCODE_OFF,
+                                            RECVTRIGGER_SINSTANCE_MODRM_OFF,
+                                            RECVTRIGGER_SINSTANCE_OFFSET,
+                                            MODRM_MOV_ECX_DISP32);
+        if (kptr_ok(d)) {
+            drumpad_sinstance_addr = d;
+            printk(KERN_INFO "nks4_inject: drumpad sInstance=0x%lx (PADCHORD via "
+                   "ReceiveTriggerEvent fallback)\n", d);
+        } else {
+            printk(KERN_WARNING "nks4_inject: ReceiveTriggerEvent+0x%x is not the "
+                   "expected `mov ecx,ds:CSTGDrumPadInterface::sInstance` (got 0x%lx) "
+                   "- re-derive RECVTRIGGER_SINSTANCE_OFFSET against this OA.ko\n",
+                   RECVTRIGGER_SINSTANCE_OFFSET, d);
+        }
+    }
 
     /* NOTE: sinstance_override is deliberately NOT folded into sinstance_addr -
      * frontpanel_this() consults it live on every call so it can be retargeted
@@ -905,9 +1023,10 @@ static void nks4_inject_setup(struct work_struct *work)
     register_module_notifier(&nks4_nb);
 
     printk(KERN_INFO "nks4_inject: ready - sinstance=0x%lx (cstgglobal=0x%lx) switch=0x%lx "
-           "touch=0x%lx rotary=0x%lx analog=0x%lx invert=0x%lx chord=0x%lx\n",
+           "touch=0x%lx rotary=0x%lx analog=0x%lx invert=0x%lx chord=0x%lx "
+           "recv_trigger=0x%lx (drumpad_sinstance=0x%lx)\n",
            sinstance_addr, global_sinstance_addr, fn_switch, fn_touch, fn_rotary,
-           fn_analog, fn_invert, fn_chord);
+           fn_analog, fn_invert, fn_chord, fn_recv_trigger, drumpad_sinstance_addr);
 }
 
 static int __init nks4_inject_init(void)

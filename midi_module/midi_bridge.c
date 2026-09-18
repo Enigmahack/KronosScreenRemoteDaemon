@@ -66,6 +66,7 @@
 #include <linux/proc_fs.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
+#include "../common/oa_safe.h"
 #include <linux/spinlock.h>
 #include <linux/mutex.h>
 #include <linux/notifier.h>
@@ -241,12 +242,12 @@ struct tapq {
 static struct tapq taps[6];   /* shared q1,q2 + up to 4 per-port q3 */
 static int ntaps;             /* number of queues we successfully tapped */
 
-static int kptr_ok(unsigned long p)
-{
-    return p >= 0x40000000UL && p < 0xfffff000UL && (p & 3) == 0;
-}
-
-/* kptr_ok() only rejects obviously-garbage pointers (null, misaligned, out of
+/* kptr_ok()/tap_read8/tap_read32/tap_readn now come from ../common/oa_safe.h
+ * (byte-identical to what nks4_inject.c independently grew for the same
+ * reason - merged 2026-09-19). Kept as macros over the shared oa_probe_*
+ * names rather than renaming every call site in this file.
+ *
+ * kptr_ok() only rejects obviously-garbage pointers (null, misaligned, out of
  * kernel range) - it cannot tell a plausible pointer from one that's since gone
  * stale.  t->ringctl/t->buf are resolved ONCE, at setup (tap_claim_reader runs a
  * single time), and OA can free/move a queue's control structure during normal
@@ -258,22 +259,9 @@ static int kptr_ok(unsigned long p)
  * the kernel's fault exception tables to turn that into a clean failure instead
  * of an oops - every touch of a t->ringctl-derived control-structure address in
  * tap_claim_slots/tap_release_slots/tap_drain_one's wpos read goes through these. */
-static int tap_read32(unsigned long addr, uint32_t *out)
-{
-    return probe_kernel_read(out, (void *)addr, sizeof(*out)) == 0;
-}
-static int tap_read8(unsigned long addr, uint8_t *out)
-{
-    return probe_kernel_read(out, (void *)addr, sizeof(*out)) == 0;
-}
-/* Block form, for the setup-time byte-pattern scans over OA .text/.bss.  Those
- * run in a window where OA has just been confirmed Live, but they are the same
- * fault class as everything above and there is no reason for the module to be
- * half-safe. */
-static int tap_readn(unsigned long addr, void *out, size_t n)
-{
-    return probe_kernel_read(out, (void *)addr, n) == 0;
-}
+#define tap_read32 oa_probe_read32
+#define tap_read8  oa_probe_read8
+#define tap_readn  oa_probe_readn
 
 /* ------------------------------------------------------------------ */
 /*  Unified MIDI OUT ring (SPSC: drain producer -> /proc/.midi_ring)   */
@@ -368,6 +356,19 @@ static int tap_claim_one(unsigned long portp, int qslot)
     qbuf = v;
     if (!kptr_ok(qptr) || !kptr_ok(qbuf))
         return -1;
+    /* Two taps resolving the SAME ringctl (e.g. two ports whose queue
+     * pointers happen to alias) would defeat tap_release_slots()'s "we are
+     * always the top reader" invariant - the lower-index one releases first,
+     * fails the top-reader check, and gets retired while the real top reader
+     * (the other tap on the same queue) never frees its slot, permanently
+     * inflating OA's reader count by one. Refuse the duplicate outright
+     * rather than relying on release order to save it (found 2026-09-19). */
+    {
+        int j;
+        for (j = 0; j < ntaps; j++)
+            if (taps[j].ringctl == qptr)
+                return -1;
+    }
     if (!tap_read32(qptr + RC_MASK, &mask))
         return -1;
     /* mask is capacity-1, so a valid one is nonzero and 2^n - 1.
@@ -425,6 +426,14 @@ static void tap_claim_slots(void)
         }
         if (cur_count >= RC_MAXREADERS)
             continue;
+        /* The one deliberately-accepted raw (non-fault-safe) access in this
+         * file: there is no fault-safe atomic RMW primitive, so this can't be
+         * routed through probe_kernel_* the way every other touch of
+         * OA-owned memory here is. The tap_read8() just above narrows the
+         * window (confirms the region is still mapped a moment earlier) but
+         * doesn't close it - accepted as-is rather than left looking like an
+         * oversight, since the alternative (skip tapping entirely) costs the
+         * whole feature for a hazard that has not been observed in practice. */
         idx = __sync_fetch_and_add(rcount, 1);
         if (idx >= RC_MAXREADERS) { __sync_fetch_and_sub(rcount, 1); continue; }
         if (!tap_read32(t->ringctl + RC_WPOS, &wpos)) {
@@ -450,7 +459,14 @@ static void tap_claim_slots(void)
 static void tap_release_slots(void)
 {
     int i;
-    for (i = 0; i < ntaps; i++) {
+    /* Descending, not ascending: the "we are always the top reader" comment
+     * above assumes stack discipline (last claimed, first released). Reader
+     * indices are handed out in ascending claim order (tap_claim_slots()'s
+     * __sync_fetch_and_add), so releasing taps[] in the same ascending order
+     * is backwards for that invariant - tap_claim_one() now refuses a
+     * duplicate ringctl so this can't matter in practice, but descending
+     * order is the actually-correct one to have regardless (found 2026-09-19). */
+    for (i = ntaps - 1; i >= 0; i--) {
         struct tapq *t = &taps[i];
         volatile uint8_t *rcount;
         uint8_t cur_count;
@@ -500,31 +516,31 @@ static int tap_claim_reader(void)
     if (!out_ports)
         return 0;
 
-    /* First activated out-port carries the shared queue pointers. */
+    /* Single pass over the 4 out-ports (was two - an identical re-read of
+     * the same 4 entries, once just to find the first valid one for p0, once
+     * to claim q3 on every valid one including that same port again).
+     * First activated out-port carries the shared queue pointers (q1/q2 -
+     * identical across all out-ports, so claimed exactly once, off the
+     * first valid port encountered); every valid out-port (that one
+     * included) also gets its own per-port q3 claimed (found 2026-09-19). */
     for (i = 0; i < 4; i++) {
         uint32_t v;
-        if (!tap_read32(out_ports + i * 4, &v))
+        if (!tap_read32(out_ports + i * 4, &v) || !kptr_ok(v))
             continue;
-        if (kptr_ok(v)) { p0 = v; break; }
+        if (!p0) {
+            p0 = v;
+            /* Shared queues carry live performance BUT draining them races with
+             * OA's MIDI reconfiguration on a Program/Combi load and wedges EVA -
+             * opt-in via param. */
+            if (tap_shared) {
+                tap_claim_one(p0, 1);   /* q1 shared (misc)                    */
+                tap_claim_one(p0, 2);   /* q2 shared (performance: notes/CC/PC/combi SysEx) */
+            }
+        }
+        tap_claim_one(v, 3);   /* per-port bulk-dump queue */
     }
     if (!p0)
         return 0;
-
-    /* Shared queues carry live performance BUT draining them races with OA's MIDI
-     * reconfiguration on a Program/Combi load and wedges EVA - opt-in via param. */
-    if (tap_shared) {
-        tap_claim_one(p0, 1);   /* q1 shared (misc)                    */
-        tap_claim_one(p0, 2);   /* q2 shared (performance: notes/CC/PC/combi SysEx) */
-    }
-
-    /* Per-port bulk-dump queue (q3) from every activated out-port. */
-    for (i = 0; i < 4; i++) {
-        uint32_t v;
-        if (!tap_read32(out_ports + i * 4, &v))
-            continue;
-        if (kptr_ok(v))
-            tap_claim_one(v, 3);
-    }
     /* Close the drain window NOW.  drain_until must not stay 0: on this kernel
      * jiffies boots negative-as-signed, so time_after(jiffies, 0) is FALSE and the
      * drain would poll the codec region at idle from boot until the first dump -
@@ -860,6 +876,21 @@ static void *find_port_object(void)
             printk(KERN_ERR "midi_bridge: RegisterMidiInPort unreadable\n");
             return NULL;
         }
+        /* NOT the same check as resolve_out_ports() - tried making these
+         * match exactly on 2026-09-19 (reasoning that both read a `movsx
+         * edx, byte[eax+disp8]` / `mov [disp32+edx*4], eax` pair and should
+         * therefore share one pattern) and broke MIDI-in discovery on real
+         * Nautilus hardware: fn_bytes[3] is the disp8 OPERAND of the first
+         * instruction (which field of the port object gets read), not a
+         * fixed opcode byte - RegisterMidiInPort's real disp8 there is 0x29
+         * on that unit's OA.ko (confirmed via live memory dump), not
+         * resolve_out_ports()'s 0x04. fn_bytes[2]=0x50 matching in both is
+         * because both instructions happen to share the same `[eax+disp8]`
+         * ModRM addressing mode and edx destination, not because the two
+         * checks are required to agree - they resolve two different fields
+         * on two different object types. Reverted to only checking the
+         * bytes that really are fixed opcode/ModRM/SIB (0,1,4,5,6); disp8
+         * at [3] and the disp32 at [7..10] are data, not signature. */
         if (fn_bytes[0] != 0x0f || fn_bytes[1] != 0xbe ||
             fn_bytes[4] != 0x89 || fn_bytes[5] != 0x04 || fn_bytes[6] != 0x95) {
             printk(KERN_ERR "midi_bridge: RegisterMidiInPort pattern mismatch\n");

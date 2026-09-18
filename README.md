@@ -5,6 +5,16 @@ Kronos Screen Remote Daemon: A framebuffer streaming daemon with virtual keyboar
 *AI DISCLAIMER*
 AI was used in the development of this code; it was AI-assisted, not vibe-coded. All code has been human-reviewed. 
 
+**Cross-platform note (2026-09-08)**: this unmodified, Kronos-built package
+was also installed on a real Nautilus and completed successfully, with
+boot-log output observed in the daemon's FTP path consistent with the
+process actually starting. TCP-level functionality (framebuffer streaming,
+input injection) is not yet confirmed — the test unit has no ethernet wired
+yet. `eva_mode.ko`'s hardcoded Kronos VMA/struct-offsets are expected to
+need Nautilus-specific recalibration even once network access exists. Full
+per-module analysis:
+`Nautilus Research/MAIN/08_tools_and_scripts/screen_remote_daemon_nautilus_feasibility.md`.
+
 > **Context**: this daemon is the Kronos-side counterpart to
 > [KronosScreenRemote](../KronosScreenRemote/) (C#) and
 > [KronosScreenRemotePy](../KronosScreenRemotePy/) (Python), and its kernel

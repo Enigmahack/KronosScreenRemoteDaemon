@@ -479,6 +479,7 @@ deps_/home/share/KronosScreenRemoteDaemon/nks4_inject_module/nks4_inject.o := \
     $(wildcard include/config/x86/wp/works/ok.h) \
     $(wildcard include/config/x86/intel/usercopy.h) \
   /home/build/linux-kronos/arch/x86/include/asm/uaccess_32.h \
+  /home/share/KronosScreenRemoteDaemon/nks4_inject_module/../common/oa_safe.h \
 
 /home/share/KronosScreenRemoteDaemon/nks4_inject_module/nks4_inject.o: $(deps_/home/share/KronosScreenRemoteDaemon/nks4_inject_module/nks4_inject.o)
 
