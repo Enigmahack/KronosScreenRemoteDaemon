@@ -1,6 +1,6 @@
 # KronosScreenRemoteDaemon - API Reference
 
-This document describes every network interface exposed by the `screenremote` daemon: the stream port, the control port, and the UDP discovery probe. All multi-byte integer fields are **little-endian** unless otherwise noted.
+**Applies to screenremote 3.0.2.** This document describes every network interface exposed by the `screenremote` daemon: the stream port, the control port, and the UDP discovery probe. All multi-byte integer fields are **little-endian** unless otherwise noted. Client-visible changes per release are listed in [Section 15](#15-changes-by-release); a client being written today should implement stream protocol **v3** ([3.0](#30-choosing-a-protocol-version), [4.5](#45-protocol-v3---native-pixel-stream-302)).
 
 ---
 
@@ -20,6 +20,7 @@ This document describes every network interface exposed by the `screenremote` da
 12. [Authentication internals](#12-authentication-internals)
 13. [Error handling and disconnection](#13-error-handling-and-disconnection)
 14. [Implementation limits](#14-implementation-limits)
+15. [Changes by release](#15-changes-by-release)
 
 ---
 
@@ -84,6 +85,22 @@ Port numbers are decimal ASCII. `MIDI=1` indicates the MIDI injection module loa
 Connect to the stream port (default 7373). The daemon applies a **5-second receive timeout** for the duration of the handshake. After a successful handshake the timeout is cleared.
 
 The daemon sets `TCP_NODELAY` and enlarges the send buffer to 512 KB (using `SO_SNDBUFFORCE`, which requires the daemon to run as root) to avoid write-stall fragmentation on 480 KB frames.
+
+### 3.0 Choosing a protocol version
+
+The hello's version byte selects one of two stream protocols. Everything else about the connection (ports, authentication, control port, MIDI) is identical.
+
+| | v2 (`0x02`) | v3 (`0x03`, 3.0.2+) |
+|---|---|---|
+| Pixel data | 8-bit palette indices + a 256-entry palette | The hardware's native format: `INDEX8` + palette on Kronos, `RGB565LE` on Nautilus |
+| Geometry | The framebuffer's (800x600 on both) | The **visible panel** (800x600 Kronos, 800x480 Nautilus) |
+| Frame unit | Full frame, or a band of whole rows | Any rectangle; a full frame is the rect (0,0,w,h) |
+| Compression | PackBits | raw / PackBits / zlib-deflate, per frame |
+| Works on Kronos | yes | yes |
+| Works on Nautilus | **no** - refused with status `0x03` | yes |
+| Daemons | all | 3.0.2+ (older daemons answer a v3 hello with status `0x01`) |
+
+**New clients should implement v3 only.** It is a superset: on a Kronos it delivers the same `INDEX8` pixels and palette as v2, just as rects. Keep v2 only if you must talk to a pre-3.0.2 daemon. A client can learn which it needs before connecting from the [UDP discovery](#2-udp-discovery) reply (`PROTO=3 FMT=... GEOM=...` present = 3.0.2+), and the daemon's failure statuses `0x03`/`0x04` say exactly which direction a mismatch is in.
 
 ### 3.2 Client hello
 
@@ -169,9 +186,11 @@ On any failure the server closes the connection immediately after sending the 5-
 
 ## 4. Stream port - frame formats
 
-After a successful handshake the server begins sending frames. All frames share the same 4-byte little-endian length prefix. The client uses the length value to determine the frame type.
+After a successful handshake the server begins sending frames. All frames, in both protocol versions, start with a 4-byte little-endian length prefix covering everything after it.
 
-Let `F = width * height` (frame size in bytes, e.g. 480000 for 800x600).
+Sections 4.1-4.4 describe the **v2** frame formats (index8 only; the client uses the length value to tell a full frame from a dirty-rect update). Section 4.5 describes **v3**, where every frame is self-describing.
+
+Let `F = width * height` (v2 frame size in bytes, e.g. 480000 for 800x600).
 
 ### 4.1 Full frame
 
@@ -222,7 +241,7 @@ The encoding follows standard PackBits (Apple/TIFF variant):
 
 Worst-case expansion is approximately 1/128 overhead (one extra header byte per 128 literal bytes), so the compressed output is at most `n + ceil(n/128)` bytes for input of `n` bytes.
 
-### 4.4 Pull mode frame request
+### 4.4 Pull mode frame request (v2)
 
 In Pull mode the client controls frame delivery by sending single-byte commands on the stream socket.
 
@@ -230,7 +249,7 @@ In Pull mode the client controls frame delivery by sending single-byte commands 
 0xFF  - request one full frame
 ```
 
-Any other byte, or a closed connection, causes the server to drop the client.
+Any other byte, or a closed connection, causes the server to drop the client. (v3 adds `0xFE`, see 4.5.)
 
 ### 4.5 Protocol v3 - native pixel stream (3.0.2+)
 
@@ -313,6 +332,72 @@ repaints a small cursor every tick), ~6% during page switching; ~29 ms to deflat
 worst-case full frame. Rects of <= 512 bytes are always sent raw (`enc=0`).
 
 Reference implementation: `tools/kscr_v3_client.py` (stdlib only).
+
+#### 4.5.1 Worked example
+
+A Nautilus, change mode. Handshake success response (13 bytes, no palette because `fmt=1`):
+
+```
+4B 53 43 52  00  20 03  E0 01  01  10  02  00
+K  S  C  R   ok  w=800  h=480  fmt bpp enc flags
+                                RGB565LE 16 deflate
+```
+
+First frame - a full 800x480 RGB565 rect, deflated (209882 payload bytes on a PROGRAM page):
+
+```
+DA 33 03 00        len = 0x000333DA = 209882 (the 9-byte rect header + 209873 data bytes)
+02                 enc = 2 (zlib)
+00 00  00 00       x0 = 0, y0 = 0
+20 03  E0 01       w = 800, h = 480
+78 01 ...          data: zlib stream; inflates to exactly 800*480*2 = 768000 bytes
+```
+
+A later delta - the UI's 2x48 px cursor blink, sent raw because it is under 512 bytes:
+
+```
+C9 00 00 00        len = 201
+00                 enc = 0 (raw)
+31 00  42 00       x0 = 49, y0 = 66
+02 00  30 00       w = 2, h = 48
+xx xx xx xx ...    192 bytes: 48 rows x 2 px x 2 bytes, no padding
+```
+
+A `0xFE` poll with nothing changed: `09 00 00 00  00  00 00 00 00  00 00 00 00` (len 9, raw, empty rect).
+
+#### 4.5.2 Client implementation outline
+
+```
+hello(ver=3, mode, fps, user, pass)
+rsp = read(5); if rsp[4] != 0: (if 3 or 4: read(2) -> ver_min, ver_max) -> report and stop
+w, h, fmt, bpp, enc, flags = read(8)
+palette = read(768) if fmt == 0 else None
+canvas = bytearray(w * h * bpp/8)          # native pixels, client-side composite
+
+loop:
+    if pull mode: send(0xFF first time, then 0xFE or 0xFF as you like)
+    len = read_u32(); pl = read(len)
+    enc, x0, y0, rw, rh = pl[0], u16(pl[1]), u16(pl[3]), u16(pl[5]), u16(pl[7])
+    data = pl[9:]
+    if rw == 0 or rh == 0: continue         # explicit "unchanged" (0xFE reply only)
+    if enc == 2: data = inflate(data)       # zlib/RFC 1950
+    if enc == 1: data = packbits_decode(data, rw*rh*bpp/8)
+    copy data row by row into canvas at (x0, y0), row pitch rw*bpp/8
+    present(canvas):
+        fmt 0: rgb = palette[index]
+        fmt 1: v = u16le; r = v>>11; g = (v>>5)&63; b = v&31
+               R = (r<<3)|(r>>2); G = (g<<2)|(g>>4); B = (b<<3)|(b>>2)   # replicate high bits, don't just shift
+```
+
+Notes for implementers:
+
+- The first frame after a successful handshake is always a full-canvas rect, so `canvas` never needs a "valid" flag. If you ever see a partial rect before any full one (should not happen), request `REFRESH` on the control port or send `0xFF`.
+- Rects never overlap the previous frame's content incorrectly - each one is a complete replacement of its area, in the same coordinate system as the canvas. Apply them in order.
+- Rect bounds are always within `(w, h)`; a defensive client should still clip.
+- `len` in the frame prefix is the total payload including the 9-byte rect header - read `len` bytes, then parse.
+- `enc` in the handshake is what the daemon *prefers*; individual frames can still arrive as `enc=0` (tiny rects, or when compression would expand). Always switch on the frame's own byte.
+- Change mode at 15 fps with the byte-rate cap engaged simply delivers fewer frames; there is no "dropped frame" signal because nothing is dropped - the next rect covers everything that changed since the last one you received.
+- `REFRESH` on the control port forces the next change-mode tick to send a full-canvas rect (both protocol versions).
 
 ---
 
@@ -929,7 +1014,7 @@ Events are delivered to `/proc/.vkbd` (vkbd.ko virtual keyboard) if available, o
 
 ### REFRESH
 
-Force the Change-mode stream to send a full frame on the next tick, regardless of whether the framebuffer has changed.
+Force the Change-mode stream to send a full frame on the next tick, regardless of whether the framebuffer has changed. Applies to both protocol versions (in v3 the full frame arrives as the rect `(0,0,w,h)`).
 
 ```
 Request:  REFRESH\n
@@ -1543,6 +1628,7 @@ Every authentication attempt (success or failure) is appended to `/korg/rw/scree
 - If any `write` on the stream socket fails, the client is dropped silently and the daemon returns to listening for new connections.
 - On client drop: `client_fd` is closed, shadow frame is invalidated, and the allowed control IP is cleared to zero - this **fails closed**, not open: with no IP set, every ownership-gated control command is rejected (see Section 5.2's read-only allowlist for the commands that remain reachable regardless).
 - There is no keepalive or ping mechanism. A stale client is only detected when a write fails.
+- **v3 byte-rate cap is not an error condition.** When `stream_max_kbps` throttles a change-mode session the daemon just sends the next rect later; a pull-mode poll is answered as soon as the cap allows, never dropped. A client should not time out a pull reply in under a couple of seconds on Nautilus.
 
 ### Control port
 
@@ -1575,6 +1661,11 @@ Every authentication attempt (success or failure) is appended to `/korg/rw/scree
 | Control port reply send timeout | 2 seconds | `SO_SNDTIMEO`; see Section 13 (1.11.2) |
 | Held-pad watchdog | 10 seconds | Force-releases a `TOUCH_DOWN`-triggered chord with no matching `TOUCH_UP`; see Section 7 `PADMAP_OFF` note (1.11.2) |
 | Handshake timeout | 5 seconds | Applied to the full client hello read |
+| Stream protocol versions | 2-3 | Hello version byte; `0x04 VERSION_MISMATCH` otherwise (3.0.2) |
+| v3 byte-rate cap | 24000 kbps Nautilus / unlimited Kronos | `stream_max_kbps` in config; token bucket with a 1 s burst (3.0.2) |
+| v3 full-frame promotion | > 75% of the canvas dirty | Such an update is sent as the full rect `(0,0,w,h)` (3.0.2) |
+| v3 raw-rect threshold | <= 512 bytes | Rects this small are always `enc=0` (3.0.2) |
+| v3 rect header | 9 bytes | `enc(1) + x0,y0,w,h (4 x LE16)`; `len` includes it (3.0.2) |
 | Screensaver sample interval | 5 seconds | How often fb1 is sampled for change detection |
 | Screensaver sample points | 16 pixels | Evenly spaced across the framebuffer |
 | PackBits RLE literal run max | 128 bytes | Standard PackBits limit |
@@ -1607,3 +1698,26 @@ Every authentication attempt (success or failure) is appended to `/korg/rw/scree
 | Touch calibration: `touch_x_range` | 813 | Pixel span mapped to ADC 0-255 (horizontal) |
 | Touch calibration: `touch_y_offset` | 20 | Pixels added to y before ADC scaling |
 | Touch calibration: `touch_y_range` | 638 | Pixel span mapped to ADC 0-255 (vertical) |
+
+---
+
+## 15. Changes by release
+
+Client-visible changes only. Internal changes are in the git history.
+
+### 3.0.2
+
+- **Stream protocol v3** ([3.0](#30-choosing-a-protocol-version), [4.5](#45-protocol-v3---native-pixel-stream-302)): native pixel format negotiated in the handshake, rectangle updates, per-frame `raw`/`PackBits`/`deflate` encoding, pull-mode `0xFE` delta poll. Required for Nautilus.
+- **Handshake status `0x03` FORMAT_NEEDS_NEWER_VERSION** (v2 hello on RGB565 hardware) and **`0x04` VERSION_MISMATCH** (unsupported version byte), both followed by `ver_min`/`ver_max` ([3.4](#34-server-response---failure)). Previously an unsupported version got `0x01`, indistinguishable from an auth failure.
+- **Nautilus colours are correct.** 3.0.1 streamed Nautilus frames through the v2 index/palette path, which cannot represent an RGB565 buffer; the "wrong palette" symptoms were that, not a palette problem. There is no palette on Nautilus and no client-side palette fix-up is needed or possible - decode `RGB565LE`.
+- **Discovery** reply gained `PROTO=3 FMT=<INDEX8|RGB565LE> GEOM=<w>x<h>` ([2](#2-udp-discovery)).
+- **`MODEL`** gained `BOARD`, `PANEL_HWVER`, `CPUS`/`CORES`/`THREADS`, `STREAM_FMT`/`STREAM_GEOM`; `MODEL` codes are now board-derived and include `NAUTILUS_AT`; `NAUTILUS` now correctly identifies the original Nautilus on the Kronos 2 board ([MODEL](#model)).
+- **`SYSINFO`** gained `BOARD_VENDOR`/`BOARD_NAME`/`BIOS_VERSION`/`PANEL_HWVER`/`FB_BPP`, `CPU_COUNT`/`CPU_CORES`/`CPU_THREADS_PER_CORE`/`CPU_DAEMON_MASK`/`CPU_RT_MASK`, `HWMON`, `TEMP<n>_LABEL` for every sensor input (not just 1-3), `FAN<n>_RPM` for every header, and the display-ready `TEMP_CPU`/`TEMP_ACPI`/`FAN_RPM`. Clients showing a temperature or fan should switch to those three: on the Nautilus AT board `TEMP1`/`FAN1_RPM` are an unconnected sensor input (reads 116 °C) and an empty fan header ([11](#11-sysinfo-field-reference)). Existing fields keep their names and positions.
+- **`MIRROR_ON`** replies `ERR MIRROR_UNSUPPORTED` on Nautilus ([MIRROR_ON](#mirror_on)).
+- `REFRESH` applies to v3 sessions too.
+- Config keys `stream_max_kbps`, `stream_height`, `cpu_affinity` (server-side; `source/screenremote.cfg.example`).
+
+### 3.0.1
+
+- First release with Nautilus support (fb1 16bpp accepted). Palette handling on Nautilus was incorrect - superseded by 3.0.2's v3 stream.
+

@@ -5904,8 +5904,10 @@ static void process_ctrl_cmd(const char *line, int fd)
         }
 
     } else if (strcmp(line, "REFRESH") == 0) {
-        /* Force change-driven mode to resend the current frame on the next tick */
+        /* Force change-driven mode to resend the current frame on the next tick
+         * (both protocol versions - the v3 path keys off v3_shadow_valid). */
         shadow_valid = 0;
+        v3_shadow_valid = 0;
         REPLY_S("OK\n");
 
     } else if (strcmp(line, "STATE") == 0) {
