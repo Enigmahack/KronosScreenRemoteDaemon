@@ -58,16 +58,22 @@ Any payload longer than 5 bytes is accepted as long as the first 5 bytes match.
 The daemon replies to the sender's address and port with a newline-terminated ASCII string.
 
 ```
-KSCR SP=<stream_port> CP=<ctrl_port> MIDI=<0|1>\n
+KSCR SP=<stream_port> CP=<ctrl_port> MIDI=<0|1> FAMILY=<KRONOS|NAUTILUS> PROTO=3 FMT=<INDEX8|RGB565LE> GEOM=<w>x<h>\n
 ```
 
-Example:
+Examples:
 
 ```
-KSCR SP=7373 CP=7374 MIDI=1\n
+KSCR SP=7373 CP=7374 MIDI=1 FAMILY=KRONOS PROTO=3 FMT=INDEX8 GEOM=800x600\n
+KSCR SP=7373 CP=7374 MIDI=1 FAMILY=NAUTILUS PROTO=3 FMT=RGB565LE GEOM=800x480\n
 ```
 
-Port numbers are decimal ASCII. `MIDI=1` indicates the MIDI injection module loaded successfully; `MIDI=0` means MIDI functionality is unavailable. There is no authentication on discovery; the daemon always responds.
+`PROTO`, `FMT` and `GEOM` were added in 3.0.2 (older daemons omit them). `FMT` is the
+native pixel format the v3 stream will deliver and `GEOM` its visible geometry - a
+client can tell from discovery alone whether it needs the v3 handshake (any daemon
+reporting `FMT=RGB565LE` refuses v2 clients, see 3.4).
+
+Port numbers are decimal ASCII. `MIDI=1` indicates the MIDI injection module loaded successfully; `MIDI=0` means MIDI functionality is unavailable. `FAMILY` identifies the device family (see the [`MODEL`](#model) command for the finer-grained model code and CPU string, not worth the extra bytes on a LAN broadcast) - lets a client branch on device family before it even opens the stream or control socket. There is no authentication on discovery; the daemon always responds.
 
 ---
 
@@ -86,7 +92,7 @@ Send immediately after the TCP connection is established.
 ```
 Offset  Size  Field
 0       4     Magic: ASCII "KSCR"  (0x4B 0x53 0x43 0x52)
-4       1     Protocol version: must be 0x02
+4       1     Protocol version: 0x02 (legacy, section 3.3/4) or 0x03 (native, section 4.5)
 5       1     Stream mode (see below)
 6       1     Requested FPS (1-15; 0 = use server maximum)
 7       1     ulen: username length in bytes (1-64)
@@ -119,6 +125,12 @@ Total success response: **777 bytes**.
 
 The palette is the Kronos hardware palette and does not change at runtime. It must be applied by the client to decode 8bpp pixel values to RGB.
 
+**v2 is only offered on hardware whose framebuffer really is 8-bit indexed** (Kronos
+1/X/2). The Nautilus framebuffer is RGB565 truecolor with no palette at all (see
+`kronosology/docs/hardware/nautilus_color_palette.md`, "Round 6"); a v2 hello there
+is refused with status `0x03`. Use v3 (section 4.5) - it is the same handshake with
+version byte `0x03` and works on every model.
+
 ### 3.4 Server response - failure
 
 ```
@@ -134,6 +146,22 @@ Offset  Size  Field
 | `0x00` | OK (success path) |
 | `0x01` | Authentication failed (bad credentials, or account locked) |
 | `0x02` | User not found (no authentication backend recognised the username) |
+| `0x03` | `FORMAT_NEEDS_NEWER_VERSION` - the version was accepted but this hardware's pixel format cannot be carried in it (v2 hello on RGB565 hardware). Reconnect with `ver_max`. |
+| `0x04` | `VERSION_MISMATCH` - the hello's version byte is outside the range this daemon supports. |
+
+Statuses `0x03` and `0x04` are followed by two more bytes so a client can tell whether it
+is too old or too new, and say so:
+
+```
+Offset  Size  Field
+0       4     Magic: "KSCR"
+4       1     Status: 0x03 or 0x04
+5       1     ver_min: lowest hello version this daemon accepts (0x02)
+6       1     ver_max: highest hello version this daemon accepts (0x03)
+```
+
+(3.0.1 and earlier answered an unknown version with plain `0x01`, indistinguishable from
+an authentication failure; a bad magic still does.)
 
 On any failure the server closes the connection immediately after sending the 5-byte error response.
 
@@ -204,6 +232,88 @@ In Pull mode the client controls frame delivery by sending single-byte commands 
 
 Any other byte, or a closed connection, causes the server to drop the client.
 
+### 4.5 Protocol v3 - native pixel stream (3.0.2+)
+
+v3 exists because the Nautilus framebuffer is **RGB565 little-endian truecolor**: Eva
+renders its UI in RGB888 and converts to RGB565 in-process, and never programs a
+palette into the display driver, so there is nothing an 8-bit index stream could
+carry. v3 ships the framebuffer exactly as the hardware holds it and leaves all
+conversion to the client; the daemon only crops to the visible panel, finds the
+changed rectangle and compresses it. v3 works on every model (on a Kronos it
+delivers the same INDEX8 pixels + palette as v2, just in rect form).
+
+**Hello**: identical to 3.2 with version byte `0x03`.
+
+**Success response**:
+
+```
+Offset  Size  Field
+0       4     Magic: "KSCR"
+4       1     Status: 0x00
+5       2     Visible width, LE16   (800)
+7       2     Visible height, LE16  (600 on Kronos, 480 on Nautilus - the physical panel;
+              the Nautilus driver's 600-row buffer is never drawn below row 480)
+9       1     fmt:   0 = INDEX8 (1 byte/pixel palette index)
+                     1 = RGB565LE (2 bytes/pixel, little-endian, RRRRRGGGGGGBBBBB)
+10      1     bpp:   8 or 16 (bits per pixel of fmt)
+11      1     enc:   the encoder this daemon uses for rect data (informational - a
+                     client must still switch on each frame's own enc byte):
+                     1 = PackBits (Kronos), 2 = deflate (Nautilus)
+12      1     flags: reserved, 0
+13      768   Palette 256 x RGB8 - PRESENT ONLY IF fmt == 0
+```
+
+Failure responses are as in 3.4.
+
+**Frames** (both modes). Every v3 frame is one rectangle:
+
+```
+Offset  Size  Field
+0       4     payload_len, LE32 (everything after this field)
+4       1     enc: 0 = raw, 1 = PackBits (byte-wise, section 4.3), 2 = zlib/deflate
+              (RFC 1950 stream: zlib header + deflate + adler32 - `zlib.decompress()`
+              in Python, `InflaterInputStream`/`ZLibStream` elsewhere)
+5       2     x0, LE16
+7       2     y0, LE16
+9       2     w,  LE16
+11      2     h,  LE16
+13      ...   data: w*h*bpp/8 bytes after decoding, row-major, rows of w pixels,
+              no padding. The client copies it into its own w x h canvas at (x0,y0).
+```
+
+A full frame is the rect `(0, 0, width, height)`. The daemon promotes any update
+covering more than 75% of the screen to a full frame; an encoder that would expand
+the data falls back to `enc=0`. `w = h = 0` is an explicit "nothing changed" reply
+(only ever sent in response to a pull-mode `0xFE`).
+
+**Pull mode requests** (v3):
+
+```
+0xFF  - send a full frame
+0xFE  - send the delta since the last frame this client received (empty rect if unchanged)
+```
+
+Every request receives exactly one reply; the daemon never coalesces or drops one.
+
+**Byte-rate cap.** On the Nautilus the only network path is a USB2 ethernet adapter
+that shares the single xHCI bus (and its interrupt core) with the NKS4 front-panel
+link carrying every panel video flush and all USB-MIDI. The daemon therefore rate-
+limits v3 output with a token bucket (default 24000 kbps on Nautilus, unlimited on
+Kronos; `stream_max_kbps=` in `screenremote.cfg`). Under the cap a change-mode
+client simply sees a lower frame rate - nothing is dropped, an undelivered change
+stays pending and is re-diffed next tick - and a pull request is answered as soon
+as tokens accrue. The first frame after connect is a full frame.
+
+**Measured on a real Nautilus (3.0.2, 2026-09-20)**: raw 800x480 RGB565 = 768000
+bytes; a full frame deflates to 47-210 KB depending on the page (photo-heavy PROGRAM
+pages are the worst case); UI-only rect updates are 40 bytes (cursor blink, sent raw)
+to ~40 KB. 36 s of continuous page switching averaged ~246 kbps. Daemon CPU on the
+N3160: 0.1% idle, ~2% with an idle change-mode client at 15 fps (the Nautilus UI
+repaints a small cursor every tick), ~6% during page switching; ~29 ms to deflate a
+worst-case full frame. Rects of <= 512 bytes are always sent raw (`enc=0`).
+
+Reference implementation: `tools/kscr_v3_client.py` (stdlib only).
+
 ---
 
 ## 5. Control port - overview and access control
@@ -222,7 +332,7 @@ The daemon enforces a strict IP-based access control rule for commands that muta
 
 A client must authenticate on the stream port before it can use ownership-gated control commands.
 
-**Read-only allowlist exception.** A short list of read-only, informational commands - `LASTTOUCH`, `PADMAP_LIST`, `PADMAP_STATE`, `PIXEL`, `REGION`, `PALETTE`, `STATE`, `MODE_DETAIL`, `VERSION`, `SYSINFO` - is answered from **any** IP, regardless of whether a stream client is connected or who owns it, and never upgrades to a persistent (`CTRL_PERSIST`) session. This lets a diagnostic/calibration tool (or a second observer) read live state concurrently with the owning client's own session. Every other command - anything that touches touch/button/wheel/slider/knob/MIDI injection, or `CTRL_PERSIST` itself - remains ownership-gated as above. Ownership-exemption and boot-time behavior are two separate things, though - see "Boot gate" below for which of these keep answering (and how) while the Kronos is still booting.
+**Read-only allowlist exception.** A short list of read-only, informational commands - `LASTTOUCH`, `PADMAP_LIST`, `PADMAP_STATE`, `PIXEL`, `REGION`, `PALETTE`, `STATE`, `MODE_DETAIL`, `VERSION`, `MODEL`, `SYSINFO` - is answered from **any** IP, regardless of whether a stream client is connected or who owns it, and never upgrades to a persistent (`CTRL_PERSIST`) session. This lets a diagnostic/calibration tool (or a second observer) read live state concurrently with the owning client's own session. Every other command - anything that touches touch/button/wheel/slider/knob/MIDI injection, or `CTRL_PERSIST` itself - remains ownership-gated as above. Ownership-exemption and boot-time behavior are two separate things, though - see "Boot gate" below for which of these keep answering (and how) while the Kronos is still booting.
 
 ### 5.3 Command format
 
@@ -280,6 +390,8 @@ Send this as the first and only command in the connection. The server does not r
 ---
 
 ### MIRROR_ON
+
+**Nautilus: unsupported.** Its motherboard video output has no display behind it, and the mirror's 15 Hz writes into uncached VESA memory measured 5.5% of a core for nothing, so on `FAMILY=NAUTILUS` `MIRROR_ON` replies `ERR MIRROR_UNSUPPORTED` and a stale `.mirror_enable` flag file is ignored (logged once at startup). Kronos units are unaffected (3.0.2+).
 
 Enable the VGA mirror. Creates the flag file `/korg/rw/screenremote/.mirror_enable` and opens `/dev/fb0`. The daemon begins copying fb1 to fb0 on every main loop tick.
 
@@ -920,7 +1032,7 @@ The daemon itself decides whether the Kronos OS/UI is genuinely up, rather than 
 Response: ERR BOOTING\n
 ```
 
-Within the read-only allowlist itself, only `STATE`/`MODE_DETAIL`/`SYSINFO` (and `PALETTE`/`VERSION`, which aren't synth state at all - `PALETTE` in particular is what a client needs just to decode the video stream, boot splash included) stay answerable during boot - `LASTTOUCH`/`PADMAP_LIST`/`PADMAP_STATE`/`PIXEL`/`REGION` also get `ERR BOOTING` while `BOOT=1`, since none of them need to stay pollable for boot-completion detection the way `STATE` does, and PIXEL/REGION in particular could otherwise be read as a claim about live UI content that isn't trustworthy yet. `STATE`/`MODE_DETAIL`/`SYSINFO` keep answering, but with `MODE`/`EDITCTX` (and `MODE_DETAIL`'s `EDITSLOT`/`SOURCE`) forced to safe values rather than whatever was actually read - see each command's own doc above. The screen stream and these three queries are how a client discovers the moment `BOOT` clears.
+Within the read-only allowlist itself, only `STATE`/`MODE_DETAIL`/`SYSINFO` (and `PALETTE`/`VERSION`/`MODEL`, which aren't synth state at all - `PALETTE` in particular is what a client needs just to decode the video stream, boot splash included, and `MODEL` is fixed device identity a client may well want to check before the UI is even up) stay answerable during boot - `LASTTOUCH`/`PADMAP_LIST`/`PADMAP_STATE`/`PIXEL`/`REGION` also get `ERR BOOTING` while `BOOT=1`, since none of them need to stay pollable for boot-completion detection the way `STATE` does, and PIXEL/REGION in particular could otherwise be read as a claim about live UI content that isn't trustworthy yet. `STATE`/`MODE_DETAIL`/`SYSINFO` keep answering, but with `MODE`/`EDITCTX` (and `MODE_DETAIL`'s `EDITSLOT`/`SOURCE`) forced to safe values rather than whatever was actually read - see each command's own doc above. The screen stream and these three queries are how a client discovers the moment `BOOT` clears.
 
 **Why this exists.** `eva_mode.ko`'s `RESOLVED=1` only means the `sm_poMMI->CMMI::modeManager` pointer chain didn't hit NULL/out-of-bounds - it does not mean the `CModeManager` object has finished constructing. Freshly-allocated-but-not-yet-constructed heap memory reads back as small integers, and `SYS_MODE=0`/`EDITCTX_RAW=1` decode to exactly `MODE=3 EDITCTX=1` ("Program edit while in Combi") - a false-confident reading that looks identical to a real one from the wire format alone. `BOOT` exists specifically to keep that window from ever reaching a client as if it were real state, and to keep it from accepting interactive commands (touch/button/wheel/MIDI/etc.) while nothing meaningful exists yet to receive them.
 
@@ -975,6 +1087,36 @@ VER=1.7.14 BUILD=20260702-1.7.14\n
 ```
 
 `BUILD` is set at compile time from the date and version string.
+
+---
+
+### MODEL
+
+Query which physical device family/model this daemon is running on.
+
+```
+Request:  MODEL\n
+Response: FAMILY=<KRONOS|NAUTILUS> MODEL=<code> FB_BPP=<8|16> CPUS=<n> CORES=<n> THREADS=<n> STREAM_FMT=<INDEX8|RGB565LE> STREAM_GEOM=<w>x<h>\n
+```
+
+Examples:
+
+```
+FAMILY=KRONOS MODEL=KRONOS2 FB_BPP=8 CPUS=4 CORES=2 THREADS=2 STREAM_FMT=INDEX8 STREAM_GEOM=800x600\n
+FAMILY=NAUTILUS MODEL=NAUTILUS FB_BPP=16 CPUS=4 CORES=4 THREADS=1 STREAM_FMT=RGB565LE STREAM_GEOM=800x480\n
+```
+
+| Field | Values | Description |
+|-------|--------|--------------|
+| `FAMILY` | `KRONOS`, `NAUTILUS` | The panel / OS family. Derived from `/dev/fb1`'s native bits-per-pixel (8 = the indexed 800x600 Kronos panel path, 16 = the RGB565 800x480 Nautilus panel path - see section 4.5), corroborated by the front-panel subsystem's own hardware revision (`PANEL_HWVER`, 2 on Nautilus). A disagreement between the two is logged (`screenremote: FAMILY CONFLICT`) and fb1 bpp wins, since that is what the stream geometry must follow. Independent of the motherboard: both Nautilus generations report `NAUTILUS`. |
+| `MODEL` | `KRONOS1`, `KRONOSX`, `KRONOS2`, `KRONOS3`, `KRONOS_UNKNOWN`, `NAUTILUS`, `NAUTILUS_AT`, `NAUTILUS_UNKNOWN` | The board generation within `FAMILY`. Since 3.0.2 derived from the DMI motherboard name (`/sys/class/dmi/id/board_name`) first, `/proc/cpuinfo`'s `model name` only as a fallback: Intel `D510MO` → `KRONOS1`, `D525MW` → `KRONOSX`, ASRock `IMB-140D` → `KRONOS2` (Kronos OS) or `NAUTILUS` (the original Nautilus, which shipped on the Kronos 2 board), ASRock `N3160TM-ITX-K` / J3160-class → `KRONOS3` (Kronos OS) or `NAUTILUS_AT` (Nautilus OS - the later Nautilus / Nautilus AT generation; `AT` is a board-generation label, the daemon cannot see whether the keybed has aftertouch). Board-vs-CPU disagreements and unrecognised boards are logged server-side (`screenremote: MODEL CONFLICT` / `unrecognised board`). `*_UNKNOWN` means `FAMILY` was determined but neither the board nor the CPU matched a known part - still safe to trust `FAMILY`. `KRONOS3` remains unverified against a real unit. |
+| `FB_BPP` | `8`, `16` | The raw framebuffer bpp `FAMILY` was derived from, for a caller that wants the underlying signal directly. |
+| `BOARD` | string | DMI motherboard name with spaces replaced by `_` (`N3160TM-ITX-K`, `IMB-140D`, ...), or `UNKNOWN` (3.0.2+). `SYSINFO` carries the vendor and BIOS version too. |
+| `PANEL_HWVER` | integer | `/proc/OmapNKS4HardwareVersion` - the NKS4 front-panel subsystem's hardware revision (2 = Nautilus WVGA panel; 0/1/3 = Kronos 1/2 panels), -1 if unreadable (3.0.2+). |
+| `CPUS` / `CORES` / `THREADS` | integers | Online logical CPUs, distinct physical cores, and logical CPUs per core, read from `/sys/devices/system/cpu/*/topology` at startup (3.0.2+). Kronos 1/X/2: `4 / 2 / 2` (two hyperthreaded Atom cores). Nautilus and Kronos 3: `4 / 4 / 1` (four real Celeron cores, no HT). Use these; never derive a core count from `FAMILY`. |
+| `STREAM_FMT` / `STREAM_GEOM` | | The v3 stream's native pixel format and visible geometry (section 4.5), for a control-port caller that has not opened the stream (3.0.2+). |
+
+All fields are computed once at startup (right after the framebuffer is opened) and cached for the life of the process - safe to poll cheaply, or just read once per connection. The same three facts (plus the raw, unparsed CPU string) are also available via `SYSINFO`'s `MODEL_FAMILY`/`MODEL`/`MODEL_CPU` fields, and a coarser `FAMILY` is broadcast in the [UDP discovery](#2-udp-discovery) reply before a client even opens a socket to this port.
 
 ---
 
@@ -1312,13 +1454,21 @@ All fields are plain ASCII decimal unless otherwise noted. Fields that cannot be
 
 | Field | Type | Description |
 |-------|------|-------------|
+| `MODEL_FAMILY` | string | Same as the [`MODEL`](#model) command's `FAMILY` field: `KRONOS` or `NAUTILUS` |
+| `MODEL` | string | Same as the [`MODEL`](#model) command's `MODEL` field - see that section for the full code list, including the unconfirmed `KRONOS3`/conflict-case `NAUTILUS_UNKNOWN` values |
+| `MODEL_CPU` | string | Raw `/proc/cpuinfo` `model name` string this was derived from, e.g. `Intel(R) Atom(TM) CPU D2550 @ 1.86GHz` |
 | `UPTIME` | integer | System uptime in seconds (from `/proc/uptime`) |
 | `LOAD` | `f f f` | 1, 5, and 15-minute load averages, two decimal places (from `/proc/loadavg`) |
 | `MEM_TOTAL_KB` | integer | Total RAM in kilobytes |
 | `MEM_FREE_KB` | integer | Free RAM in kilobytes |
 | `MEM_AVAIL_KB` | integer | Estimated available RAM (free + buffers + cached) in kilobytes |
 | `CPU_PCT` | integer | Aggregate CPU utilisation percentage since last SYSINFO call; -1 on first call |
-| `CPU0_PCT` - `CPU3_PCT` | integer | Per-core utilisation percentage; -1 on first call |
+| `CPU_COUNT` | integer | Online logical CPUs (3.0.2+; same as `MODEL`'s `CPUS`) |
+| `CPU_CORES` | integer | Physical cores (3.0.2+; same as `MODEL`'s `CORES`) |
+| `CPU_THREADS_PER_CORE` | integer | Logical CPUs per core - 2 on hyperthreaded Kronos 1/X/2, 1 on Nautilus / Kronos 3 (3.0.2+) |
+| `CPU_DAEMON_MASK` | hex bitmask | The CPUs this daemon (and its `midi_tcp` child) are pinned to - `0x8` (CPU3) on Nautilus, `0x3` (core 0) on Kronos (3.0.2+; see `pick_cpu_affinity()` in the source) |
+| `CPU_RT_MASK` | hex bitmask | CPUs hosting at least one RTAI real-time task per `/proc/rtai/scheduler` (`0xf` on Nautilus: OA runs a worker on every core; `0x0` if RTAI isn't readable) (3.0.2+) |
+| `CPU0_PCT` - `CPU<n>_PCT` | integer | Per-logical-CPU utilisation percentage, one line per online CPU (`CPU_COUNT` of them); -1 on first call |
 | `AUDIO_SR` | integer | Audio sample rate in Hz |
 | `AUDIO_OUT_CH` | integer | Number of audio output channels |
 | `AUDIO_RTO` | integer | Audio round-trip overrun count (from `/proc/KorgUsbAudio`) |
@@ -1334,8 +1484,15 @@ All fields are plain ASCII decimal unless otherwise noted. Fields that cannot be
 | `USB1_FREE_MB` | integer | Free space on second USB drive in megabytes |
 | `USB1_TOTAL_MB` | integer | Total size of second USB drive in megabytes |
 | `USB_COUNT` | integer | Number of mounted USB drives detected (0-2) |
-| `TEMP1` - `TEMP3` | integer | Hardware temperature sensor readings in degrees Celsius |
-| `FAN1_RPM` | integer | Fan speed in RPM |
+| `BOARD_VENDOR` / `BOARD_NAME` / `BIOS_VERSION` | string | DMI motherboard identity (`ASRock` / `N3160TM-ITX-K` / `L0.07E` on the Nautilus AT board), `UNKNOWN` if the kernel exposes no DMI (3.0.2+) |
+| `PANEL_HWVER` / `FB_BPP` | integer | Same as the `MODEL` command's fields (3.0.2+) |
+| `HWMON` | string | The Super-IO sensor chip driver name (`nct6793` on the N3160TM-ITX-K) (3.0.2+) |
+| `TEMP<n>` | integer | Every temperature input the sensor chip exposes, in degrees Celsius, raw. **Unconnected inputs read garbage**: on the N3160TM-ITX-K, `SYSTIN` (`TEMP1`) reads 116 and `AUXTIN1-3` read 109 permanently. Display `TEMP_CPU` / `TEMP_ACPI`, not these. `TEMP1`-`TEMP3` keep their pre-3.0.2 position for existing clients. |
+| `TEMP<n>_LABEL` | string | The chip's label for `TEMP<n>` (`CPUTIN`, `SYSTIN`, `AUXTIN0`, ...) when it provides one (3.0.2+) |
+| `TEMP_CPU` | integer | The CPU temperature: the input whose label is `CPUTIN`/contains `CPU`, if it reads a plausible 1-99 °C (3.0.2+; 36 on the Nautilus AT at idle) |
+| `TEMP_ACPI` | integer | `/sys/class/thermal/thermal_zone0` (ACPI), when present (3.0.2+) |
+| `FAN<n>_RPM` | integer | Every fan header the chip exposes. `FAN1_RPM` keeps its pre-3.0.2 meaning - but on the N3160TM-ITX-K the only populated header is `FAN2` (~400 RPM); `FAN1` is unused and reads 0. |
+| `FAN_RPM` | integer | The first fan header that is actually spinning (3.0.2+) - the value to display |
 | `MODE` | integer | Current Kronos mode (same values as STATE command) |
 | `EDITCTX` | integer | Program-edit-in-context sub-state (same values as STATE command) |
 

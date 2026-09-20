@@ -1,0 +1,2 @@
+/home/share/KronosScreenRemoteDaemon/omapvideo_peek_module/omapvideo_peek.ko
+/home/share/KronosScreenRemoteDaemon/omapvideo_peek_module/omapvideo_peek.o

@@ -262,5 +262,11 @@ static const uint8_t kronos_palette[256][3] = {
     {255,255,  0},  /* 254 */
     {255,255,255},  /* 255 */
 };
+/* NOTE (2026-09-20): a nautilus_palette_fixes[] table used to live here (a
+ * 6-entry per-index "fixup" derived from screenshot pairs). Removed: the
+ * Nautilus fb1 is RGB565 truecolor, not indexed, so no palette applies to it
+ * at all - the daemon now streams native RGB565 to v3 clients and refuses v2
+ * clients on that hardware. See kronosology/docs/hardware/
+ * nautilus_color_palette.md "Round 6". */
 
 #endif /* PALETTE_DATA_H */

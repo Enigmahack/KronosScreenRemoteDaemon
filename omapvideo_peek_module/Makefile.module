@@ -1,0 +1,10 @@
+# ONE-SHOT diagnostic module - not embedded in the daemon, just insmod'd
+# directly during investigation. Read-only, no hooking. See omapvideo_peek.c.
+KDIR ?= /home/build/linux-kronos
+PWD  := $(shell pwd)
+
+all:
+	$(MAKE) -C $(KDIR) M=$(PWD) modules
+
+clean:
+	$(MAKE) -C $(KDIR) M=$(PWD) clean

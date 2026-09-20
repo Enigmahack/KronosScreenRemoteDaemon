@@ -1,20 +1,34 @@
 /*
  * screenremote.c  - Kronos/Nautilus framebuffer streaming daemon
- * Validated on real Nautilus hardware 2026-09-18. fb1 there is a genuine
- * 16-bit-per-pixel buffer (palette index in the low byte) rather than the
- * Kronos family's plain 8bpp - see fb1_native_bpp's block comment and
- * kronosology/docs/hardware/nautilus_fb1_16bpp.md.
  *
- * Streams /dev/fb1 (800x600, 8bpp on Kronos / 16bpp-indexed on Nautilus) over TCP port 7373 (default; set by config).
+ * Streams /dev/fb1 over TCP port 7373 (default; set by config):
+ *   Kronos 1/X/2 : 800x600, 8bpp palette-indexed (OmapVideoModule 8bpp default)
+ *   Nautilus     : 800x480 visible rows of an 800x600 RGB565 little-endian
+ *                  truecolor buffer (OmapVideoModule 16bpp default; Eva renders
+ *                  RGB888 -> RGB565 itself and NEVER sends the kernel a palette -
+ *                  see kronosology/docs/hardware/nautilus_color_palette.md
+ *                  "Round 6"). There is no palette to apply on this hardware;
+ *                  the daemon ships the native pixels and the client decodes.
  * Mirrors fb1 to /dev/fb0 (VGA out) when /korg/rw/screenremote/.mirror_enable exists.
  *
- * Stream handshake (TCP port 7373):
- *   Client -> Server: MAGIC[4]="KSCR" + 0x02(ver) + mode(1) + fps(1) + ulen(1) + plen(1)
+ * Stream handshake (TCP port 7373) - two protocol versions, selected by the
+ * client's hello version byte (docs/api.md is the normative description):
+ *   Client -> Server: MAGIC[4]="KSCR" + ver(1) + mode(1) + fps(1) + ulen(1) + plen(1)
  *                    + username[ulen] + password[plen]
- *     mode: 0x01=Pull (server sends at fps), 0x02=Change (server sends on fb change)
- *   Server -> Client: MAGIC[4] + status(1)  [+ width_LE16 + height_LE16 + 256 xRGB8 if status=0x00]
- *     status: 0x00=ok  0x01=auth_fail  0x02=user_not_found
- *   Frames: [len_LE32][pixel_data]  (full) or dirty-rect PackBits RLE
+ *     ver:  0x02 = legacy (index8 + palette only; refused on RGB565 hardware)
+ *           0x03 = native (pixel format negotiated, rect updates, deflate)
+ *     mode: 0x01=Pull (client polls), 0x02=Change (server sends on fb change)
+ *   Server -> Client (v2): MAGIC[4] + status(1) [+ w_LE16 + h_LE16 + 256xRGB8 if ok]
+ *   Server -> Client (v3): MAGIC[4] + status(1) [+ w_LE16 + h_LE16 + fmt(1) + bpp(1)
+ *                          + enc(1) + flags(1) + (256xRGB8 only if fmt==0) if ok]
+ *     status: 0x00=ok  0x01=auth_fail/bad magic  0x02=user_not_found
+ *             0x03=FORMAT_NEEDS_NEWER_VERSION  0x04=VERSION_MISMATCH
+ *             (0x03/0x04 are followed by ver_min, ver_max = 0x02, 0x03)
+ *   Frames (v2): [len_LE32][pixel_data] (full) or dirty-rect PackBits RLE
+ *   Frames (v3): [len_LE32][enc(1)][x0_LE16][y0_LE16][w_LE16][h_LE16][data]
+ *     enc: 0=raw  1=PackBits(byte-wise)  2=zlib/deflate (RFC 1950 stream)
+ *     A full frame is simply the rect (0,0,w,h). Pull mode: 0xFF = full frame,
+ *     0xFE = delta since last sent frame (w=h=0 rect if nothing changed).
  *
  * Control port 7374 (text line commands, newline-terminated):
  *   CTRL_PERSIST            - open a persistent session; server keeps the connection open
@@ -71,12 +85,25 @@
  *                              caller confirm eva_mode.ko is in play rather than the pixel
  *                              fallback without needing to infer it from SOURCE alone.
  *   VERSION                 -> VER=x.x.x BUILD=xxx\n
+ *   MODEL                   -> FAMILY=KRONOS|NAUTILUS MODEL=<code> FB_BPP=8|16\n
+ *                            Which physical unit this daemon is running on - see
+ *                              detect_device_model()'s header comment for how FAMILY (from
+ *                              fb1's native bpp, hardware-confirmed) and MODEL (from
+ *                              /proc/cpuinfo, narrows within FAMILY) are derived, and which
+ *                              MODEL codes exist (KRONOS1/KRONOSX/KRONOS2/KRONOS3/
+ *                              KRONOS_UNKNOWN/NAUTILUS/NAUTILUS_UNKNOWN - KRONOS3 and a
+ *                              NAUTILUS_UNKNOWN caused by an Atom CPU string are both an
+ *                              INFERRED conflict resolution, logged loudly, not a confirmed
+ *                              mapping like the rest). Static for the life of the
+ *                              process. SYSINFO's MODEL_FAMILY/MODEL/MODEL_CPU repeat this
+ *                              (plus the raw CPU string) for a caller already polling SYSINFO.
  *   SYSINFO                 -> multi-line key=value block terminated by OK\n
- *                            (UPTIME, LOAD, MEM_*, CPU_*, AUDIO_*, DISK_*, USB_*, TEMP*, FAN*, MODE, EDITCTX)
+ *                            (UPTIME, LOAD, MEM_*, CPU_*, AUDIO_*, DISK_*, USB_*, TEMP*, FAN*,
+ *                              MODE, EDITCTX, MODEL_FAMILY, MODEL, MODEL_CPU)
  *
  * UDP discovery port 7372 (fixed, never configurable):
  *   Client sends: "KSCR?" (5+ bytes)
- *   Daemon replies: "KSCR SP=<stream_port> CP=<ctrl_port>\n"
+ *   Daemon replies: "KSCR SP=<stream_port> CP=<ctrl_port> MIDI=<0|1> FAMILY=<KRONOS|NAUTILUS>\n"
  *
  * Access control: ctrl commands are only accepted from the authenticated stream client's IP.
  *   Control connections are rejected if no authenticated stream client is connected.
@@ -143,6 +170,7 @@
 
 #define _GNU_SOURCE   /* for sched_setaffinity / CPU_SET */
 #include <sched.h>
+#include <sys/resource.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -173,6 +201,7 @@
 #include <sys/syscall.h>
 #include <elf.h>
 #include "palette_data.h"
+#include "miniz.h"          /* zlib-format deflate for the v3 RGB565 stream (MIT, miniz.LICENSE) */
 #include "mode_detect_refs.h"
 #include "vkbd_ko.h"
 #include "midi_bridge_ko.h"
@@ -198,7 +227,7 @@
 #define KBD_EV_KEY  1
 
 /*  Version */
-#define SCREENREMOTE_VERSION "3.0.0"
+#define SCREENREMOTE_VERSION "3.0.2"
 #ifndef BUILD_ID
 #define BUILD_ID "dev"
 #endif
@@ -248,23 +277,94 @@ static uint32_t  fb1_stride, fb0_stride;
 static uint32_t  fb_w, fb_h;           /* 800, 600 */
 static uint32_t  frame_bytes;          /* fb_w * fb_h */
 
-/* Nautilus fb1 quirk (found 2026-09-18, see kronosology/docs/hardware/nautilus_fb1_16bpp.md):
- * the Kronos family's fb1 is a real 8bpp indexed buffer, but on the Nautilus
- * (OmapVideoModule build for the N3160/J3160 board) FBIOGET_VSCREENINFO reports
- * bits_per_pixel=16 while ffix.line_length is stale 8bpp-era metadata (pixel
- * count, not byte count). The actual hardware layout is 2 bytes/pixel with the
- * same 0-255 palette index living in the low byte of each little-endian cell
- * and the high byte always 0 - confirmed against live panel content on real
- * hardware. fb1_native_bpp/fb1_hw_map/fb1_hw_stride hold the raw device mapping
- * in that case; fb1_map/fb1_stride keep meaning exactly what they always have
- * (a byte-per-pixel, fb_w-strided buffer) by pointing at fb1_shadow, a
- * synthesized de-interleaved copy kept fresh once per main-loop tick by
- * fb1_refresh_shadow(). Every existing fb1_map reader in this file - Kronos or
- * Nautilus - is therefore unmodified and unaware of the distinction. */
+/* Nautilus fb1 (kronosology/docs/hardware/nautilus_fb1_16bpp.md + nautilus_color_
+ * palette.md "Round 6"): the Kronos family's fb1 is a real 8bpp indexed buffer,
+ * but the Nautilus's OmapVideoModule build defaults to bits_per_pixel=16 and the
+ * buffer is genuine RGB565 little-endian truecolor (Eva renders RGB888 into a
+ * virtual framebuffer and ScreenUtil::Convert24bppTo16bppRGB() flushes it here).
+ * FBIOGET_FSCREENINFO's line_length (800) and the 8/8/8@0 channel descriptors
+ * are stale metadata copied from the Kronos 8bpp default - Eva ignores them and
+ * so do we. fb1_native_bpp/fb1_hw_map/fb1_hw_stride hold the raw device mapping.
+ *
+ * fb1_map/fb1_stride keep meaning what they always have (a byte-per-pixel,
+ * fb_w-strided buffer) by pointing at fb1_shadow, refreshed once per tick by
+ * fb1_refresh_shadow() with the LOW byte of each RGB565 word (GGGBBBBB). That
+ * byte is NOT a palette index - it is only a cheap luminance-ish proxy that the
+ * non-streaming heuristics (boot gate fb_metrics(), screensaver change sampling,
+ * VGA mirror, pixel-fingerprint mode detection) keep consuming exactly as in
+ * 3.0.1 so their Nautilus behaviour is unchanged by this release. Nothing that
+ * reaches a client is derived from it any more: the v3 stream reads
+ * fb1_hw_map directly (see the "Native (v3) stream" block further down), and v2
+ * clients are refused on this hardware rather than fed that byte as an index
+ * (which is exactly what 3.0.1 did, and why its Nautilus colours were wrong). */
 static int       fb1_native_bpp = 8;
 static uint8_t  *fb1_hw_map = NULL;
 static uint32_t  fb1_hw_stride = 0;
 static uint8_t  *fb1_shadow = NULL;
+
+/*  Native (v3) stream state - see the "Native (v3) stream" block after send_frame()
+ * for the code. The stream geometry is the VISIBLE panel, which on the Nautilus
+ * is 800x480 out of an 800x600 buffer (rows >= 480 are never drawn - the
+ * physical panel is WVGA; the existing touch_y_range scaling below already
+ * assumes the same 480). stream_height= in screenremote.cfg overrides. */
+#define STREAM_FMT_INDEX8    0   /* 1 byte/pixel palette index + 256xRGB8 palette */
+#define STREAM_FMT_RGB565LE  1   /* 2 bytes/pixel, little-endian RRRRRGGGGGGBBBBB */
+#define STREAM_ENC_RAW       0
+#define STREAM_ENC_PACKBITS  1
+#define STREAM_ENC_DEFLATE   2   /* zlib/RFC 1950 stream, miniz level 1 */
+#define STREAM_V3_HDR        9   /* enc(1) + x0,y0,w,h (4 x LE16) */
+#define NAUTILUS_VISIBLE_ROWS 480
+static uint8_t   g_stream_fmt = STREAM_FMT_INDEX8;
+static uint8_t   g_stream_enc = STREAM_ENC_PACKBITS;
+static uint32_t  g_stream_w = 0, g_stream_h = 0;   /* visible geometry sent to v3 clients */
+static uint32_t  g_stream_bpp = 8;
+static uint32_t  g_stream_pitch = 0;               /* bytes per stream row = w*bpp/8 */
+static uint32_t  g_stream_frame_bytes = 0;
+static int       g_stream_height_cfg = 0;          /* stream_height= override, 0 = auto */
+static int       g_cpu_affinity_cfg  = 0;          /* cpu_affinity= bitmask override, 0 = auto */
+static uint8_t  *v3_shadow  = NULL;   /* last frame sent to the v3 client, native pitch */
+static uint8_t  *v3_staging = NULL;   /* this tick's capture (+ boot compositing) */
+static uint8_t  *v3_enc     = NULL;   /* encode scratch: STREAM_V3_HDR + compressBound */
+static size_t    v3_enc_cap = 0;
+static int       v3_shadow_valid = 0;
+static uint8_t   client_ver = 2;      /* hello version byte of the connected stream client */
+static int       v3_pull_pending = 0; /* pull request deferred by the byte-rate cap: 0/0xFF/0xFE */
+
+/* Byte-rate cap (token bucket). On the Nautilus the only NIC is a USB2 dongle
+ * that shares the single xHCI bus (and its IRQ core) with the NKS4 front-panel
+ * link - the same bus every panel video flush and all USB-MIDI travel over - so
+ * an uncapped burst of page-switch frames can crowd the panel itself. The cap
+ * bounds our share of that bus; fps floats underneath it. 0 = unlimited (the
+ * Kronos default: PCIe NIC, TWI panel, no shared bus). stream_max_kbps= in
+ * screenremote.cfg overrides either default. */
+#define NAUTILUS_DEFAULT_MAX_KBPS 24000
+static int       g_stream_max_kbps = -1;          /* -1 = not configured, pick per hardware */
+static double    g_bucket_bytes = 0;              /* tokens available right now, in bytes */
+static struct timespec g_bucket_t;                /* last refill time */
+
+/* Device identity - see detect_device_model()'s own header comment (right
+ * after fb1_open() below) for how these are derived and cached. g_model_cpu
+ * holds the raw /proc/cpuinfo "model name" string (may contain spaces); the
+ * other two are fixed, space-free tokens safe to embed in a single-line
+ * space-separated ctrl reply. */
+static char      g_model_family[16] = "UNKNOWN";
+static char      g_model_code[24]   = "UNKNOWN";
+static char      g_model_cpu[64]    = "";
+static char      g_board_vendor[32] = "";   /* /sys/class/dmi/id/board_vendor, "" if unavailable */
+static char      g_board_name[48]   = "";   /* /sys/class/dmi/id/board_name */
+static char      g_bios_version[32] = "";   /* /sys/class/dmi/id/bios_version */
+static int       g_panel_hwver      = -1;   /* /proc/OmapNKS4HardwareVersion (panel subsystem), -1 unknown */
+
+/* CPU topology, probed once by cpu_topology_probe() (from /sys/devices/system/
+ * cpuN/topology) and reported verbatim by MODEL and SYSINFO so clients never
+ * have to infer core counts from FAMILY - the Kronos 1/X/2 are 2 cores x 2
+ * threads, the Nautilus / Kronos 3 are 4 cores x 1 thread, both 4 logical
+ * CPUs. g_cpu_daemon_mask / g_cpu_rt_mask are filled by pick_cpu_affinity(). */
+static int           g_cpu_logical = 0;    /* online logical CPUs */
+static int           g_cpu_cores   = 0;    /* distinct physical core ids */
+static int           g_cpu_threads = 0;    /* logical per core (1 = no HT) */
+static unsigned long g_cpu_daemon_mask = 0;/* affinity this daemon settled on */
+static unsigned long g_cpu_rt_mask = 0;    /* CPUs hosting RTAI tasks (from /proc/rtai/scheduler) */
 
 /* Boot-splash compositing state (see apply_boot_splash()/load_boot_splash()/
  * send_frame(), all further down) - declared up here alongside the other
@@ -375,8 +475,8 @@ static int g_sm_pommi_resolve_pending = 0;  /* 1 = still trying to autodetect sm
 typedef struct {
     unsigned long user, nice, sys, idle, iowait, irq, softirq;
 } cpu_snap_t;
-#define SI_NCPU 4
-static cpu_snap_t g_si_prev[SI_NCPU + 1]; /* [0]=aggregate  [1..4]=per-cpu  */
+#define SI_NCPU 8
+static cpu_snap_t g_si_prev[SI_NCPU + 1]; /* [0]=aggregate  [1..SI_NCPU]=per-cpu  */
 static int        g_si_prev_valid = 0;
 
 /* Front-panel injection: nks4_inject.ko calls OA's real CSTGFrontPanel::Handle*
@@ -904,10 +1004,19 @@ static void apply_palette_to_fb0(void)
  * buffer, then once per main-loop iteration (top of the loop, before anything
  * reads fb1_map) so both the staging path and the zero-copy "pull mode" reads
  * see an at-most-one-tick-stale frame. No-op on Kronos (fb1_native_bpp==8). */
+static struct timespec fb1_shadow_t;   /* last refresh, for fb1_shadow_due() */
+static int fb1_shadow_due(void)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (now.tv_sec - fb1_shadow_t.tv_sec) * 1000L +
+           (now.tv_nsec - fb1_shadow_t.tv_nsec) / 1000000L >= 200;
+}
 static void fb1_refresh_shadow(void)
 {
     uint32_t y, x;
     if (!fb1_hw_map || !fb1_shadow) return;
+    clock_gettime(CLOCK_MONOTONIC, &fb1_shadow_t);
     for (y = 0; y < fb_h; y++) {
         const uint8_t *src = fb1_hw_map + (size_t)y * fb1_hw_stride;
         uint8_t *dst = fb1_shadow + (size_t)y * fb_w;
@@ -935,22 +1044,28 @@ static int fb1_open(void)
                 fvar.bits_per_pixel);
         return -1;
     }
-    /* The 16bpp (Nautilus) path further requires the "index in the low byte"
-     * layout documented above - all three channel fields folded onto the same
-     * low 8 bits is the signature we measured on real hardware. A device that
-     * reports a genuine spread-out RGB565/RGB555 field layout is NOT this
-     * quirk (real truecolor, no per-pixel palette index to extract) and is
-     * refused rather than silently mis-decoded. */
-    if (fvar.bits_per_pixel == 16 &&
-        !(fvar.red.offset == 0 && fvar.red.length == 8 &&
-          fvar.green.offset == 0 && fvar.green.length == 8 &&
-          fvar.blue.offset == 0 && fvar.blue.length == 8)) {
-        fprintf(stderr, "screenremote: fb1 bpp=16 but channel layout isn't the "
-                "known index-in-low-byte quirk (red off=%u len=%u, green off=%u "
-                "len=%u, blue off=%u len=%u) - refusing rather than guessing\n",
-                fvar.red.offset, fvar.red.length, fvar.green.offset,
-                fvar.green.length, fvar.blue.offset, fvar.blue.length);
-        return -1;
+    /* 16bpp: the Nautilus OmapVideoModule reports the stale 8/8/8@offset-0
+     * channel descriptors of its Kronos-era 8bpp default even though the
+     * buffer is RGB565 (measured on real hardware and confirmed against Eva's
+     * own Convert24bppTo16bppRGB - see the fb1_native_bpp comment up top). A
+     * genuine 5/6/5 descriptor set is ALSO RGB565 and equally fine. Anything
+     * else (5/5/5, BGR, 4/4/4/4) is a layout this daemon has never seen -
+     * refuse rather than mislabel it to clients as RGB565. */
+    if (fvar.bits_per_pixel == 16) {
+        int stale_888 = fvar.red.offset == 0 && fvar.red.length == 8 &&
+                        fvar.green.offset == 0 && fvar.green.length == 8 &&
+                        fvar.blue.offset == 0 && fvar.blue.length == 8;
+        int real_565  = fvar.red.offset == 11 && fvar.red.length == 5 &&
+                        fvar.green.offset == 5 && fvar.green.length == 6 &&
+                        fvar.blue.offset == 0 && fvar.blue.length == 5;
+        if (!stale_888 && !real_565) {
+            fprintf(stderr, "screenremote: fb1 bpp=16 with an unknown channel layout "
+                    "(red off=%u len=%u, green off=%u len=%u, blue off=%u len=%u) - "
+                    "refusing rather than guessing\n",
+                    fvar.red.offset, fvar.red.length, fvar.green.offset,
+                    fvar.green.length, fvar.blue.offset, fvar.blue.length);
+            return -1;
+        }
     }
     fb_w = fvar.xres;
     fb_h = fvar.yres;
@@ -982,8 +1097,16 @@ static int fb1_open(void)
                        PROT_READ, MAP_SHARED, fb1_fd, 0);
         if (fb1_map == MAP_FAILED) { perror("mmap fb1"); return -1; }
 
-        fprintf(stderr, "screenremote: fb1 %ux%u bpp=8 stride=%u\n",
-                fb_w, fb_h, fb1_stride);
+        g_stream_fmt   = STREAM_FMT_INDEX8;
+        g_stream_enc   = STREAM_ENC_PACKBITS;
+        g_stream_bpp   = 8;
+        g_stream_w     = fb_w;
+        g_stream_h     = (g_stream_height_cfg > 0 && (uint32_t)g_stream_height_cfg <= fb_h)
+                         ? (uint32_t)g_stream_height_cfg : fb_h;
+        g_stream_pitch = g_stream_w;
+        g_stream_frame_bytes = g_stream_pitch * g_stream_h;
+        fprintf(stderr, "screenremote: fb1 %ux%u bpp=8 stride=%u (stream: %ux%u INDEX8/PackBits)\n",
+                fb_w, fb_h, fb1_stride, g_stream_w, g_stream_h);
         return 0;
     }
 
@@ -1018,9 +1141,185 @@ static int fb1_open(void)
     fb1_stride = fb_w;   /* fb1_map is always a contiguous byte-per-pixel buffer */
     fb1_refresh_shadow();
 
-    fprintf(stderr, "screenremote: fb1 %ux%u native bpp=16 (index-in-low-byte), "
-            "hw_stride=%u, shadow stride=%u\n", fb_w, fb_h, fb1_hw_stride, fb1_stride);
+    g_stream_fmt   = STREAM_FMT_RGB565LE;
+    g_stream_enc   = STREAM_ENC_DEFLATE;
+    g_stream_bpp   = 16;
+    g_stream_w     = fb_w;
+    if (g_stream_height_cfg > 0 && (uint32_t)g_stream_height_cfg <= fb_h)
+        g_stream_h = (uint32_t)g_stream_height_cfg;
+    else
+        g_stream_h = (fb_h > NAUTILUS_VISIBLE_ROWS) ? NAUTILUS_VISIBLE_ROWS : fb_h;
+    g_stream_pitch = g_stream_w * 2;
+    g_stream_frame_bytes = g_stream_pitch * g_stream_h;
+
+    fprintf(stderr, "screenremote: fb1 %ux%u native bpp=16 RGB565LE, hw_stride=%u "
+            "(stream: %ux%u RGB565/deflate; 8-bit shadow kept for heuristics only)\n",
+            fb_w, fb_h, fb1_hw_stride, g_stream_w, g_stream_h);
     return 0;
+}
+
+/* Identifies which physical unit this daemon is running on, for clients that
+ * need to branch on device family/model (e.g. a UI that shows different
+ * touch calibration hints, or just labels the connection) - not needed by
+ * anything inside this daemon itself, which already handles every hardware
+ * fork (palette fixes, fb1 bpp, touch scaling) internally regardless of what
+ * a client thinks the device is.
+ *
+ * FAMILY comes from fb1's native bpp, not the CPU string - that's the one
+ * signal in this function that's actually been confirmed on real hardware
+ * end to end (8bpp on every Kronos-family board tested; 16bpp-indexed on a
+ * real Nautilus, see kronosology/docs/hardware/nautilus_fb1_16bpp.md). It
+ * must run after fb1_open() has set fb1_native_bpp.
+ *
+ * MODEL narrows within FAMILY using /proc/cpuinfo's "model name": Atom
+ * D510/D525/D2550 identify the three Kronos-family boards per
+ * /home/share/CLAUDE.md's hardware table; Celeron/Pentium N3160 identifies
+ * Nautilus-class silicon (confirmed live on real Nautilus hardware, see the
+ * same nautilus_fb1_16bpp.md doc; CLAUDE.md's table names this part "J3160",
+ * which that doc flags as a documentation error, so J3160 is matched too).
+ * Ordinarily FAMILY (from bpp) and the CPU-string class agree, and MODEL is
+ * just the obvious combination (NAUTILUS, or one of the three Kronos codes).
+ * A CPU string that matches neither known list still gets a FAMILY (from bpp,
+ * always trusted) with an "unknown submodel" MODEL code rather than failing
+ * closed.
+ *
+ * The interesting case is when they DISAGREE: fb1 bpp reflects which video
+ * DRIVER is running (tied to a specific OmapVideoModule build - see
+ * fb1_native_bpp's own comment), not which BOARD the CPU string reports, so
+ * they are not actually guaranteed to move together just because every real
+ * unit seen so far has agreed. Nautilus-class silicon (N3160/J3160) paired
+ * with 8bpp fb1 is exactly the shape a genuine separate "Kronos 3" board
+ * would have if it exists as real hardware distinct from Nautilus - per
+ * CLAUDE.md's own hardware table and kronosology's firmware analysis (the
+ * "ForKRONOS3" branch lineage, see
+ * kronosology/docs/hardware/nautilus_color_palette.md) it shares Nautilus's
+ * CPU class but could plausibly run an older/different video driver. That
+ * combination reports MODEL=KRONOS3 (FAMILY stays KRONOS, since fb1 bpp is
+ * what the rest of this daemon's own hardware handling - palette fixes,
+ * touch scaling - actually keys off) with a loud stderr log, since this
+ * mapping is INFERRED, not verified against a real Kronos 3 unit the way
+ * every other mapping in this function is. The mirror-image conflict (Atom
+ * CPU string with 16bpp fb1) is guarded the same way, logged and reported as
+ * NAUTILUS_UNKNOWN, even though nothing suggests that combination is
+ * physically possible - better to surface an unexpected reading loudly than
+ * silently misreport it as an ordinary Nautilus. Runs once; the result is
+ * fixed for the life of the process, same caching rationale as
+ * nks4_progress_read()'s hwver_cached. */
+static void read_sys_string(const char *path, char *out, size_t outsz)
+{
+    FILE *f = fopen(path, "r");
+    size_t l;
+    out[0] = '\0';
+    if (!f) return;
+    if (!fgets(out, (int)outsz, f)) out[0] = '\0';
+    fclose(f);
+    l = strlen(out);
+    while (l > 0 && (out[l - 1] == '\n' || out[l - 1] == '\r' || out[l - 1] == ' ')) out[--l] = '\0';
+    /* Single-line space-separated replies (MODEL) embed these - keep them token-safe. */
+    for (l = 0; out[l]; l++) if (out[l] == ' ' || out[l] == '\t') out[l] = '_';
+}
+
+/* Identity is built from FOUR independent signals, reported raw alongside the
+ * derived codes so a client can always see the evidence:
+ *   1. fb1 bpp (8/16)          - the video driver build = which OS family is
+ *                                running; 16 is the RGB565 800x480 Nautilus
+ *                                panel path, 8 the indexed 800x600 Kronos one.
+ *   2. /proc/OmapNKS4HardwareVersion - the front-panel subsystem's own hardware
+ *                                revision (2 = the Nautilus WVGA panel; 0/1/3 =
+ *                                Kronos 1/2 SVGA panels, per the boot-progress-
+ *                                bar reconstruction in boot_progress_bar_state()).
+ *   3. DMI board_vendor/board_name - the motherboard. Two Nautilus generations
+ *                                exist: the original on the Kronos 2 board
+ *                                (ASRock IMB-140D, Atom D2550) and the later one
+ *                                (Kronos 3 / Nautilus AT) on the ASRock
+ *                                N3160TM-ITX-K / J3160 Celeron board.
+ *   4. /proc/cpuinfo model name - fallback for 3 on a kernel without DMI sysfs.
+ * FAMILY (the panel/OS) comes from 1, corroborated by 2. MODEL (the board
+ * generation within the family) comes from 3, else 4. Disagreements are
+ * logged, never silently collapsed. */
+static void detect_device_model(void)
+{
+    FILE *f;
+    char  line[256];
+    char  cpu[64] = "";
+    char  tmp[16];
+    int   board_atom_k1 = 0, board_atom_kx = 0, board_atom_k2 = 0, board_celeron = 0;
+    int   cpu_is_celeron, cpu_is_atom;
+    int   panel_says_nautilus;
+
+    f = fopen("/proc/cpuinfo", "r");
+    if (f) {
+        while (fgets(line, sizeof(line), f)) {
+            if (strncmp(line, "model name", 10) == 0) {
+                char  *p = strchr(line, ':');
+                size_t l;
+                if (!p) continue;
+                p++;
+                while (*p == ' ' || *p == '\t') p++;
+                l = strlen(p);
+                while (l > 0 && (p[l - 1] == '\n' || p[l - 1] == '\r')) p[--l] = '\0';
+                snprintf(cpu, sizeof(cpu), "%s", p);
+                break;
+            }
+        }
+        fclose(f);
+    }
+    snprintf(g_model_cpu, sizeof(g_model_cpu), "%s", cpu);
+
+    read_sys_string("/sys/class/dmi/id/board_vendor", g_board_vendor, sizeof(g_board_vendor));
+    read_sys_string("/sys/class/dmi/id/board_name",   g_board_name,   sizeof(g_board_name));
+    read_sys_string("/sys/class/dmi/id/bios_version", g_bios_version, sizeof(g_bios_version));
+    read_sys_string("/proc/OmapNKS4HardwareVersion",  tmp,            sizeof(tmp));
+    if (tmp[0]) g_panel_hwver = (int)strtol(tmp, NULL, 10);
+
+    board_atom_k1 = strstr(g_board_name, "D510") != NULL;
+    board_atom_kx = strstr(g_board_name, "D525") != NULL;
+    board_atom_k2 = strstr(g_board_name, "IMB-140") != NULL;
+    board_celeron = strstr(g_board_name, "3160") != NULL;
+    cpu_is_celeron = strstr(cpu, "N3160") || strstr(cpu, "J3160");
+    cpu_is_atom    = strstr(cpu, "D510") || strstr(cpu, "D525") || strstr(cpu, "D2550");
+    panel_says_nautilus = (g_panel_hwver == 2);
+
+    /* FAMILY: the panel. fb1 bpp is what we can prove on both families and is
+     * what the stream geometry must follow; the NKS4 hardware version is the
+     * panel subsystem's own word and should agree. */
+    if (fb1_native_bpp == 16) {
+        snprintf(g_model_family, sizeof(g_model_family), "NAUTILUS");
+        if (g_panel_hwver >= 0 && !panel_says_nautilus)
+            fprintf(stderr, "screenremote: FAMILY CONFLICT - fb1 16bpp (Nautilus video driver) "
+                    "but panel hwver=%d (Kronos-class) - trusting fb1 bpp\n", g_panel_hwver);
+    } else {
+        snprintf(g_model_family, sizeof(g_model_family), "KRONOS");
+        if (panel_says_nautilus)
+            fprintf(stderr, "screenremote: FAMILY CONFLICT - fb1 8bpp (Kronos video driver) "
+                    "but panel hwver=2 (Nautilus-class) - trusting fb1 bpp\n");
+    }
+
+    /* MODEL: the board generation within the family. DMI first, CPU fallback. */
+    {
+        int is_nautilus = fb1_native_bpp == 16;
+        const char *code;
+        if (board_atom_k1)      code = is_nautilus ? "NAUTILUS_UNKNOWN" : "KRONOS1";
+        else if (board_atom_kx) code = is_nautilus ? "NAUTILUS_UNKNOWN" : "KRONOSX";
+        else if (board_atom_k2) code = is_nautilus ? "NAUTILUS"         : "KRONOS2";
+        else if (board_celeron) code = is_nautilus ? "NAUTILUS_AT"      : "KRONOS3";
+        else if (strstr(cpu, "D510"))  code = is_nautilus ? "NAUTILUS_UNKNOWN" : "KRONOS1";
+        else if (strstr(cpu, "D525"))  code = is_nautilus ? "NAUTILUS_UNKNOWN" : "KRONOSX";
+        else if (strstr(cpu, "D2550")) code = is_nautilus ? "NAUTILUS"         : "KRONOS2";
+        else if (cpu_is_celeron)       code = is_nautilus ? "NAUTILUS_AT"      : "KRONOS3";
+        else                           code = is_nautilus ? "NAUTILUS_UNKNOWN" : "KRONOS_UNKNOWN";
+        snprintf(g_model_code, sizeof(g_model_code), "%s", code);
+
+        if (g_board_name[0] && !(board_atom_k1 || board_atom_kx || board_atom_k2 || board_celeron))
+            fprintf(stderr, "screenremote: MODEL - unrecognised board \"%s %s\", fell back to CPU string\n",
+                    g_board_vendor, g_board_name);
+        if ((board_celeron && cpu_is_atom) || (cpu_is_celeron && (board_atom_k1 || board_atom_kx || board_atom_k2)))
+            fprintf(stderr, "screenremote: MODEL CONFLICT - board \"%s\" vs CPU \"%s\" disagree, trusting the board\n",
+                    g_board_name, cpu);
+    }
+    fprintf(stderr, "screenremote: device model FAMILY=%s MODEL=%s BOARD=\"%s %s\" BIOS=%s CPU=\"%s\" FB_BPP=%d PANEL_HWVER=%d\n",
+            g_model_family, g_model_code, g_board_vendor, g_board_name, g_bios_version, cpu,
+            fb1_native_bpp, g_panel_hwver);
 }
 
 static int fb0_open(void)
@@ -1235,10 +1534,28 @@ static void do_mirror(void)
     mirror_shadow_valid = 1;
 }
 
+/* The Nautilus board's video output has no panel behind it, and the mirror's
+ * 15 Hz writes into uncached VESA memory cost ~5.5% of a core on that unit for
+ * nothing (measured 2026-09-20) - so on FAMILY=NAUTILUS the flag is ignored.
+ * Kronos units drive a real VGA monitor with it and are untouched. */
+static int mirror_supported(void)
+{
+    return fb1_native_bpp != 16;
+}
+
 static void check_mirror_flag(void)
 {
     struct stat st;
     int want = (stat(MIRROR_FLAG, &st) == 0);
+    if (want && !mirror_supported()) {
+        static int warned = 0;
+        if (!warned) {
+            warned = 1;
+            fprintf(stderr, "screenremote: %s present but the VGA mirror is not supported on "
+                    "this hardware (Nautilus: no video output) - ignoring\n", MIRROR_FLAG);
+        }
+        want = 0;
+    }
     if (want == mirror_on) return;
     if (want) { if (fb0_open() == 0) { mirror_on = 1; ss_reset(time(NULL)); } }
     else      { fb0_close(); mirror_on = 0; ss_active = 0; }
@@ -1300,6 +1617,12 @@ static void read_config(void)
            g_touch_y_range = v;
            g_touch_y_range_from_config = 1;
         }
+        else if (sscanf(line, "stream_max_kbps=%d", &v) == 1 && v >= 0)
+           g_stream_max_kbps = v;
+        else if (sscanf(line, "stream_height=%d", &v) == 1 && v > 0)
+           g_stream_height_cfg = v;
+        else if (sscanf(line, "cpu_affinity=%i", &v) == 1 && v > 0)
+           g_cpu_affinity_cfg = v;
     }
     fclose(f);
     /* stream and ctrl are both TCP listeners, so equal ports make the second
@@ -1555,6 +1878,351 @@ static int send_frame(int fd)
     return -1;
 }
 
+
+/* ======================================================================
+ *  Native (v3) stream
+ *
+ * The v2 protocol above is 8-bit palette indices + a 256-entry palette, which
+ * cannot carry the Nautilus's RGB565 framebuffer (kronosology/docs/hardware/
+ * nautilus_color_palette.md "Round 6"). v3 ships whatever the hardware has,
+ * unconverted: INDEX8+palette on Kronos, RGB565LE on Nautilus. The client
+ * decodes; the daemon only crops to the visible panel, finds the changed
+ * rectangle, and compresses it.
+ *
+ * Every frame is one rectangle: [len_LE32][enc][x0][y0][w][h][data]. The
+ * encoder per hardware is chosen once (g_stream_enc): PackBits on Kronos so
+ * its validated CPU profile is untouched, zlib/deflate level 1 (miniz) on
+ * Nautilus - measured on the real N3160: ~29 ms for a worst-case full 800x480
+ * photo frame (768000 -> ~140-200 KB), ~10x less for typical UI rects, on a
+ * core RTAI does not use (see pick_cpu_affinity()). Either encoder falls back
+ * to raw if it would expand.
+ *
+ * Working buffers use the stream pitch (w*bpp/8), not the device stride, so
+ * the 600-row Nautilus buffer is cropped to its 480 visible rows on capture.
+ * ====================================================================== */
+
+static uint32_t packbits_encode(const uint8_t *src, uint32_t n, uint8_t *dst);   /* defined further down */
+
+static int v3_init(void)
+{
+    size_t bound = (size_t)mz_compressBound((mz_ulong)g_stream_frame_bytes);
+    v3_enc_cap = STREAM_V3_HDR + (bound > (size_t)g_stream_frame_bytes * 2
+                                  ? bound : (size_t)g_stream_frame_bytes * 2);
+    v3_shadow  = malloc(g_stream_frame_bytes);
+    v3_staging = malloc(g_stream_frame_bytes);
+    v3_enc     = malloc(v3_enc_cap);
+    if (!v3_shadow || !v3_staging || !v3_enc) {
+        perror("malloc v3 stream buffers");
+        return -1;
+    }
+    v3_shadow_valid = 0;
+    if (g_stream_max_kbps < 0)
+        g_stream_max_kbps = (fb1_native_bpp == 16) ? NAUTILUS_DEFAULT_MAX_KBPS : 0;
+    clock_gettime(CLOCK_MONOTONIC, &g_bucket_t);
+    g_bucket_bytes = (double)g_stream_max_kbps * 125.0;   /* start with 1 s of credit */
+    fprintf(stderr, "screenremote: v3 stream %ux%u fmt=%s enc=%s cap=%d kbps\n",
+            g_stream_w, g_stream_h,
+            g_stream_fmt == STREAM_FMT_RGB565LE ? "RGB565LE" : "INDEX8",
+            g_stream_enc == STREAM_ENC_DEFLATE ? "deflate" : "packbits",
+            g_stream_max_kbps);
+    return 0;
+}
+
+/* Token bucket: refill at g_stream_max_kbps, burst up to one second's worth.
+ * Returns 1 and debits if `bytes` may be sent now, else 0 (caller retries next
+ * tick - the pending change is not lost, it simply stays undiffed in the shadow). */
+static int v3_bucket_take(size_t bytes)
+{
+    struct timespec now;
+    double cap;
+    if (g_stream_max_kbps <= 0) return 1;
+    cap = (double)g_stream_max_kbps * 125.0;              /* bytes per second */
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    g_bucket_bytes += cap * ((now.tv_sec - g_bucket_t.tv_sec) +
+                             (now.tv_nsec - g_bucket_t.tv_nsec) / 1e9);
+    g_bucket_t = now;
+    if (g_bucket_bytes > cap) g_bucket_bytes = cap;
+    /* A single frame bigger than a whole second's budget must still be able to
+     * go out (once the bucket is full), or a large full-frame update would
+     * starve forever behind the cap. */
+    if (g_bucket_bytes >= (double)bytes || g_bucket_bytes >= cap - 1.0) {
+        g_bucket_bytes -= (double)bytes;
+        if (g_bucket_bytes < -cap) g_bucket_bytes = -cap;   /* bounded debt */
+        return 1;
+    }
+    return 0;
+}
+
+/* RGB565 of a kronos_palette[] index - the boot splash resource and the
+ * boot-progress-bar colours are defined as Kronos palette indices (they
+ * predate the Nautilus); on RGB565 hardware they're converted through the
+ * same table Kronos would display them with. */
+static uint16_t v3_index_to_565(uint8_t idx)
+{
+    uint16_t r = kronos_palette[idx][0], g = kronos_palette[idx][1], b = kronos_palette[idx][2];
+    return (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
+}
+
+static void v3_fill_px(uint8_t *row, uint32_t x, uint32_t n, uint8_t idx)
+{
+    if (g_stream_bpp == 8) {
+        memset(row + x, idx, n);
+    } else {
+        uint16_t v = v3_index_to_565(idx);
+        uint32_t i;
+        for (i = 0; i < n; i++) {
+            row[(x + i) * 2]     = (uint8_t)(v & 0xFF);
+            row[(x + i) * 2 + 1] = (uint8_t)(v >> 8);
+        }
+    }
+}
+
+/* Boot-gate compositing for a v3 staging frame - the same splash rows and
+ * 2-row progress bar apply_boot_splash()/apply_boot_progress_bar() paint for
+ * v2, expressed in the stream's pixel format. */
+static void v3_composite_boot(uint8_t *buf)
+{
+    uint32_t rows = boot_splash_active_rows();
+    struct boot_bar_geom g;
+    int filled;
+    if (rows > g_stream_h) rows = g_stream_h;
+    if (rows) {
+        if (g_stream_bpp == 8) {
+            memcpy(buf, g_boot_splash, (size_t)g_stream_w * rows);
+        } else {
+            uint32_t y, x;
+            for (y = 0; y < rows; y++) {
+                const uint8_t *src = g_boot_splash + (size_t)y * g_boot_splash_w;
+                uint8_t *dst = buf + (size_t)y * g_stream_pitch;
+                for (x = 0; x < g_stream_w; x++) {
+                    uint16_t v = v3_index_to_565(src[x]);
+                    dst[x * 2] = (uint8_t)(v & 0xFF); dst[x * 2 + 1] = (uint8_t)(v >> 8);
+                }
+            }
+        }
+    }
+    if (boot_progress_bar_state(&g, &filled) && g.row + 1 < g_stream_h) {
+        uint8_t *r0 = buf + (size_t)g.row * g_stream_pitch;
+        uint8_t *r1 = r0 + g_stream_pitch;
+        v3_fill_px(r0, g.col,          (uint32_t)filled,                 9);
+        v3_fill_px(r0, g.col + filled, g.max_width - (uint32_t)filled, 0xC0);
+        v3_fill_px(r1, g.col,          (uint32_t)filled,                 1);
+        v3_fill_px(r1, g.col + filled, g.max_width - (uint32_t)filled, 0xC0);
+    }
+}
+
+/* Capture the visible panel into v3_staging (native pixels, stream pitch).
+ * Reads from the device mapping - fb1_hw_map on 16bpp, fb1_map on 8bpp - so
+ * the Nautilus path never goes through the 8-bit shadow. ~0.5 ms for the full
+ * 768 KB Nautilus frame (cached system RAM, measured on the unit). */
+static void v3_capture(void)
+{
+    uint32_t y;
+    const uint8_t *src    = (fb1_native_bpp == 16) ? fb1_hw_map   : fb1_map;
+    uint32_t       stride = (fb1_native_bpp == 16) ? fb1_hw_stride : fb1_stride;
+    if (stride == g_stream_pitch) {
+        memcpy(v3_staging, src, (size_t)g_stream_pitch * g_stream_h);
+    } else {
+        for (y = 0; y < g_stream_h; y++)
+            memcpy(v3_staging + (size_t)y * g_stream_pitch,
+                   src + (size_t)y * stride, g_stream_pitch);
+    }
+    v3_composite_boot(v3_staging);   /* no-op once the boot gate clears */
+}
+
+/* Steady-state (no boot compositing, shadow valid) capture: compare the
+ * device mapping row-by-row against what the client already has and copy
+ * ONLY the dirty rows into v3_staging. An idle tick then costs one
+ * row-compare pass (~0.4 ms for a full Nautilus frame, measured) and no
+ * full-frame copy. Rows outside [first,last] in v3_staging are left stale -
+ * the caller must not read them and must not swap staging/shadow wholesale
+ * (see v3_update). Returns 0 if nothing differs. */
+static int v3_capture_dirty_rows(uint32_t *first_out, uint32_t *last_out)
+{
+    uint32_t y, first = g_stream_h, last = 0;
+    const uint8_t *src    = (fb1_native_bpp == 16) ? fb1_hw_map   : fb1_map;
+    uint32_t       stride = (fb1_native_bpp == 16) ? fb1_hw_stride : fb1_stride;
+    for (y = 0; y < g_stream_h; y++) {
+        if (memcmp(src + (size_t)y * stride,
+                   v3_shadow + (size_t)y * g_stream_pitch, g_stream_pitch) != 0) {
+            if (y < first) first = y;
+            last = y;
+        }
+    }
+    if (first > last) return 0;
+    for (y = first; y <= last; y++)
+        memcpy(v3_staging + (size_t)y * g_stream_pitch, src + (size_t)y * stride, g_stream_pitch);
+    *first_out = first; *last_out = last;
+    return 1;
+}
+
+/* Bounding rectangle of everything that differs between v3_staging and
+ * v3_shadow. Rows first (one memcmp per row, ~0.4 ms for a full Nautilus
+ * frame), then columns only over the dirty rows. Returns 0 if nothing changed. */
+static int v3_find_dirty_rect(uint32_t row_lo, uint32_t row_hi,
+                              uint32_t *x0, uint32_t *y0, uint32_t *w, uint32_t *h)
+{
+    uint32_t first = g_stream_h, last = 0, y;
+    uint32_t bpp = g_stream_bpp / 8;
+    uint32_t minx = g_stream_w, maxx = 0;
+
+    for (y = row_lo; y <= row_hi && y < g_stream_h; y++) {
+        if (memcmp(v3_staging + (size_t)y * g_stream_pitch,
+                   v3_shadow  + (size_t)y * g_stream_pitch, g_stream_pitch) != 0) {
+            if (y < first) first = y;
+            last = y;
+        }
+    }
+    if (first > last) return 0;
+
+    for (y = first; y <= last; y++) {
+        const uint8_t *a = v3_staging + (size_t)y * g_stream_pitch;
+        const uint8_t *b = v3_shadow  + (size_t)y * g_stream_pitch;
+        /* Word-wise scan from each end (rows are malloc-aligned and the pitch
+         * is a multiple of 4), narrowed to the byte, then to the pixel. */
+        uint32_t lim = minx * bpp, i = 0;
+        const uint32_t *A = (const uint32_t *)a, *B = (const uint32_t *)b;
+        while (i + 4 <= lim && A[i / 4] == B[i / 4]) i += 4;
+        while (i < lim && a[i] == b[i]) i++;
+        if (i < lim) minx = i / bpp;
+        i = g_stream_pitch; lim = maxx * bpp;
+        while (i >= lim + 4 && A[i / 4 - 1] == B[i / 4 - 1]) i -= 4;
+        while (i > lim && a[i - 1] == b[i - 1]) i--;
+        if (i > lim) maxx = (i + bpp - 1) / bpp;
+        if (minx == 0 && maxx == g_stream_w) break;
+    }
+    if (maxx <= minx) { minx = 0; maxx = g_stream_w; }   /* defensive: can't happen once a row differs */
+    *x0 = minx; *y0 = first; *w = maxx - minx; *h = last - first + 1;
+    return 1;
+}
+
+/* Encode rect (x0,y0,w,h) of `src` into v3_enc as a complete v3 frame
+ * (9-byte header + payload). Returns the total byte count. */
+static size_t v3_encode_rect(const uint8_t *src, uint32_t x0, uint32_t y0,
+                             uint32_t w, uint32_t h)
+{
+    uint32_t bpp   = g_stream_bpp / 8;
+    uint32_t pitch = w * bpp;
+    size_t   raw   = (size_t)pitch * h;
+    uint8_t *payload = v3_enc + STREAM_V3_HDR;
+    uint8_t  enc = STREAM_ENC_RAW;
+    size_t   n = 0;
+    uint32_t y;
+
+    /* Gather the rect contiguously. For a full-width rect this is the frame
+     * itself, so encode straight from src. Otherwise use the tail of v3_enc
+     * (past any possible encoded output) as the gather area. */
+    const uint8_t *rect;
+    size_t gathered = 0;
+    if (x0 == 0 && w == g_stream_w) {
+        rect = src + (size_t)y0 * g_stream_pitch;
+    } else {
+        uint8_t *g = v3_enc + v3_enc_cap - raw;   /* tail of v3_enc, never overlaps payload */
+        for (y = 0; y < h; y++)
+            memcpy(g + (size_t)y * pitch,
+                   src + (size_t)(y0 + y) * g_stream_pitch + (size_t)x0 * bpp, pitch);
+        rect = g;
+        gathered = raw;
+    }
+
+    /* Tiny rects (cursor blinks, LED-style indicators: a few hundred bytes)
+     * go raw - deflate can't win much on them, and miniz's per-call
+     * compressor setup costs far more than the bytes it would save. */
+    if (raw <= 512) {
+        /* fall through to raw */
+    } else if (g_stream_enc == STREAM_ENC_DEFLATE) {
+        mz_ulong out = (mz_ulong)(v3_enc_cap - STREAM_V3_HDR - gathered);
+        if (mz_compress2(payload, &out, rect, (mz_ulong)raw, 1) == MZ_OK && out < raw) {
+            enc = STREAM_ENC_DEFLATE; n = (size_t)out;
+        }
+    } else if (g_stream_enc == STREAM_ENC_PACKBITS) {
+        /* packbits_encode() is defined further down; worst case 2x expansion,
+         * which v3_enc_cap covers. Only worth it if it actually shrinks. */
+        uint32_t out = packbits_encode(rect, (uint32_t)raw, payload);
+        if (out < raw) { enc = STREAM_ENC_PACKBITS; n = out; }
+    }
+    if (enc == STREAM_ENC_RAW) {
+        memmove(payload, rect, raw);
+        n = raw;
+    }
+    v3_enc[0] = enc;
+    put_le16(v3_enc + 1, (uint16_t)x0);
+    put_le16(v3_enc + 3, (uint16_t)y0);
+    put_le16(v3_enc + 5, (uint16_t)w);
+    put_le16(v3_enc + 7, (uint16_t)h);
+    return STREAM_V3_HDR + n;
+}
+
+static int v3_send_encoded(int fd, size_t total)
+{
+    uint8_t hdr[4];
+    put_le32(hdr, (uint32_t)total);
+    TCP_CORK_ON(fd);
+    if (write_all_f(fd, hdr, 4) < 0 || write_all_f(fd, v3_enc, total) < 0) {
+        TCP_CORK_OFF(fd);
+        return -1;
+    }
+    TCP_CORK_OFF(fd);
+    return 0;
+}
+
+/* One v3 update: capture, diff against what the client already has, encode
+ * the changed rect (or the whole frame when `force_full` / no valid shadow),
+ * apply the byte-rate cap, send, and on success promote staging to shadow.
+ * Returns 1 sent, 0 nothing sent (unchanged, or deferred by the cap - the
+ * caller may retry next tick), -1 socket error. `want_empty` makes an
+ * unchanged frame answer with an explicit empty rect (pull-mode 0xFE). */
+static int v3_update(int fd, int force_full, int want_empty)
+{
+    uint32_t x0 = 0, y0 = 0, w = g_stream_w, h = g_stream_h;
+    uint32_t rlo = 0, rhi = g_stream_h - 1;
+    size_t total;
+    int changed, partial_staging = 0;
+    struct boot_bar_geom bg; int bar_filled;
+    /* Boot-gate compositing (splash rows / progress bar) needs the full-copy
+     * path so v3_composite_boot() has a whole frame to paint into. Both
+     * helpers short-circuit to 0 once the gate clears. */
+    int compositing = boot_splash_active_rows() > 0 || boot_progress_bar_state(&bg, &bar_filled);
+
+    if (force_full || !v3_shadow_valid || compositing) {
+        v3_capture();                    /* full copy (+ boot compositing) */
+        if (force_full || !v3_shadow_valid) {
+            changed = 1;
+        } else {
+            changed = v3_find_dirty_rect(0, g_stream_h - 1, &x0, &y0, &w, &h);
+        }
+    } else {
+        changed = v3_capture_dirty_rows(&rlo, &rhi);
+        partial_staging = 1;             /* only rows [rlo,rhi] of v3_staging are fresh */
+        if (changed)
+            changed = v3_find_dirty_rect(rlo, rhi, &x0, &y0, &w, &h);
+    }
+    if (changed && (size_t)w * h * 4 >= (size_t)g_stream_w * g_stream_h * 3) {
+        if (partial_staging) { v3_capture(); partial_staging = 0; }
+        x0 = 0; y0 = 0; w = g_stream_w; h = g_stream_h;   /* >75% dirty: just send it all */
+    }
+    if (!changed) {
+        if (!want_empty) return 0;
+        total = v3_encode_rect(v3_staging, 0, 0, 0, 0);
+        return v3_send_encoded(fd, total) < 0 ? -1 : 1;
+    }
+    total = v3_encode_rect(v3_staging, x0, y0, w, h);
+    if (!v3_bucket_take(total + 4))
+        return 0;
+    if (v3_send_encoded(fd, total) < 0) return -1;
+    if (partial_staging) {
+        /* Only the sent rows are fresh in staging: fold them into the shadow. */
+        uint32_t y;
+        for (y = y0; y < y0 + h; y++)
+            memcpy(v3_shadow + (size_t)y * g_stream_pitch,
+                   v3_staging + (size_t)y * g_stream_pitch, g_stream_pitch);
+    } else {
+        uint8_t *t = v3_shadow; v3_shadow = v3_staging; v3_staging = t;
+    }
+    v3_shadow_valid = 1;
+    return 1;
+}
+
 #define STREAM_HELLO_SIZE 9
 #define STREAM_HELLO_MAX  (STREAM_HELLO_SIZE + 64 + 128)
 
@@ -1575,6 +2243,9 @@ static void stream_handshake_close(struct stream_handshake *hs, const char *reas
     }
 }
 
+#define STREAM_VER_MIN 0x02
+#define STREAM_VER_MAX 0x03
+
 static int stream_handshake_reject(struct stream_handshake *hs, const char *reason)
 {
     uint8_t fail[5];
@@ -1583,6 +2254,22 @@ static int stream_handshake_reject(struct stream_handshake *hs, const char *reas
     (void)write_all(hs->fd, fail, sizeof(fail));
     stream_handshake_close(hs, reason);
     return -1;
+}
+
+/* Version-related refusals carry the daemon's supported range after the
+ * status byte so a client can tell "I'm too old" from "I'm too new" and say
+ * so: KSCR + status + ver_min + ver_max (7 bytes). status 0x04 =
+ * VERSION_MISMATCH (hello version byte outside [ver_min, ver_max]); status
+ * 0x03 = FORMAT_NEEDS_NEWER_VERSION (version accepted, but this hardware's
+ * pixel format can't be carried in it - reconnect with ver_max). */
+static void stream_reply_version_status(int fd, uint8_t status)
+{
+    uint8_t rsp[7];
+    memcpy(rsp, MAGIC, 4);
+    rsp[4] = status;
+    rsp[5] = STREAM_VER_MIN;
+    rsp[6] = STREAM_VER_MAX;
+    (void)write_all(fd, rsp, sizeof(rsp));
 }
 
 /* Read one bounded stream hello without ever waiting for the peer. */
@@ -1594,8 +2281,16 @@ static int stream_handshake_read(struct stream_handshake *hs)
 
         if (hs->need == 0 && hs->have == STREAM_HELLO_SIZE) {
             const uint8_t *hdr = hs->hello;
-            if (memcmp(hdr, MAGIC, 4) != 0 || hdr[4] != 0x02)
-                return stream_handshake_reject(hs, "bad magic/version");
+            if (memcmp(hdr, MAGIC, 4) != 0)
+                return stream_handshake_reject(hs, "bad magic");
+            if (hdr[4] < STREAM_VER_MIN || hdr[4] > STREAM_VER_MAX) {
+                char why[64];
+                snprintf(why, sizeof(why), "VERSION_MISMATCH: client v%u, daemon supports v%u-v%u",
+                         hdr[4], STREAM_VER_MIN, STREAM_VER_MAX);
+                stream_reply_version_status(hs->fd, 0x04);
+                stream_handshake_close(hs, why);
+                return -1;
+            }
             if (hdr[7] == 0 || hdr[7] > 64 || hdr[8] > 128)
                 return stream_handshake_reject(hs, "bad credential lengths");
             hs->need = STREAM_HELLO_SIZE + hdr[7] + hdr[8];
@@ -1622,11 +2317,11 @@ static int stream_handshake_read(struct stream_handshake *hs)
     }
 }
 
-static int do_handshake(int fd, uint8_t *mode_out, uint8_t *fps_out,
+static int do_handshake(int fd, uint8_t *mode_out, uint8_t *fps_out, uint8_t *ver_out,
                         const struct sockaddr_in *peer, const uint8_t *hello)
 {
     const uint8_t *hdr = hello;  /* KSCR(4) + ver(1) + mode(1) + fps(1) + ulen(1) + plen(1) */
-    uint8_t  rsp[4 + 1 + 2 + 2 + PAL_ENTRIES * 3];
+    uint8_t  rsp[4 + 1 + 2 + 2 + 4 + PAL_ENTRIES * 3];
     char     user[65], pass[129];
     uint8_t  fail[5];
     uint8_t  ulen, plen;
@@ -1675,18 +2370,41 @@ static int do_handshake(int fd, uint8_t *mode_out, uint8_t *fps_out,
     }
     *fps_out  = hdr[6] ? hdr[6] : FPS_MAX;
     if (*fps_out > FPS_MAX) *fps_out = FPS_MAX;
+    *ver_out  = hdr[4];
+
+    /* A v2 client can only render index8+palette. On RGB565 hardware there is
+     * no palette - 3.0.1 fed such clients the low byte of each RGB565 word as
+     * an "index", which is where the wrong Nautilus colours came from. Refuse
+     * with a distinct status so the client can say "update me" instead of
+     * showing garbage. */
+    if (*ver_out == 0x02 && g_stream_fmt != STREAM_FMT_INDEX8) {
+        stream_reply_version_status(fd, 0x03);
+        log_access(peer_ip, 0, "FORMAT_NEEDS_NEWER_VERSION: v2 client on RGB565 hardware - needs protocol v3");
+        return -1;
+    }
 
     i = 0;
     memcpy(rsp + i, MAGIC, 4);              i += 4;
     rsp[i++] = 0x00;                       /* status ok */
-    rsp[i++] = (uint8_t)(fb_w & 0xFF);     /* width LE16 */
-    rsp[i++] = (uint8_t)(fb_w >> 8);
-    rsp[i++] = (uint8_t)(fb_h & 0xFF);     /* height LE16 */
-    rsp[i++] = (uint8_t)(fb_h >> 8);
-    for (j = 0; j < PAL_ENTRIES; j++) {    /* palette: 256  x RGB8 */
-        rsp[i++] = (uint8_t)(pal_r[j] >> 8);
-        rsp[i++] = (uint8_t)(pal_g[j] >> 8);
-        rsp[i++] = (uint8_t)(pal_b[j] >> 8);
+    if (*ver_out == 0x02) {
+        rsp[i++] = (uint8_t)(fb_w & 0xFF);     /* width LE16 */
+        rsp[i++] = (uint8_t)(fb_w >> 8);
+        rsp[i++] = (uint8_t)(fb_h & 0xFF);     /* height LE16 */
+        rsp[i++] = (uint8_t)(fb_h >> 8);
+    } else {
+        put_le16(rsp + i, (uint16_t)g_stream_w); i += 2;   /* VISIBLE geometry */
+        put_le16(rsp + i, (uint16_t)g_stream_h); i += 2;
+        rsp[i++] = g_stream_fmt;
+        rsp[i++] = (uint8_t)g_stream_bpp;
+        rsp[i++] = g_stream_enc;               /* the encoder this daemon will use */
+        rsp[i++] = 0x00;                       /* flags - reserved, always 0 */
+    }
+    if (*ver_out == 0x02 || g_stream_fmt == STREAM_FMT_INDEX8) {
+        for (j = 0; j < PAL_ENTRIES; j++) {    /* palette: 256  x RGB8 */
+            rsp[i++] = (uint8_t)(pal_r[j] >> 8);
+            rsp[i++] = (uint8_t)(pal_g[j] >> 8);
+            rsp[i++] = (uint8_t)(pal_b[j] >> 8);
+        }
     }
     log_access(peer_ip, 1, NULL);
     return write_all(fd, rsp, i);
@@ -2702,11 +3420,13 @@ static long eva_uptime_seconds(int pid)
 /* One-way gate clear, shared by all three independent clearing signals in
  * update_boot_state() below - frees the boot splash (never needed again once
  * the gate is open) exactly once, whichever signal fires first. */
+static void pick_cpu_affinity(const char *when);   /* defined near main() */
 static void boot_gate_clear(void)
 {
     g_boot_active = 0;
     free(g_boot_splash);
     g_boot_splash = NULL;
+    pick_cpu_affinity("boot gate clear");   /* OA.ko's RT task map is complete now */
 }
 
 /* Called once per main-loop iteration (see main()) - cheap once latched
@@ -2819,6 +3539,7 @@ static int cmd_class(const char *line)
         strcmp(line, "STATE") == 0 ||
         strcmp(line, "MODE_DETAIL") == 0 ||
         strcmp(line, "VERSION") == 0 ||
+        strcmp(line, "MODEL") == 0 ||
         strcmp(line, "SYSINFO") == 0)
         return CMD_RO_ALWAYS;
     if (strcmp(line, "LASTTOUCH") == 0 ||
@@ -3655,6 +4376,18 @@ static int sysinfo_collect(char *out, int outsz)
     memcpy(g_si_prev, cur, sizeof(g_si_prev));
     g_si_prev_valid = 1;
 
+    /*  Device identity - see detect_device_model(), called once at startup.
+     *  Same FAMILY/MODEL as the standalone MODEL command; MODEL_CPU is the
+     *  raw /proc/cpuinfo string, safe here (own line, terminated by \n) even
+     *  though it can contain spaces - unlike MODEL's single-line reply. */
+    SI_APPEND("MODEL_FAMILY=%s\nMODEL=%s\nMODEL_CPU=%s\n",
+              g_model_family, g_model_code, g_model_cpu);
+    SI_APPEND("BOARD_VENDOR=%s\nBOARD_NAME=%s\nBIOS_VERSION=%s\nPANEL_HWVER=%d\nFB_BPP=%d\n",
+              g_board_vendor[0] ? g_board_vendor : "UNKNOWN",
+              g_board_name[0]   ? g_board_name   : "UNKNOWN",
+              g_bios_version[0] ? g_bios_version : "UNKNOWN",
+              g_panel_hwver, fb1_native_bpp);
+
     /*  /proc/uptime */
     {
         unsigned long up = 0;
@@ -3689,7 +4422,10 @@ static int sysinfo_collect(char *out, int outsz)
             total, mem_free, mem_free + bufs + cached);
     }
 
-    /*  CPU percentages */
+    /*  CPU topology + placement (static after startup) and percentages */
+    SI_APPEND("CPU_COUNT=%d\nCPU_CORES=%d\nCPU_THREADS_PER_CORE=%d\n"
+              "CPU_DAEMON_MASK=0x%lx\nCPU_RT_MASK=0x%lx\n",
+              g_cpu_logical, g_cpu_cores, g_cpu_threads, g_cpu_daemon_mask, g_cpu_rt_mask);
     SI_APPEND("CPU_PCT=%d\n", cpu_pct[0]);
     for (i = 0; i < ncpu; i++)
         SI_APPEND("CPU%d_PCT=%d\n", i, cpu_pct[i + 1]);
@@ -3774,23 +4510,51 @@ static int sysinfo_collect(char *out, int outsz)
         }
         if (hwmon_base >= 0) {
             const char *sub = use_device ? "/device" : "";
-            for (int i = 1; i <= 3; i++) {
+            int temp_cpu = -1000, fan_rpm = -1;
+            char hname[32] = "";
+            snprintf(tpath, sizeof(tpath), "/sys/class/hwmon/hwmon%d%s/name", hwmon_base, sub);
+            read_sys_string(tpath, hname, sizeof(hname));
+            SI_APPEND("HWMON=%s\n", hname[0] ? hname : "UNKNOWN");
+            /* Every temperature input the chip exposes, with its label. On the
+             * Nautilus/Kronos 3 board (ASRock N3160TM-ITX-K, NCT6793) SYSTIN
+             * and AUXTIN1-3 are unconnected inputs that read 109-116 C - real
+             * artefacts of the sensor, reported as-is; TEMP_CPU below is the
+             * one to display. TEMP1-3/FAN1_RPM keep their pre-3.0.2 meaning. */
+            for (int i = 1; i <= 10; i++) {
+                char lbl[32] = "";
                 snprintf(tpath, sizeof(tpath),
                          "/sys/class/hwmon/hwmon%d%s/temp%d_input",
                          hwmon_base, sub, i);
                 f = fopen(tpath, "r");
-                if (f) {
-                    tv = 0; fscanf(f, "%d", &tv); fclose(f);
-                    SI_APPEND("TEMP%d=%d\n", i, tv / 1000);
-                }
+                if (!f) continue;
+                tv = 0; fscanf(f, "%d", &tv); fclose(f);
+                snprintf(tpath, sizeof(tpath),
+                         "/sys/class/hwmon/hwmon%d%s/temp%d_label",
+                         hwmon_base, sub, i);
+                read_sys_string(tpath, lbl, sizeof(lbl));
+                SI_APPEND("TEMP%d=%d\n", i, tv / 1000);
+                if (lbl[0]) SI_APPEND("TEMP%d_LABEL=%s\n", i, lbl);
+                if (temp_cpu == -1000 && lbl[0] &&
+                    (strcmp(lbl, "CPUTIN") == 0 || strstr(lbl, "CPU")) && tv > 0 && tv < 100000)
+                    temp_cpu = tv / 1000;
             }
-            snprintf(tpath, sizeof(tpath),
-                     "/sys/class/hwmon/hwmon%d%s/fan1_input",
-                     hwmon_base, sub);
-            f = fopen(tpath, "r");
-            if (f) { tv = 0; fscanf(f, "%d", &tv); fclose(f);
-                SI_APPEND("FAN1_RPM=%d\n", tv); }
+            for (int i = 1; i <= 5; i++) {
+                snprintf(tpath, sizeof(tpath),
+                         "/sys/class/hwmon/hwmon%d%s/fan%d_input",
+                         hwmon_base, sub, i);
+                f = fopen(tpath, "r");
+                if (!f) continue;
+                tv = 0; fscanf(f, "%d", &tv); fclose(f);
+                SI_APPEND("FAN%d_RPM=%d\n", i, tv);
+                if (fan_rpm < 0 && tv > 0) fan_rpm = tv;
+            }
+            /* The values a UI should show: the CPU sensor (by label), the
+             * first fan header that is actually spinning, and the ACPI zone. */
+            if (temp_cpu != -1000) SI_APPEND("TEMP_CPU=%d\n", temp_cpu);
+            if (fan_rpm >= 0)      SI_APPEND("FAN_RPM=%d\n", fan_rpm);
         }
+        f = fopen("/sys/class/thermal/thermal_zone0/temp", "r");
+        if (f) { tv = 0; fscanf(f, "%d", &tv); fclose(f); SI_APPEND("TEMP_ACPI=%d\n", tv / 1000); }
     }
 
     /* Mode - forced to the safe 0/0 "unknown"/"none" sentinels during boot,
@@ -4357,6 +5121,10 @@ static void start_midi_capture(int wait_iters)
         if (pid < 0) return;
 
         if (pid == 0) {
+            /* Inherit the CPU affinity (off the RT cores) but NOT the daemon's
+             * nice 10 - the MIDI relay should win scheduling ties against our
+             * own frame-encode bursts on the shared core, not lose them. */
+            setpriority(PRIO_PROCESS, 0, 0);
             execl(MIDI_TCP_BIN, "midi_tcp", "-s", NULL);
             _exit(127);
         }
@@ -4607,6 +5375,10 @@ static void sysex_poll(int readable)
  * fd >= 0: write response to fd.  fd == -1: fire-and-forget, no response. */
 static void process_ctrl_cmd(const char *line, int fd)
 {
+    /* Nautilus: several commands below (PIXEL/REGION/mode detection/...) read
+     * fb1_map, whose 8-bit shadow is otherwise only refreshed at 5 Hz - make it
+     * fresh for this command. Kronos: no-op. */
+    if (fb1_native_bpp == 16) fb1_refresh_shadow();
 #define REPLY(msg, len) do { if (fd >= 0) write_all(fd, (msg), (len)); } while (0)
 /* For a string-literal reply, sizeof(s)-1 computes the length at compile
  * time instead of it being hand-counted at every call site - every such
@@ -4638,10 +5410,14 @@ static void process_ctrl_cmd(const char *line, int fd)
     }
 
     if (strcmp(line, "MIRROR_ON") == 0) {
-        int f = open(MIRROR_FLAG, O_CREAT | O_WRONLY, 0644);
-        if (f >= 0) close(f);
-        check_mirror_flag();
-        REPLY_S("OK\n");
+        if (!mirror_supported()) {
+            REPLY_S("ERR MIRROR_UNSUPPORTED\n");   /* Nautilus: no video output - see mirror_supported() */
+        } else {
+            int f = open(MIRROR_FLAG, O_CREAT | O_WRONLY, 0644);
+            if (f >= 0) close(f);
+            check_mirror_flag();
+            REPLY_S("OK\n");
+        }
 
     } else if (strcmp(line, "MIRROR_OFF") == 0) {
         unlink(MIRROR_FLAG);
@@ -5202,6 +5978,23 @@ static void process_ctrl_cmd(const char *line, int fd)
         char resp[64];
         int  rlen = snprintf(resp, sizeof(resp), "VER=%s BUILD=%s\n",
                              SCREENREMOTE_VERSION, BUILD_ID);
+        REPLY(resp, (size_t)rlen);
+
+    } else if (strcmp(line, "MODEL") == 0) {
+        /* FAMILY/MODEL are fixed, space-free tokens set once by
+         * detect_device_model() - see that function's header comment for how
+         * they're derived and what MODEL codes exist. CPU is the raw
+         * /proc/cpuinfo string, which can contain spaces, so it's kept out of
+         * this single-line space-separated reply on purpose (that's what
+         * SYSINFO's MODEL_CPU field is for). */
+        char resp[224];
+        int  rlen = snprintf(resp, sizeof(resp),
+                             "FAMILY=%s MODEL=%s FB_BPP=%d BOARD=%s PANEL_HWVER=%d CPUS=%d CORES=%d THREADS=%d STREAM_FMT=%s STREAM_GEOM=%ux%u\n",
+                             g_model_family, g_model_code, fb1_native_bpp,
+                             g_board_name[0] ? g_board_name : "UNKNOWN", g_panel_hwver,
+                             g_cpu_logical, g_cpu_cores, g_cpu_threads,
+                             g_stream_fmt == STREAM_FMT_RGB565LE ? "RGB565LE" : "INDEX8",
+                             g_stream_w, g_stream_h);
         REPLY(resp, (size_t)rlen);
 
     } else if (strcmp(line, "SYSINFO") == 0) {
@@ -6032,26 +6825,192 @@ static void tv_clamp_us(struct timeval *tv, long max_us)
     }
 }
 
-/* Pin ourselves - and, by inheritance across fork+exec, our streaming children and
- * the midi_tcp child - to physical CORE 0 (logical CPUs 0,1).  On the Kronos (Atom
- * D2550, 2 cores + HT: core0=CPU0,1 / core1=CPU2,3) the RT audio engine, EVA, and
- * boot-time PCM sample loading all run on core 1, which pins at 100% during boot.
- * The scheduler otherwise places screenremote's fb-streaming on core 1 too; that
- * extra load during the ~4 s boot-settling window starves the RT engine, rtf0 backs
- * up, and EVA freezes (confirmed: no crash without a client, i.e. without the
- * streaming load).  Keeping our load on the otherwise-idle core 0 removes it from
- * the RT core entirely.  Best-effort: a failure just leaves default scheduling. */
-static void pin_off_rt_core(void)
+/* CPU placement - keep our load off the cores the real-time engine lives on.
+ *
+ * History: 3.0.1 hard-pinned to CPUs 0,1 ("physical core 0") because on the
+ * Kronos (Atom, 2 cores + HT: core0=CPU0,1 / core1=CPU2,3) the RT audio
+ * engine, EVA and boot-time PCM loading all run on core 1, and streaming load
+ * landing there during the ~4 s boot-settling window starved the RT engine
+ * (rtf0 backed up, EVA froze - confirmed on hardware). That fixed pin is the
+ * WRONG answer on the Nautilus / Kronos 3 (Celeron N3160, 4 real cores, no HT):
+ * /proc/rtai/scheduler on a live Nautilus shows OA's three control tasks (prio
+ * 10/4/1 - the most important ones) on CPU0 and one prio-2 periodic worker on
+ * EACH of CPUs 1, 2 and 3 - so "CPUs 0,1" put us on the control-task core and
+ * in the L2 it shares with CPU1 (Braswell pairs L2 per core pair: 0-1, 2-3).
+ * CPU3 also takes every xHCI interrupt (panel + USB-ethernet), but IRQ
+ * handlers preempt us regardless of where we run.
+ *
+ * So derive it from the running system instead of a table:
+ *   1. Parse the CPU column and priority of every task in /proc/rtai/scheduler
+ *      (RTAI tasks are pinned at creation and never migrate).
+ *   2. Exclude every CPU hosting the most-important task or more tasks than
+ *      the minimum, plus their hyperthread siblings
+ *      (/sys/devices/system/cpu/cpuN/topology/thread_siblings_list).
+ *   3. Pin to ONE remaining core (highest-numbered, plus its HT siblings).
+ *      Nautilus: CPU3. Kronos: the core the engine doesn't live on.
+ * Fallbacks when /proc/rtai isn't readable or nothing remains: with HT present
+ * use the validated Kronos answer {0,1}; without HT use the last CPU.
+ * cpu_affinity=<mask> in screenremote.cfg overrides everything. Best-effort
+ * throughout - any failure just leaves default scheduling, as before.
+ *
+ * RTAI preempts all of Linux unconditionally, so our CPU time can never starve
+ * the audio engine directly - what this protects is cache/L2 sharing and the
+ * Linux-side threads (Eva) that live on the RT cores. nice 10 on top so any
+ * Linux-side work Korg's own processes (or our own midi_tcp child, which
+ * resets itself to nice 0) do on our core wins ties against frame encoding.
+ *
+ * Called at startup (before any fork, so midi_tcp/children inherit it) and
+ * again once the boot gate clears, by which time OA.ko has created all its RT
+ * tasks and the map is complete. */
+static int cpu_sibling_mask(int cpu, unsigned long *mask)
 {
+    char path[96], buf[64];
+    FILE *f;
+    *mask = 0;
+    snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", cpu);
+    f = fopen(path, "r");
+    if (!f) return -1;
+    if (fgets(buf, sizeof(buf), f)) {
+        /* "0,2" or "0-1" or "3" */
+        char *p = buf;
+        while (*p) {
+            int a = (int)strtol(p, &p, 10), b = a;
+            if (*p == '-') b = (int)strtol(p + 1, &p, 10);
+            for (; a <= b && a >= 0; a++)
+                if (a < (int)(8 * sizeof(unsigned long))) *mask |= 1UL << a;
+            if (*p == ',') p++; else break;
+        }
+    }
+    fclose(f);
+    return 0;
+}
+
+static void cpu_topology_probe(void)
+{
+    int ncpu = (int)sysconf(_SC_NPROCESSORS_ONLN), c, ncore = 0;
+    int core_ids[32];
+    if (ncpu < 1) ncpu = 1;
+    if (ncpu > 32) ncpu = 32;
+    for (c = 0; c < ncpu; c++) {
+        char path[96];
+        FILE *f;
+        int id = -1, k, seen = 0;
+        snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/topology/core_id", c);
+        f = fopen(path, "r");
+        if (f) { if (fscanf(f, "%d", &id) != 1) id = -1; fclose(f); }
+        if (id < 0) id = c;                 /* no topology info: assume distinct cores */
+        for (k = 0; k < ncore; k++) if (core_ids[k] == id) { seen = 1; break; }
+        if (!seen) core_ids[ncore++] = id;
+    }
+    g_cpu_logical = ncpu;
+    g_cpu_cores   = ncore;
+    g_cpu_threads = ncore ? ncpu / ncore : 1;
+    fprintf(stderr, "screenremote: cpu topology %d logical, %d cores, %d thread(s)/core\n",
+            g_cpu_logical, g_cpu_cores, g_cpu_threads);
+}
+
+static void pick_cpu_affinity(const char *when)
+{
+    int ncpu = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    unsigned long all, use = 0, ht = 0, excl = 0, cand;
+    int rt_count[32], rt_best[32];   /* per CPU: number of RT tasks, best (lowest) priority number */
+    int have_rtai = 0, c, min_count = 0, best_prio = 0x7fffffff;
+    FILE *f;
     cpu_set_t set;
+
+    if (ncpu <= 1) return;
+    if (ncpu > 31) ncpu = 31;
+    all = (1UL << ncpu) - 1;
+    for (c = 0; c < ncpu; c++) { rt_count[c] = 0; rt_best[c] = 0x7fffffff; }
+
+    if (g_cpu_affinity_cfg > 0) {
+        use = (unsigned long)g_cpu_affinity_cfg & all;
+        if (!use) use = all;
+        goto apply;
+    }
+
+    f = fopen("/proc/rtai/scheduler", "r");
+    if (f) {
+        char line[256];
+        while (fgets(line, sizeof(line), f)) {
+            /* Task rows look like:
+             *   "10         0           Yes  No  0x5    0:1   1      1    0     58b02240   0"
+             * i.e. prio period fpu sig state CPU:mask ... - match that shape only.
+             * RTAI: lower priority NUMBER = more important. */
+            int prio, cpu, mask; long period; char fpu[8], sig[8]; unsigned st;
+            if (sscanf(line, "%d %ld %7s %7s 0x%x %d:%d", &prio, &period, fpu, sig, &st, &cpu, &mask) == 7 &&
+                (strcmp(fpu, "Yes") == 0 || strcmp(fpu, "No") == 0) &&
+                cpu >= 0 && cpu < ncpu) {
+                have_rtai = 1;
+                rt_count[cpu]++;
+                if (prio < rt_best[cpu]) rt_best[cpu] = prio;
+                if (prio < best_prio) best_prio = prio;
+            }
+        }
+        fclose(f);
+    }
+    for (c = 0; c < ncpu; c++) {
+        unsigned long m;
+        if (cpu_sibling_mask(c, &m) == 0 && (m & ~(1UL << c)))
+            ht |= m;                                   /* CPUs that have an HT sibling */
+    }
+
+    if (have_rtai) {
+        /* Exclude: every CPU hosting the most-important RT task, and every CPU
+         * hosting more RT tasks than the minimum - on the Nautilus that is CPU0
+         * (3 control tasks incl. prio 1) vs one prio-2 worker on each of 1/2/3;
+         * on a Kronos it is whichever core the engine lives on. Then exclude
+         * their HT siblings (shared execution units and L2). */
+        min_count = 0x7fffffff;
+        for (c = 0; c < ncpu; c++) if (rt_count[c] < min_count) min_count = rt_count[c];
+        for (c = 0; c < ncpu; c++)
+            if (rt_best[c] == best_prio || rt_count[c] > min_count)
+                excl |= 1UL << c;
+        for (c = 0; c < ncpu; c++) {
+            unsigned long m;
+            if ((excl & (1UL << c)) && cpu_sibling_mask(c, &m) == 0) excl |= m;
+        }
+        cand = all & ~excl;
+        if (cand) {
+            /* Deterministic single choice: the highest-numbered candidate (and
+             * its HT siblings, which share its L2 anyway). One core, not the
+             * whole candidate set, so we pollute exactly one L2. On the
+             * Nautilus this is CPU3 - the core with the least Linux-side work
+             * (/proc/stat) and the one that is NOT in CPU0's L2 pair. */
+            for (c = ncpu - 1; c >= 0; c--)
+                if (cand & (1UL << c)) {
+                    unsigned long m = 0;
+                    use = 1UL << c;
+                    if (cpu_sibling_mask(c, &m) == 0) use |= (m & cand);
+                    break;
+                }
+        }
+    }
+    if (!use)
+        use = ht ? (0x3UL & all)            /* validated Kronos answer (core 0 = CPUs 0,1) */
+                 : (1UL << (ncpu - 1));
+
+apply:
+    g_cpu_rt_mask = 0;
+    for (c = 0; c < ncpu; c++) if (rt_count[c]) g_cpu_rt_mask |= 1UL << c;
     CPU_ZERO(&set);
-    CPU_SET(0, &set);
-    CPU_SET(1, &set);
-    if (sched_setaffinity(0, sizeof(set), &set) != 0)
-        fprintf(stderr, "screenremote: sched_setaffinity(core0) failed: %s\n",
-                strerror(errno));
-    else
-        fprintf(stderr, "screenremote: pinned to core 0 (CPUs 0,1), off the RT core (2,3)\n");
+    for (c = 0; c < ncpu; c++)
+        if (use & (1UL << c)) CPU_SET(c, &set);
+    if (sched_setaffinity(0, sizeof(set), &set) != 0) {
+        fprintf(stderr, "screenremote: sched_setaffinity(0x%lx) failed: %s\n", use, strerror(errno));
+    } else {
+        g_cpu_daemon_mask = use;
+        fprintf(stderr, "screenremote: cpu affinity 0x%lx (%s; rtai=%s excluded=0x%lx ht=%s ncpu=%d",
+                use, when, have_rtai ? "yes" : "no", excl, ht ? "yes" : "no", ncpu);
+        if (have_rtai) {
+            fprintf(stderr, "; rt tasks/best-prio per cpu:");
+            for (c = 0; c < ncpu; c++)
+                fprintf(stderr, " %d/%d", rt_count[c], rt_best[c] == 0x7fffffff ? -1 : rt_best[c]);
+        }
+        fprintf(stderr, ")\n");
+    }
+    if (setpriority(PRIO_PROCESS, 0, 10) != 0)
+        fprintf(stderr, "screenremote: setpriority(10) failed: %s\n", strerror(errno));
 }
 
 /*  Main */
@@ -6108,8 +7067,9 @@ int main(void)
     pid_t kmsg_pid = -1;
     /* MUST be first - before any open()/fopen()/socket() in this process. */
     ensure_std_fds();
-    pin_off_rt_core();   /* keep our load off the RT/sample-loading core - do this
-                          * before any fork so children inherit the affinity */
+    cpu_topology_probe();
+    pick_cpu_affinity("startup");   /* keep our load off the RT cores - before any fork
+                                     * so children inherit it; re-run at boot-gate clear */
     int stream_listen, ctrl_listen, disc_fd = -1, client_fd = -1;
     /* ctrl_fd and ctrl_lb* are file-scope globals (see top of file) */
     uint8_t client_mode = MODE_CHANGE, client_fps = FPS_MAX;
@@ -6305,6 +7265,7 @@ int main(void)
         }
     }
     if (fb1_open() < 0) { graceful_shutdown(kmsg_pid); return 1; }
+    detect_device_model();
 
     /* Nautilus touch Y-range: BEST-EFFORT proportional scaling, NOT verified
      * against real hardware - see
@@ -6342,6 +7303,7 @@ int main(void)
     if (!staging) { perror("malloc staging"); graceful_shutdown(kmsg_pid); return 1; }
     rle_buf = malloc(frame_bytes * 2);
     if (!rle_buf) { perror("malloc rle_buf"); graceful_shutdown(kmsg_pid); return 1; }
+    if (v3_init() < 0) { graceful_shutdown(kmsg_pid); return 1; }
 
     check_mirror_flag();
 
@@ -6409,10 +7371,15 @@ int main(void)
 
         if (g_exit) break;
 
-        /* Nautilus only (fb1_native_bpp==16): resync the shadow fb1_map from
-         * the real 16bpp device memory before anything below reads it. See
-         * fb1_refresh_shadow()'s comment. */
-        if (fb1_native_bpp == 16) fb1_refresh_shadow();
+        /* Nautilus only (fb1_native_bpp==16): resync the 8-bit shadow fb1_map
+         * from the real 16bpp device memory before anything below reads it.
+         * It only feeds heuristics (see fb1_refresh_shadow()'s comment) - the
+         * v3 stream reads the device mapping directly - so it is refreshed at
+         * 5 Hz, plus every tick while the VGA mirror or boot gate need it, plus
+         * on demand at the top of process_ctrl_cmd(). 1.2 ms per refresh on the
+         * N3160; at 15 Hz that alone was ~2% of a core for nothing. */
+        if (fb1_native_bpp == 16 && (mirror_on || g_boot_active || fb1_shadow_due()))
+            fb1_refresh_shadow();
 
         if (handshake.fd >= 0) {
             struct timespec hs_now;
@@ -6731,6 +7698,17 @@ int main(void)
             }
         }
 
+        /* v3 pull request deferred by the byte-rate cap - retry each tick. */
+        if (client_fd >= 0 && client_ver == 0x03 && v3_pull_pending) {
+            int r = v3_update(client_fd, v3_pull_pending == 0xFF, v3_pull_pending == 0xFE);
+            if (r < 0) {
+                close(client_fd); client_fd = -1; v3_pull_pending = 0;
+                g_ctrl_allowed_ip = 0;
+            } else if (r == 1) {
+                v3_pull_pending = 0;
+            }
+        }
+
         /* Change-driven frame send */
         if (client_fd >= 0 && client_mode == MODE_CHANGE) {
             struct timespec ts;
@@ -6741,7 +7719,14 @@ int main(void)
             if (elapsed >= frame_ns) {
                 last_frame = ts;
 
-                if (capture_to_staging()) {
+                if (client_ver == 0x03) {
+                    /* Native stream: one rect per tick, byte-rate capped. A
+                     * deferral (0) leaves the change pending for the next tick. */
+                    if (v3_update(client_fd, 0, 0) < 0) {
+                        close(client_fd); client_fd = -1; v3_shadow_valid = 0;
+                        g_ctrl_allowed_ip = 0;
+                    }
+                } else if (capture_to_staging()) {
                     int send_ok;
                     if (!shadow_valid) {
                         send_ok = send_frame_buf(client_fd, staging) == 0;
@@ -6898,7 +7883,7 @@ int main(void)
         if (handshake.fd >= 0 && FD_ISSET(handshake.fd, &rfds)) {
             if (stream_handshake_read(&handshake) > 0) {
                 int new_fd = handshake.fd;
-                if (do_handshake(new_fd, &client_mode, &client_fps, &handshake.peer,
+                if (do_handshake(new_fd, &client_mode, &client_fps, &client_ver, &handshake.peer,
                                  handshake.hello) < 0) {
                     close(new_fd);
                 } else {
@@ -6916,13 +7901,24 @@ int main(void)
                      * frame writes get a roomier budget than everything else. */
                     if (client_fd >= 0) close(client_fd);
                     shadow_valid = 0;
+                    v3_shadow_valid = 0;
+                    v3_pull_pending = 0;
                     client_fd = new_fd;
                     g_ctrl_allowed_ip = handshake.peer.sin_addr.s_addr;
                     clock_gettime(CLOCK_MONOTONIC, &last_frame);
                     client_just_connected = 1;
-                    fprintf(stderr, "screenremote: client connected mode=%u fps=%u from %s\n",
-                            client_mode, client_fps, inet_ntoa(handshake.peer.sin_addr));
-                    if (client_mode == MODE_CHANGE) {
+                    fprintf(stderr, "screenremote: client connected proto=v%u mode=%u fps=%u from %s\n",
+                            client_ver, client_mode, client_fps, inet_ntoa(handshake.peer.sin_addr));
+                    if (client_ver == 0x03) {
+                        /* First frame is a full one. If the byte-rate cap defers it
+                         * (bucket drained by a previous session), v3_shadow_valid is
+                         * still 0, so the tick loop below sends a full frame as soon
+                         * as tokens accrue - nothing is lost. */
+                        if (client_mode == MODE_CHANGE && v3_update(client_fd, 1, 0) < 0) {
+                            close(client_fd); client_fd = -1;
+                            g_ctrl_allowed_ip = 0;
+                        }
+                    } else if (client_mode == MODE_CHANGE) {
                         capture_to_staging();
                         if (send_frame_buf(client_fd, staging) < 0) {
                             close(client_fd); client_fd = -1;
@@ -7057,9 +8053,16 @@ int main(void)
             ssize_t n = recvfrom(disc_fd, buf, sizeof(buf) - 1, 0,
                                  (struct sockaddr *)&from, &fromlen);
             if (n >= 5 && memcmp(buf, "KSCR?", 5) == 0) {
-                char resp[64];
-                int rlen = snprintf(resp, sizeof(resp), "KSCR SP=%d CP=%d MIDI=%d\n",
-                                    g_stream_port, g_ctrl_port, g_midi_loaded);
+                /* FAMILY lets a client pick the right stream decoding/UI hints
+                 * before it even opens the stream socket - see MODEL's own
+                 * ctrl command for the finer-grained MODEL code and raw CPU
+                 * string, not worth this LAN broadcast's extra bytes. */
+                char resp[160];
+                int rlen = snprintf(resp, sizeof(resp),
+                                    "KSCR SP=%d CP=%d MIDI=%d FAMILY=%s PROTO=3 FMT=%s GEOM=%ux%u\n",
+                                    g_stream_port, g_ctrl_port, g_midi_loaded, g_model_family,
+                                    g_stream_fmt == STREAM_FMT_RGB565LE ? "RGB565LE" : "INDEX8",
+                                    g_stream_w, g_stream_h);
                 sendto(disc_fd, resp, rlen, 0, (struct sockaddr *)&from, fromlen);
             }
         }
@@ -7069,7 +8072,19 @@ int main(void)
             FD_ISSET(client_fd, &rfds)) {
             uint8_t cmd;
             ssize_t n = recv(client_fd, &cmd, 1, 0);
-            if (n == 1 && cmd == 0xFF) {
+            if (n == 1 && client_ver == 0x03 && (cmd == 0xFF || cmd == 0xFE)) {
+                /* v3 pull: 0xFF = full frame, 0xFE = delta (empty rect if unchanged).
+                 * If the byte-rate cap defers it, remember the request and answer
+                 * it from the tick below once tokens accrue - a poll is never
+                 * silently dropped, the client always gets exactly one reply. */
+                int r = v3_update(client_fd, cmd == 0xFF, cmd == 0xFE);
+                if (r < 0) {
+                    close(client_fd); client_fd = -1;
+                    g_ctrl_allowed_ip = 0;
+                } else if (r == 0) {
+                    v3_pull_pending = cmd;
+                }
+            } else if (n == 1 && cmd == 0xFF) {
                 if (send_frame(client_fd) < 0) {
                     close(client_fd); client_fd = -1;
                     g_ctrl_allowed_ip = 0;

@@ -1,0 +1,11 @@
+# ONE-SHOT diagnostic module - not embedded in the daemon, just insmod'd
+# directly during investigation. Read-only kprobe capture, no patching.
+# See nks4_colorpal_capture.c.
+KDIR ?= /home/build/linux-kronos
+PWD  := $(shell pwd)
+
+all:
+	$(MAKE) -C $(KDIR) M=$(PWD) modules
+
+clean:
+	$(MAKE) -C $(KDIR) M=$(PWD) clean

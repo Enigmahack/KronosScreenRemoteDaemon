@@ -4,7 +4,7 @@
 # Changes take effect the next time screenremote starts (reboot, or rmmod/insmod).
 #
 # Lines beginning with # are comments and are ignored.
-# Recognised keys: stream_port, ctrl_port, screensaver_timeout,
+# Recognised keys: stream_port, ctrl_port, screensaver_timeout, stream_max_kbps, stream_height,
 #   touch_x_offset, touch_x_range, touch_y_offset, touch_y_range
 #
 # Default values are shown below (commented out).
@@ -25,3 +25,16 @@
 #touch_x_range=813
 #touch_y_offset=20
 #touch_y_range=638
+
+# Native (v3) stream tuning - see docs/api.md section 4.5.
+# stream_max_kbps: byte-rate cap for v3 clients, kilobits per second. Default is
+# 24000 on Nautilus (its USB2 ethernet shares the USB bus with the front panel)
+# and 0 (unlimited) on Kronos. 0 disables the cap.
+#stream_max_kbps=24000
+# stream_height: visible rows to stream. Default: the framebuffer height, except
+# on Nautilus where the physical panel is 800x480 inside an 800x600 buffer.
+#stream_height=480
+# cpu_affinity: bitmask of CPUs the daemon (and its children) may run on, e.g.
+# 0x8 = CPU3, 0x3 = CPUs 0+1. Default: derived from /proc/rtai/scheduler so the
+# daemon stays off the cores running OA's real-time tasks (see pick_cpu_affinity()).
+#cpu_affinity=0x8

@@ -4,6 +4,13 @@ endif
 CFLAGS = -Wall -O2 -static $(if $(filter i686-linux-gnu-gcc,$(CC)),,-m32)
 OUTDIR = ../build
 
+# miniz (MIT, see miniz.LICENSE) provides the zlib-format deflate encoder used
+# by the v3 RGB565 stream on Nautilus. Built as a separate object with only
+# the compressor enabled - no stdio/archive/time code, and no zlib-compatible
+# names so it can never collide with a system zlib.
+MINIZ_DEFS = -DMINIZ_NO_STDIO -DMINIZ_NO_TIME -DMINIZ_NO_ARCHIVE_APIS \
+             -DMINIZ_NO_ARCHIVE_WRITING_APIS -DMINIZ_NO_ZLIB_COMPATIBLE_NAMES
+
 _VERSION := $(shell sed -n 's/.*SCREENREMOTE_VERSION "\([^"]*\)".*/\1/p' screenremote.c)
 BUILD_ID := $(shell date +%Y%m%d)-$(_VERSION)
 
@@ -31,11 +38,14 @@ midi_tcp_bin.h: midi_tcp.c
 	xxd -i midi_tcp_bin > $@
 	rm -f midi_tcp_bin
 
-$(OUTDIR)/screenremote: screenremote.c vkbd_ko.h midi_bridge_ko.h nks4_inject_ko.h eva_mode_ko.h midi_tcp_bin.h
-	$(CC) $(CFLAGS) -DBUILD_ID=\"$(BUILD_ID)\" -o $@ screenremote.c
+miniz.o: miniz.c miniz.h
+	$(CC) $(filter-out -Wall,$(CFLAGS)) $(MINIZ_DEFS) -c -o $@ miniz.c
+
+$(OUTDIR)/screenremote: screenremote.c miniz.o vkbd_ko.h midi_bridge_ko.h nks4_inject_ko.h eva_mode_ko.h midi_tcp_bin.h
+	$(CC) $(CFLAGS) $(MINIZ_DEFS) -DBUILD_ID=\"$(BUILD_ID)\" -o $@ screenremote.c miniz.o
 
 clean:
-	rm -f $(TARGETS) vkbd_ko.h midi_bridge_ko.h nks4_inject_ko.h eva_mode_ko.h midi_tcp_bin.h midi_tcp_bin
+	rm -f $(TARGETS) miniz.o vkbd_ko.h midi_bridge_ko.h nks4_inject_ko.h eva_mode_ko.h midi_tcp_bin.h midi_tcp_bin
 	# Recurse into the kernel-module build dirs.  Without this, `make clean`
 	# leaves the old .ko/.o in place; kbuild then skips recompiling when the
 	# module source mtime isn't newer than the artifact (common right after a
