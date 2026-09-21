@@ -322,7 +322,7 @@ Copy `source/screenremote.cfg.example` to `/korg/rw/screenremote/screenremote.cf
 #touch_y_range=638
 ```
 
-`screensaver_timeout` is in seconds; set to `0` to disable. The `touch_*` keys adjust the pixel-to-ADC mapping for touchscreen injection; the defaults are correct for standard Kronos units but can be tweaked if touch events land at the wrong position. The `/korg/rw/screenremote/` directory is created automatically by the daemon on first run.
+`screensaver_timeout` is in seconds; set to `0` to disable. The `touch_*` keys adjust the pixel-to-ADC mapping for touchscreen injection. Those shown are the Kronos defaults; on a Nautilus the daemon substitutes all four automatically (hardware-calibrated: `touch_x_range=857`, `touch_x_offset=24`, `touch_y_range=570`, `touch_y_offset=29`). Setting either `touch_y_` key here suppresses that substitution, so only do so if touch events land at the wrong position on that particular unit. The `/korg/rw/screenremote/` directory is created automatically by the daemon on first run.
 
 ---
 

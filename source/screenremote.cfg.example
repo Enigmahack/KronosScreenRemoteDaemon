@@ -19,8 +19,11 @@
 #screensaver_timeout=300
 
 # Touch calibration: adjusts the pixel-to-ADC mapping for touchscreen injection.
-# Defaults are correct for standard Kronos units. Only change if remote touch
-# events land at the wrong position on screen.
+# The values below are the Kronos defaults. On a Nautilus the daemon substitutes
+# hardware-calibrated values automatically: touch_x_range=857, touch_x_offset=24,
+# touch_y_range=570, touch_y_offset=29. Setting any one of these keys here
+# suppresses that one substitution, so only do so if remote touch events land at
+# the wrong position on THIS unit.
 #touch_x_offset=10
 #touch_x_range=813
 #touch_y_offset=20

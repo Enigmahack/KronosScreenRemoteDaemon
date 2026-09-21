@@ -227,7 +227,7 @@
 #define KBD_EV_KEY  1
 
 /*  Version */
-#define SCREENREMOTE_VERSION "3.0.2"
+#define SCREENREMOTE_VERSION "3.0.3"
 #ifndef BUILD_ID
 #define BUILD_ID "dev"
 #endif
@@ -407,19 +407,92 @@ static time_t   last_ss_chk   = 0;
 static uint8_t  ss_prev[SS_SAMPLE_N];
 static int      ss_prev_valid = 0;
 
-/* Touch calibration - values below are the Kronos-family defaults (empirically
- * tuned against real Kronos hardware, per this project's own history). Overridable
- * via screenremote.cfg; see g_touch_y_range_from_config below for why that matters
- * on a Nautilus. */
+/* Touch calibration - pixel -> 8-bit-per-axis ADC, empirically tuned against real
+ * hardware. Overridable per unit via screenremote.cfg.
+ *
+ * The values below are the KRONOS-family defaults. The HORIZONTAL pair is shared
+ * with the Nautilus unchanged; only the VERTICAL pair differs, and only by a
+ * gain (see NAUTILUS_TOUCH_Y_* below and its application in main()).
+ *
+ * Why x needs no per-device value and y does: Eva converts ADC back to pixels in
+ * an 800x600 logical canvas on BOTH families (CEditor::CPanelIfcTask::
+ * OnTouchPanelEvent; both builds hardcode /800 and /600 in
+ * CFormDlogGlobalCalibTouchPanel::ProcessLeftTop/ProcessRightBottom, and
+ * ScreenManager::GetScreenXMax/YMax return 799/599 on both). Horizontally that
+ * canvas reaches the panel 1:1, so the same constants land correctly. Vertically
+ * it does not: ScreenManager::CreateScreens attaches a KorgDisplayBilinearScalerSSE
+ * mapping the 800x600 canvas onto PegRect{0,0,799,521}, so a canvas row is
+ * compressed by ~522/600 before it reaches the rows this daemon streams. The
+ * vertical constants have to absorb that. */
 static int g_touch_x_offset = 10;   /* pixels added to x before ADC scaling      */
 static int g_touch_x_range  = 813;  /* total pixel span -> ADC 0-255             */
 static int g_touch_y_offset = 20;   /* pixels added to y before ADC scaling      */
 static int g_touch_y_range  = 638;  /* total pixel span -> ADC 0-255             */
-/* 1 once read_config() has seen an explicit touch_y_range= line - main() checks
- * this after fb1_open() to decide whether it's still safe to apply the Nautilus
- * proportional-scaling default below (never override an operator's explicit
- * config value, on either device). */
-static int g_touch_y_range_from_config = 0;
+
+/* Nautilus HORIZONTAL touch constants - second calibration pass, 2026-09-21.
+ *
+ * The first pass appeared to show x needing no correction (offsets 0, 0, ~1), but
+ * those nodes had simply never been adjusted - an exactly-zero row is what an
+ * untouched grid looks like, and the 70 px vertical error dominated that session.
+ * Once y was correct (544/18 below), a clean x measurement became possible and
+ * showed a real 5.4% gain error that had been there all along. Nothing about the
+ * y change can affect x: inject_touch() computes h_adc and v_adc independently
+ * and packs them into separate bytes, which Eva then scales with separate margin
+ * pairs and separate spans.
+ *
+ *     sent x=0   -> landed  -13.7      sent x=400 -> landed 408.0
+ *     sent x=799 -> landed 830.3  (i.e. 31 px off the right edge of the panel)
+ *
+ * Fitting the left and middle columns only - the right-hand nodes sit off-screen
+ * at the old constants, so they can't be placed by hand - gives
+ * landed = 1.05418*x - 13.67, gives range 857.1 / offset 24.2, and independently
+ * predicts that unplaceable right column to within 1.7 px. 857/24 holds the whole
+ * 0-799 sweep to under 2 px.
+ *
+ * Per-column scatter was 1-3 px (versus up to 18 px per row on the y axis), so
+ * this is the better-conditioned of the two measurements.
+ *
+ * NOT applied to the Kronos: 813/10 is long-standing there and this was measured
+ * on a Nautilus. Worth re-checking on a Kronos, since 813/10 may carry the same
+ * error - it was last touched by a commit whose message says "hopefully removing
+ * the need for calibration entirely", which is not a measurement. */
+#define NAUTILUS_TOUCH_X_RANGE   857
+#define NAUTILUS_TOUCH_X_OFFSET   24
+static int g_touch_x_range_from_config  = 0;
+static int g_touch_x_offset_from_config = 0;
+
+/* Nautilus VERTICAL touch constants - third and final calibration pass, 2026-09-21.
+ *
+ * Refined on a screen the user had calibrated and with the horizontal axis already
+ * correct (857/24 above), which is what made a clean vertical read possible: the
+ * per-row scatter dropped to 2 px at the top and 7 px at the bottom, against up to
+ * 18 px in the previous pass. Measured against 544/18:
+ *
+ *     sent y=0   -> landed -10.0        sent y=479 -> landed 492.0
+ *
+ * The middle row was left unadjusted, and the two-point fit
+ * landed = 1.04802*y - 10 predicts only +1.5 px of error there - so "untouched"
+ * is corroboration here, not a gap. Solving back gives range 570.1 / offset 28.9;
+ * 570/29 holds the full 0-479 sweep to 1.35 px.
+ *
+ * Superseded values, for reference: 510 (3.0.2's 480/600 guess, ~37 px low at the
+ * bottom), 638 (3.0.3's no-scaling cut, ~72 px high), 544 (first measured pass,
+ * ~13 px low at the bottom).
+ *
+ * CAVEAT - these constants describe this daemon PLUS Eva's own ADC->pixel step,
+ * and Eva's half depends on sm_aucTouchPanelMargin, which Global > Touch Panel
+ * Calibration rewrites (see
+ * kronosology/docs/hardware/nautilus_touch_calibration.md). Re-running that
+ * on-device calibration changes the mapping and invalidates these numbers; the
+ * screenremote.cfg overrides exist for exactly that case. */
+#define NAUTILUS_TOUCH_Y_RANGE   570
+#define NAUTILUS_TOUCH_Y_OFFSET   29
+/* Set once read_config() has seen an explicit touch_y_range= / touch_y_offset=
+ * line, so the Nautilus defaults above never override a per-unit config value
+ * (digitizers vary, and Eva's margins are themselves user-writable from
+ * Global > Touch Panel Calibration). */
+static int g_touch_y_range_from_config  = 0;
+static int g_touch_y_offset_from_config = 0;
 
 /* Pad-tap detection: touch (x,y) in framebuffer pixel space -> PADCHORD.
  * Regions calibrated 2026-07-14 against real hardware: 32 corner taps (4 per
@@ -1607,12 +1680,18 @@ static void read_config(void)
            g_ctrl_port = v;
         else if (sscanf(line, "screensaver_timeout=%d", &v) == 1 && v >= 0)
            g_ss_timeout = v;
-        else if (sscanf(line, "touch_x_offset=%d", &v) == 1)
+        else if (sscanf(line, "touch_x_offset=%d", &v) == 1) {
            g_touch_x_offset = v;
-        else if (sscanf(line, "touch_x_range=%d", &v) == 1 && v > 0)
+           g_touch_x_offset_from_config = 1;
+        }
+        else if (sscanf(line, "touch_x_range=%d", &v) == 1 && v > 0) {
            g_touch_x_range = v;
-        else if (sscanf(line, "touch_y_offset=%d", &v) == 1)
+           g_touch_x_range_from_config = 1;
+        }
+        else if (sscanf(line, "touch_y_offset=%d", &v) == 1) {
            g_touch_y_offset = v;
+           g_touch_y_offset_from_config = 1;
+        }
         else if (sscanf(line, "touch_y_range=%d", &v) == 1 && v > 0) {
            g_touch_y_range = v;
            g_touch_y_range_from_config = 1;
@@ -4161,8 +4240,23 @@ static void nks4_give_up(const char *reason)
  * degraded path whose no-ops are not individually knowable (see the header). */
 static int inject_touch(int type, int x, int y)
 {
-    x = clampi(x, 0, (int)fb_w - 1);
-    y = clampi(y, 0, (int)fb_h - 1);
+    /* Clamp to the device's REAL usable input zone, which is the streamed frame
+     * (g_stream_w x g_stream_h) - not the raw framebuffer. On a Kronos the two
+     * are the same 800x600. On a Nautilus the fb is still 800x600 but only
+     * NAUTILUS_VISIBLE_ROWS of it reach the physical panel, so y=550 is a
+     * coordinate a Kronos client may legitimately send and a Nautilus one may
+     * not: clamping against fb_h (as this did before) accepted it and returned
+     * OK for a tap that landed off-panel where nothing could ever respond.
+     * g_stream_h is already this daemon's own notion of the visible height and
+     * is exactly what the client is told the frame is, so a coordinate inside
+     * the frame the client was given is always accepted and one outside it is
+     * snapped to the nearest edge. Falls back to fb_w/fb_h if fb1_open() hasn't
+     * populated the stream geometry yet. */
+    int max_x = (g_stream_w ? (int)g_stream_w : (int)fb_w) - 1;
+    int max_y = (g_stream_h ? (int)g_stream_h : (int)fb_h) - 1;
+
+    x = clampi(x, 0, max_x > 0 ? max_x : 0);
+    y = clampi(y, 0, max_y > 0 ? max_y : 0);
     g_last_touch_x = x;
     g_last_touch_y = y;
     g_last_touch_type = type;
@@ -7269,32 +7363,30 @@ int main(void)
     if (fb1_open() < 0) { graceful_shutdown(kmsg_pid); return 1; }
     detect_device_model();
 
-    /* Nautilus touch Y-range: BEST-EFFORT proportional scaling, NOT verified
-     * against real hardware - see
-     * kronosology/docs/hardware/nautilus_touch_calibration.md for the full
-     * story and why. Short version: the Kronos-tuned g_touch_y_range default
-     * (638) empirically cancels out CSTGFrontPanel::HandleTouchPanel's own
-     * ADC<->pixel conversion for a Kronos-family unit's physical touch
-     * digitizer. The Nautilus's physical screen is reported as 800x480 (vs.
-     * Kronos's 800x600) while the logical fb1 render canvas stays 800x600 on
-     * both (confirmed via FBIOGET_VSCREENINFO and a real screen capture), so
-     * a touch position in that SAME 800x600 client-visible coordinate space
-     * needs a proportionally SMALLER ADC range to land correctly on the
-     * physically-shorter panel. Disassembling this Nautilus OA.ko's own
-     * HandleTouchPanel found it architecturally different from what the
-     * Kronos-tuned constant was derived against (no reference to the
-     * on-screen-touch-mode fields the Kronos version reads) - so this linear
-     * approximation (638 * 480/600 ~= 510) is a starting point, not a
-     * confirmed-correct value. Only applied when the operator hasn't already
-     * set touch_y_range= explicitly, on either device. */
-    if (fb1_native_bpp == 16 && !g_touch_y_range_from_config) {
-        int scaled = (int)((long)g_touch_y_range * 480L /
-                            (fb_h ? (long)fb_h : 600L));
-        fprintf(stderr, "screenremote: Nautilus detected - scaling touch_y_range "
-                "%d -> %d (800x480 physical vs 800x%u logical canvas, BEST-EFFORT, "
-                "not hardware-verified - override with touch_y_range= in "
-                "screenremote.cfg if this is wrong)\n", g_touch_y_range, scaled, fb_h);
-        g_touch_y_range = scaled;
+    /* Nautilus touch constants - both axes, each measured on real hardware. See
+     * NAUTILUS_TOUCH_X_RANGE / NAUTILUS_TOUCH_Y_RANGE for the calibrations these
+     * came from. Each value is applied only if the operator hasn't set it in
+     * screenremote.cfg, so a per-unit override always wins. */
+    if (fb1_native_bpp == 16) {
+        int xr = g_touch_x_range, xo = g_touch_x_offset;
+        int yr = g_touch_y_range, yo = g_touch_y_offset;
+
+        if (!g_touch_x_range_from_config)  g_touch_x_range  = NAUTILUS_TOUCH_X_RANGE;
+        if (!g_touch_x_offset_from_config) g_touch_x_offset = NAUTILUS_TOUCH_X_OFFSET;
+        if (!g_touch_y_range_from_config)  g_touch_y_range  = NAUTILUS_TOUCH_Y_RANGE;
+        if (!g_touch_y_offset_from_config) g_touch_y_offset = NAUTILUS_TOUCH_Y_OFFSET;
+
+        fprintf(stderr, "screenremote: Nautilus touch calibration: "
+                "x_range %d -> %d%s, x_offset %d -> %d%s, "
+                "y_range %d -> %d%s, y_offset %d -> %d%s\n",
+                xr, g_touch_x_range,
+                g_touch_x_range_from_config  ? " (kept: set in config)" : "",
+                xo, g_touch_x_offset,
+                g_touch_x_offset_from_config ? " (kept: set in config)" : "",
+                yr, g_touch_y_range,
+                g_touch_y_range_from_config  ? " (kept: set in config)" : "",
+                yo, g_touch_y_offset,
+                g_touch_y_offset_from_config ? " (kept: set in config)" : "");
     }
 
     load_boot_splash();   /* optional - missing/invalid file just leaves compositing off */

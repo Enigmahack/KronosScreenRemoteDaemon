@@ -514,7 +514,7 @@ Response: OK\n
 | x | integer | 0 to width-1 | Horizontal pixel coordinate |
 | y | integer | 0 to height-1 | Vertical pixel coordinate |
 
-Coordinates outside the framebuffer are **snapped** to the nearest edge, not rejected. The resulting ADC-space event is delivered via `/proc/.nks4inject` straight into `CSTGFrontPanel::HandleTouchPanel` (see TOUCH_DOWN/TOUCH_UP for the ADC encoding) - the same function a physical finger dispatches through, so any conditional side effect a real touch has (including ones that trigger MIDI output) fires the same way here.
+`width`/`height` are the **visible frame** the client was given in the handshake (`STREAM_GEOM`) - 800x600 on a Kronos, 800x480 on a Nautilus, whose framebuffer is still 800x600 but is never drawn below row 480. Coordinates outside that frame are **snapped** to the nearest edge, not rejected. This is the only place the two families differ for touch: the pixel-to-ADC mapping itself is identical on both (see TOUCH_DOWN/TOUCH_UP), so `TOUCH 400 200` means the same screen position on either machine. Before 3.0.3 the clamp used the raw framebuffer height, so a Nautilus accepted `y` up to 599 and answered `OK` for taps that landed off the physical panel. The resulting ADC-space event is delivered via `/proc/.nks4inject` straight into `CSTGFrontPanel::HandleTouchPanel` (see TOUCH_DOWN/TOUCH_UP for the ADC encoding) - the same function a physical finger dispatches through, so any conditional side effect a real touch has (including ones that trigger MIDI output) fires the same way here.
 
 **Why every touch injection is paced ~30ms apart.** A zero-delay pen-down immediately followed by pen-up (or a burst of TOUCH_MOVE steps with no gap) reaches `HandleTouchPanel` only microseconds apart - two back-to-back `write()`s to `/proc/.nks4inject` - versus the tens of milliseconds a real finger's contact/scan naturally spans. Confirmed on hardware: a zero-delay drag across an on-screen knob collapsed into a single tap (the field got selected, but the value never changed) instead of scrubbing the value; the identical sequence paced ~30ms apart worked correctly end to end. This is the same behaviour class as `DAMPER`/`TEMPO` needing a real-time ramp instead of an instant jump (Section 7) - the touch/gesture state machine on the other end needs real elapsed time between samples, not just correct coordinates. The daemon now enforces a minimum ~30ms gap between every touch injection (`TOUCH`'s internal down+up pair, and each `TOUCH_DOWN`/`TOUCH_MOVE`/`TOUCH_UP` a client sends) regardless of how fast the client requests them, so `TOUCH` and multi-step drags both take slightly longer than before but land correctly. This pacing is also the suspected fix for touch-driven "Pads" chord widgets not triggering from injected taps - not yet hardware-confirmed for that specific case.
 
@@ -581,6 +581,25 @@ v_adc = clamp(round(cy * 255 / touch_y_range), 0, 255)
 ```
 
 With defaults (`touch_x_offset=10`, `touch_x_range=813`, `touch_y_offset=20`, `touch_y_range=638`), pixel (0,0) maps to approximately ADC (3,8) and pixel (799,599) maps to approximately ADC (254,247). The calibration parameters can be adjusted in `screenremote.cfg` if the touch response is misaligned on a particular unit.
+
+**Horizontal is device-independent; vertical is not.** Eva converts ADC back to pixels in an 800x600 logical canvas on the Nautilus exactly as on a Kronos (both builds hardcode `/800` and `/600` in `CFormDlogGlobalCalibTouchPanel::ProcessLeftTop`/`ProcessRightBottom`, and `ScreenManager::GetScreenXMax`/`GetScreenYMax` return 799/599 on both), and horizontally that canvas reaches the panel 1:1 - so `touch_x_range`/`touch_x_offset` are the same on both families. Vertically the canvas is compressed by a display scaler (`ScreenManager::CreateScreens` maps it onto `PegRect{0,0,799,521}`) before it reaches the rows this daemon streams, so the vertical pair has to absorb that.
+
+On a Nautilus the daemon substitutes all four values at startup, logging the substitution:
+
+| key | Kronos | Nautilus |
+|---|---|---|
+| `touch_x_range` | 813 | **857** |
+| `touch_x_offset` | 10 | **24** |
+| `touch_y_range` | 638 | **570** |
+| `touch_y_offset` | 20 | **29** |
+
+All four are derived from hand calibrations on a live unit (2026-09-21), not from geometry ratios. Horizontal: `landed = 1.05418*x - 13.67`, and 857/24 holds to under 2 px over 0-799 - at the old 813/10 an `x` of 799 landed at 829, i.e. 30 px off the right edge of the panel. Vertical took three passes, converging on `landed = 1.04802*y - 10` measured against 544/18, giving 570/29, which holds to 1.35 px over 0-479. Setting any of these keys in `screenremote.cfg` suppresses that one substitution, so a per-unit override always wins.
+
+**These values describe the daemon *and* Eva's own ADC-to-pixel step**, and Eva's half depends on `sm_aucTouchPanelMargin`, which the on-device **Global > Touch Panel Calibration** page rewrites. Re-running that calibration changes the mapping and invalidates these defaults - use the config overrides to re-tune if that happens.
+
+History, vertical at y=479: 510 (3.0.2's 480/600 guess) landed ~37 px low; 638 (3.0.3's no-scaling cut) ~72 px high; 544 (first measured pass) ~13 px low; 570 lands it. The horizontal error was present throughout but masked by the much larger vertical one - a first calibration pass appeared to show x needing no correction, but those grid nodes had simply never been adjusted.
+
+The Kronos values are deliberately left alone: they are long-standing, and this was measured on a Nautilus. They may carry the same horizontal error and are worth re-checking on a real Kronos.
 
 `nks4_inject.ko` calls `CSTGFrontPanel::HandleTouchPanel(this, event_type, coord)` with these exact values - `this` resolved from OA's own `CSTGFrontPanel::sInstance`, `event_type`/`coord` passed through unmodified from the values above.
 
