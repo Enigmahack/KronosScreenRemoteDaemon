@@ -2,7 +2,7 @@
  * eva_mode_peek.c - ONE-SHOT diagnostic, READ-ONLY kernel memory peek into
  * Eva's own process memory to read its live CModeManager state directly,
  * as a candidate replacement for the framebuffer pixel-fingerprint mode
- * detection in ../source/screenremote.c (detect_ui_mode()/
+ * detection in ../../../source/screenremote.c (detect_ui_mode()/
  * detect_program_edit_context()).
  *
  * NOT WIRED INTO screenremote.c AND NOT YET CALIBRATED ON REAL HARDWARE -

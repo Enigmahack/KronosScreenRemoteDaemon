@@ -233,9 +233,9 @@ of ints out of Eva's memory replaces pixel-fingerprinting entirely - no PNG
 references, no thresholds, and it covers the Sequence edit-context case
 pixel detection never could.
 
-`eva_mode_peek_module/eva_mode_peek.c` is a **one-shot, read-only diagnostic**
-kernel module (same bar as `shm_peek_module/shm_peek.c` and
-`chord_probe_module/chord_probe.c` - no hooking, no patching) that resolves
+`tools/diagnostic_modules/eva_mode_peek_module/eva_mode_peek.c` is a **one-shot, read-only diagnostic**
+kernel module (same bar as `tools/diagnostic_modules/shm_peek_module/shm_peek.c` and
+`tools/diagnostic_modules/chord_probe_module/chord_probe.c` - no hooking, no patching) that resolves
 Eva's `task_struct` by scanning the process list for `comm=="Eva"`, then reads
 through its memory via `get_user_pages()` (the same mechanism `/proc/pid/mem`
 uses) to dump:
@@ -281,7 +281,7 @@ sm_poMMI (VA 0x0ae431b0, in Eva's own address space)
 ## Build
 
 ```bash
-cd eva_mode_peek_module
+cd tools/diagnostic_modules/eva_mode_peek_module
 make -f Makefile.module        # KDIR defaults to /home/build/linux-kronos
 ```
 Builds clean as of 2026-07-16. `nm -u eva_mode_peek.ko` shows only standard

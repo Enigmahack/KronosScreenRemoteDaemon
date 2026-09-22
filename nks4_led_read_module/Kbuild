@@ -1,2 +1,0 @@
-obj-m += nks4_led_read.o
-EXTRA_CFLAGS := -fno-pic -fno-PIE -fno-common -include $(src)/../source/no_tracepoints.h

@@ -48,7 +48,7 @@ echo "=== Syncing build artifacts back to ${SRC_ROOT} ==="
 rsync -a "$BUILD_ROOT"/source/*_ko.h "$BUILD_ROOT"/source/midi_tcp_bin.h "$SRC_ROOT"/source/ 2>/dev/null || true
 
 # Kernel modules themselves + the final daemon binary
-for mod in vkbd_module midi_module nks4_inject_module eva_mode_module eva_mode_peek_module mode_page_hook_module; do
+for mod in vkbd_module midi_module nks4_inject_module eva_mode_module mode_page_hook_module; do
     [ -d "$BUILD_ROOT/$mod" ] || continue
     rsync -a --include='*.ko' --include='*.o' --include='*.mod.c' --include='*.mod.o' \
         --exclude='*' "$BUILD_ROOT/$mod"/ "$SRC_ROOT/$mod"/

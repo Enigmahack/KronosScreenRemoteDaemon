@@ -16,6 +16,17 @@ vkbd_module/.tmp_versions/
 vkbd_module/Module.symvers
 vkbd_module/modules.order
 
+# Diagnostic/probe kernel modules (not part of the daemon build) - sources
+# only, build artifacts stay local
+tools/diagnostic_modules/*/*.ko
+tools/diagnostic_modules/*/*.o
+tools/diagnostic_modules/*/*.mod
+tools/diagnostic_modules/*/*.mod.c
+tools/diagnostic_modules/*/.*.cmd
+tools/diagnostic_modules/*/.tmp_versions/
+tools/diagnostic_modules/*/Module.symvers
+tools/diagnostic_modules/*/modules.order
+
 # midi_module kernel module build artifacts
 midi_module/*.ko
 midi_module/*.o
@@ -50,8 +61,8 @@ desktop.ini
 # Troubleshooting Files
 .rawGrab/
 tools/evatrace/
-shm_peek_module/
-chord_probe_module/
+tools/diagnostic_modules/shm_peek_module/
+tools/diagnostic_modules/chord_probe_module/
 
 # Unnecessary files/documentation
 docs/vm_environment.md

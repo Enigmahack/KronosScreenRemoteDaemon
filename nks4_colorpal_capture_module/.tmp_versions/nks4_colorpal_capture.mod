@@ -1,2 +1,0 @@
-/home/share/KronosScreenRemoteDaemon/nks4_colorpal_capture_module/nks4_colorpal_capture.ko
-/home/share/KronosScreenRemoteDaemon/nks4_colorpal_capture_module/nks4_colorpal_capture.o

@@ -2,7 +2,7 @@
  * eva_mode.c - READ-ONLY kernel memory read of Eva's live CModeManager
  * state, exposed via /proc/.eva_mode for screenremote.c to consume as the
  * primary source for its MODE=/EDITCTX= reporting (STATE, SYSINFO,
- * MODE_DETAIL). Production counterpart of ../eva_mode_peek_module/
+ * MODE_DETAIL). Production counterpart of ../tools/diagnostic_modules/eva_mode_peek_module/
  * eva_mode_peek.c, the diagnostic this was calibrated with - see
  * docs/EVA_ModeManager_probe.md for the full calibration session (all 7
  * SYS_MODE values and all 3 EDITCTX_RAW values independently confirmed live

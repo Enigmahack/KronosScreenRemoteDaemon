@@ -1,2 +1,0 @@
-/home/share/KronosScreenRemoteDaemon/eva_mode_peek_module/eva_mode_peek.ko
-/home/share/KronosScreenRemoteDaemon/eva_mode_peek_module/eva_mode_peek.o

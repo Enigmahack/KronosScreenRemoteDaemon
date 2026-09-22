@@ -574,6 +574,10 @@ static int g_nks4_load_pending = 0;  /* 1 = early load found OA not-yet-Live; re
  * MODE_LIT/PAGE_LIT fields stay absent there (see mode_page_hook_read()),
  * same conditional-omission convention as RW2_* in SYSINFO. */
 static int g_mode_page_hook_loaded = 0;
+/* Set on the first try_load_mode_page_hook() call, success or not: the load
+ * is attempted exactly once per daemon run, so a permanent failure can't
+ * turn into a per-tick extract/fsync/init_module/log loop. */
+static int g_mode_page_hook_attempted = 0;
 
 /* rtf5 degraded fallback - see header comment above for what this is and its known
  * limitations.  Only entered once nks4_inject.ko has been permanently given up on for
@@ -7149,8 +7153,9 @@ static void try_load_mode_page_hook(void)
     long ret;
     int fd, i;
 
-    if (g_mode_page_hook_loaded)
+    if (g_mode_page_hook_loaded || g_mode_page_hook_attempted)
         return;
+    g_mode_page_hook_attempted = 1;
 
     {
         struct sym_probe probes[] = {
@@ -8047,13 +8052,13 @@ int main(void)
 
         /* mode_page_hook.ko: Nautilus only - see g_mode_page_hook_loaded's
          * own comment for why. Checked every tick; fires at most once
-         * (g_mode_page_hook_loaded latches). Placed in the main loop rather
+         * (g_mode_page_hook_attempted latches, whether or not it succeeds). Placed in the main loop rather
          * than at either try_load_nks4_inject() call site because
          * detect_device_model() (which sets g_model_family) is a one-time
          * synchronous call in main() before the loop starts, so every loop
          * iteration is guaranteed to see it populated regardless of when
          * nks4_inject itself finished loading. */
-        if (g_nks4_loaded && !g_mode_page_hook_loaded &&
+        if (g_nks4_loaded && !g_mode_page_hook_attempted &&
             strcmp(g_model_family, "NAUTILUS") == 0)
             try_load_mode_page_hook();
 
