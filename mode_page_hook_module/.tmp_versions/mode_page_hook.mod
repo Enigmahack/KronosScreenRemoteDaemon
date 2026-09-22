@@ -1,0 +1,2 @@
+/home/share/KronosScreenRemoteDaemon/mode_page_hook_module/mode_page_hook.ko
+/home/share/KronosScreenRemoteDaemon/mode_page_hook_module/mode_page_hook.o

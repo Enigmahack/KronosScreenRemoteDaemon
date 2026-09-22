@@ -75,6 +75,9 @@
  *                              detection's own fallback to the last BUTTON-commanded mode
  *                              applies in that path only. Either way this is the daemon's own
  *                              source of truth, not an echo of client-side screen comparison.
+ *                            Nautilus appends MODE_LIT=0|1 PAGE_LIT=0|1: the MODE/PAGE
+ *                              button LEDs, detected from the popup each one opens (see
+ *                              lit_state(), lit_detect_refs.h).
  *   MODE_DETAIL             -> SOURCE=eva|pixel MODE=N EDITCTX=E EDITSLOT=S EVA_LOADED=0|1
  *                              EVA_RESOLVED=0|1\n
  *                            Richer counterpart to STATE (same spirit as PADMAP_STATE
@@ -203,6 +206,7 @@
 #include "palette_data.h"
 #include "miniz.h"          /* zlib-format deflate for the v3 RGB565 stream (MIT, miniz.LICENSE) */
 #include "mode_detect_refs.h"
+#include "lit_detect_refs.h"
 #include "vkbd_ko.h"
 #include "midi_bridge_ko.h"
 #include "midi_tcp_bin.h"
@@ -228,7 +232,7 @@
 #define KBD_EV_KEY  1
 
 /*  Version */
-#define SCREENREMOTE_VERSION "3.1.0"
+#define SCREENREMOTE_VERSION "3.1.1"
 #ifndef BUILD_ID
 #define BUILD_ID "dev"
 #endif
@@ -562,22 +566,30 @@ static int nks4_fd      = -1;  /* fd to /proc/.nks4inject O_WRONLY */
 static int g_nks4_loaded = 0;  /* 1 once nks4_inject.ko is loaded and nks4_fd is open */
 static int g_nks4_load_pending = 0;  /* 1 = early load found OA not-yet-Live; retry from main loop */
 
-/* mode_page_hook.ko: permanent read-only HandleSwitchEvent hook tracking a
- * software MODE/PAGE LED toggle. NAUTILUS ONLY - those popup-toggle buttons
- * don't exist on Kronos, which has discrete mode-select buttons and its own
- * eva_mode.ko-based mode-state monitoring instead; those buttons happen to
- * share the same eSTGButtonCode numbers this hook watches (COMBI=1,
- * PROGRAM=2), so hooking on Kronos would toggle these bits on every real
- * mode-select press for no reason. Loaded once from the main loop, gated on
- * g_model_family=="NAUTILUS" && g_nks4_loaded (see the check right before
- * the sm_pommi_addr retry block). Left 0 forever on Kronos - STATE's
- * MODE_LIT/PAGE_LIT fields stay absent there (see mode_page_hook_read()),
- * same conditional-omission convention as RW2_* in SYSINFO. */
+/* mode_page_hook.ko: permanent read-only HandleSwitchEvent hook counting
+ * MODE/PAGE button presses - lit_state()'s press trigger. NAUTILUS ONLY -
+ * those popup-toggle buttons don't exist on Kronos, which has discrete
+ * mode-select buttons and its own eva_mode.ko-based mode-state monitoring
+ * instead; those buttons happen to share the same eSTGButtonCode numbers
+ * this hook watches (COMBI=1, PROGRAM=2). Loaded once from the main loop,
+ * gated on g_model_family=="NAUTILUS" && g_nks4_loaded (see the check right
+ * before the sm_pommi_addr retry block). Left 0 forever on Kronos. */
 static int g_mode_page_hook_loaded = 0;
 /* Set on the first try_load_mode_page_hook() call, success or not: the load
  * is attempted exactly once per daemon run, so a permanent failure can't
  * turn into a per-tick extract/fsync/init_module/log loop. */
 static int g_mode_page_hook_attempted = 0;
+
+/* lit_state()'s cache of the screen-detected Nautilus MODE/PAGE LED state.
+ * g_lit_dirty: a v3 dirty rect touched a template region since the last
+ * detection (set in v3_update()). g_lit_tracked: a change-mode v3 client is
+ * diffing every frame, so g_lit_dirty can be trusted; set per main-loop
+ * tick. g_lit_presses: last MODE_PRESSES+PAGE_PRESSES seen from the hook. */
+static int      g_lit_dirty   = 1;
+static int      g_lit_tracked = 0;
+static int      g_lit_mode    = 0;
+static int      g_lit_page    = 0;
+static unsigned g_lit_presses = 0;
 
 /* rtf5 degraded fallback - see header comment above for what this is and its known
  * limitations.  Only entered once nks4_inject.ko has been permanently given up on for
@@ -2351,6 +2363,11 @@ static int v3_update(int fd, int force_full, int want_empty)
         if (partial_staging) { v3_capture(); partial_staging = 0; }
         x0 = 0; y0 = 0; w = g_stream_w; h = g_stream_h;   /* >75% dirty: just send it all */
     }
+    /* Nautilus MODE/PAGE popup detection only needs re-running when the
+     * change reaches one of its two template regions (see lit_state()). */
+    if (changed && y0 <= LIT_BAND_Y1 &&
+        ((x0 <= LIT_MODE_UL_X1) || (x0 + w - 1 >= LIT_CLOSE_X_X0)))
+        g_lit_dirty = 1;
     if (!changed) {
         if (!want_empty) return 0;
         total = v3_encode_rect(v3_staging, 0, 0, 0, 0);
@@ -2934,16 +2951,16 @@ static int eva_mode_read(int *out_mode, int *out_editctx, int *out_slot, int *ou
 
 /* Reads mode_page_hook.ko's /proc/.mode_page_hook - read fresh every call
  * (no caching), same live-read philosophy as eva_mode_read() above. Returns
- * 1 and fills out_mode_lit/out_page_lit on success; returns 0 (leaving both
- * untouched) if the module isn't loaded or the read/parse failed. Defined
- * here (well before try_load_mode_page_hook(), which actually loads the
- * module) purely so it's available to STATE's handler earlier in this same
- * translation unit - this file has no header declarations, only definition
- * order, matching eva_mode_read()'s own position right above it. */
-static int mode_page_hook_read(int *out_mode_lit, int *out_page_lit)
+ * 1 and fills *out_presses with MODE_PRESSES + PAGE_PRESSES on success;
+ * returns 0 if the module isn't loaded or the read/parse failed. Only the
+ * press count is used: it is lit_state()'s "a MODE/PAGE button was pressed"
+ * trigger. The module's own MODE_LIT/PAGE_LIT parity is not reported - a
+ * press the popup ignores, or a popup closed by touch, leaves it wrong. */
+static int mode_page_hook_presses(unsigned *out_presses)
 {
     char buf[160];
-    int fd, installed = 0, mode_lit = 0, page_lit = 0;
+    int fd, installed = 0;
+    unsigned mode_presses = 0, page_presses = 0;
     ssize_t n;
 
     if (!g_mode_page_hook_loaded)
@@ -2957,12 +2974,92 @@ static int mode_page_hook_read(int *out_mode_lit, int *out_page_lit)
         return 0;
     buf[n] = '\0';
 
-    if (sscanf(buf, "INSTALLED=%d TARGET=%*x TOTAL_CALLS=%*u MODE_LIT=%d PAGE_LIT=%d",
-               &installed, &mode_lit, &page_lit) != 3 || !installed)
+    if (sscanf(buf, "INSTALLED=%d TARGET=%*x TOTAL_CALLS=%*u MODE_LIT=%*u PAGE_LIT=%*u "
+                    "MODE_PRESSES=%u PAGE_PRESSES=%u",
+               &installed, &mode_presses, &page_presses) != 3 || !installed)
         return 0;
 
-    *out_mode_lit = mode_lit;
-    *out_page_lit = page_lit;
+    *out_presses = mode_presses + page_presses;
+    return 1;
+}
+
+/* Nautilus MODE/PAGE LED state, read off the screen. Both buttons open a
+ * full-screen popup with a close X at the top right (lit_detect_refs.h
+ * g_lit_close_x); only the MODE popup's title starts with the word "Mode"
+ * (g_lit_mode_ul) - the PAGE popup's title is "<mode name> Page Select".
+ * That gives the four cases, which are the sole source of MODE_LIT/PAGE_LIT:
+ *   X + Mode      -> MODE_LIT=1 PAGE_LIT=0
+ *   X, no Mode    -> MODE_LIT=0 PAGE_LIT=1
+ *   Mode, no X    -> 0 0 (not a real screen state)
+ *   neither       -> 0 0
+ *
+ * A template matches when at least LIT_MATCH_PCT% of its points agree. Pixel
+ * values are only compared with each other, never with stored colours: each
+ * class's value is taken from its first three points (majority of three),
+ * the classes must differ, and every point must equal its class's value.
+ * One match is ~90 uncached 16-bit reads from fb1_hw_map and stops at the
+ * first miss past the 5% budget, so a non-popup screen costs a handful. */
+#define LIT_MATCH_PCT 95
+
+static uint16_t lit_px_at(const struct lit_px *p)
+{
+    uint16_t v;
+    memcpy(&v, fb1_hw_map + (size_t)p->y * fb1_hw_stride + (size_t)p->x * 2, 2);
+    return v;
+}
+
+/* pts[] is grouped by class (generator order), each class >= 3 points. */
+static int lit_match(const struct lit_px *pts, int n, int nclasses)
+{
+    uint16_t ref[LIT_MAX_CLASSES];
+    int c, i, start = 0, misses = 0, budget = n * (100 - LIT_MATCH_PCT) / 100;
+
+    for (c = 0; c < nclasses; c++) {
+        uint16_t a, b, d;
+        while (start < n && pts[start].cls != c) start++;
+        if (start + 2 >= n || pts[start + 2].cls != c)
+            return 0;
+        a = lit_px_at(&pts[start]);
+        b = lit_px_at(&pts[start + 1]);
+        d = lit_px_at(&pts[start + 2]);
+        ref[c] = (a == b || a == d) ? a : b;
+        for (i = 0; i < c; i++)
+            if (ref[i] == ref[c])
+                return 0;
+    }
+    for (i = 0; i < n; i++)
+        if (lit_px_at(&pts[i]) != ref[pts[i].cls] && ++misses > budget)
+            return 0;
+    return 1;
+}
+
+/* Current MODE_LIT/PAGE_LIT. Re-runs the detection only when something
+ * could have changed it: the stream's dirty rect touched either template
+ * region (g_lit_dirty, set in v3_update()), the hook saw a MODE/PAGE press,
+ * or no change-mode stream is diffing the screen for us (g_lit_tracked==0),
+ * in which case there is no cheaper change signal than the detection
+ * itself. Returns 0 if there is no 16bpp framebuffer to read. */
+static int lit_state(int *out_mode_lit, int *out_page_lit)
+{
+    unsigned presses;
+
+    if (!fb1_hw_map || fb_w < 800 || fb_h <= LIT_BAND_Y1)
+        return 0;
+    if (mode_page_hook_presses(&presses) && presses != g_lit_presses) {
+        g_lit_presses = presses;
+        g_lit_dirty = 1;
+    }
+    if (g_lit_dirty || !g_lit_tracked) {
+        int x = lit_match(g_lit_close_x, (int)(sizeof(g_lit_close_x) / sizeof(g_lit_close_x[0])),
+                          LIT_CLOSE_X_CLASSES);
+        int m = x && lit_match(g_lit_mode_ul, (int)(sizeof(g_lit_mode_ul) / sizeof(g_lit_mode_ul[0])),
+                               LIT_MODE_UL_CLASSES);
+        g_lit_mode = m;
+        g_lit_page = x && !m;
+        g_lit_dirty = 0;
+    }
+    *out_mode_lit = g_lit_mode;
+    *out_page_lit = g_lit_page;
     return 1;
 }
 
@@ -6391,7 +6488,7 @@ static void process_ctrl_cmd(const char *line, int fd)
     } else if (strcmp(line, "STATE") == 0) {
         char resp[96];
         int  rlen, mode, editctx; const char *src;
-        int  mode_lit = 0, page_lit = 0, have_mode_page;
+        int  mode_lit = 0, page_lit = 0, have_lit;
         get_mode_state(&mode, &editctx, &src);
         /* Don't report synth state we don't trust yet - see update_boot_state()'s
          * block comment for exactly why a raw eva_mode.ko/pixel reading can look
@@ -6404,14 +6501,13 @@ static void process_ctrl_cmd(const char *line, int fd)
          * reading and start polling again. */
         if (g_boot_active) { mode = 0; editctx = 0; }
         /* MODE_LIT/PAGE_LIT: Nautilus-only front-panel LED state for the MODE/
-         * PAGE popup-toggle buttons - a software toggle, not a hardware read
-         * (see mode_page_hook.c's header comment). Omitted entirely on
-         * Kronos, same conditional-omission convention as RW2_* in SYSINFO -
-         * those buttons don't exist there. */
-        have_mode_page = strcmp(g_model_family, "NAUTILUS") == 0 &&
-                          mode_page_hook_read(&mode_lit, &page_lit);
+         * PAGE popup-toggle buttons, detected from the popup on screen (see
+         * lit_state()). Omitted entirely on Kronos, same conditional-omission
+         * convention as RW2_* in SYSINFO - those buttons don't exist there. */
+        have_lit = strcmp(g_model_family, "NAUTILUS") == 0 &&
+                   lit_state(&mode_lit, &page_lit);
         rlen = snprintf(resp, sizeof(resp),
-                         have_mode_page ? "MODE=%u EDITCTX=%d BOOT=%d MODE_LIT=%d PAGE_LIT=%d\n"
+                         have_lit ? "MODE=%u EDITCTX=%d BOOT=%d MODE_LIT=%d PAGE_LIT=%d\n"
                                         : "MODE=%u EDITCTX=%d BOOT=%d\n",
                          (unsigned)mode, editctx, g_boot_active, mode_lit, page_lit);
         REPLY(resp, (size_t)rlen);
@@ -7138,9 +7234,9 @@ static int try_load_nks4_inject(int live_wait_ds)
  * safe, and g_mode_page_hook_loaded's own comment for why this is
  * NAUTILUS-ONLY. Callers gate on g_nks4_loaded (HandleSwitchEvent's
  * kallsyms entry only exists once OA is Live) and
- * g_model_family=="NAUTILUS". Not retried if it fails: no client-visible
- * command depends on this loading - MODE_LIT/PAGE_LIT just won't appear in
- * STATE - so a permanent failure is logged and left at that.
+ * g_model_family=="NAUTILUS". Not retried if it fails: MODE_LIT/PAGE_LIT
+ * come from the screen, the hook only makes lit_state() re-check sooner
+ * after a press, so a permanent failure is logged and left at that.
  *
  * Resolves HandleSwitchEvent's address via its own single-symbol
  * kallsyms_resolve() probe rather than reusing nks4_inject's fn_switch (a
@@ -7928,6 +8024,11 @@ int main(void)
          * N3160; at 15 Hz that alone was ~2% of a core for nothing. */
         if (fb1_native_bpp == 16 && (mirror_on || g_boot_active || fb1_shadow_due()))
             fb1_refresh_shadow();
+
+        /* lit_state() may trust g_lit_dirty only while a change-mode v3
+         * client has a valid shadow, i.e. every screen change is diffed. */
+        g_lit_tracked = client_fd >= 0 && client_ver >= 3 &&
+                        client_mode == MODE_CHANGE && v3_shadow_valid;
 
         if (handshake.fd >= 0) {
             struct timespec hs_now;

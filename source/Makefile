@@ -44,7 +44,7 @@ midi_tcp_bin.h: midi_tcp.c
 miniz.o: miniz.c miniz.h
 	$(CC) $(filter-out -Wall,$(CFLAGS)) $(MINIZ_DEFS) -c -o $@ miniz.c
 
-$(OUTDIR)/screenremote: screenremote.c miniz.o vkbd_ko.h midi_bridge_ko.h nks4_inject_ko.h eva_mode_ko.h mode_page_hook_ko.h midi_tcp_bin.h
+$(OUTDIR)/screenremote: screenremote.c lit_detect_refs.h miniz.o vkbd_ko.h midi_bridge_ko.h nks4_inject_ko.h eva_mode_ko.h mode_page_hook_ko.h midi_tcp_bin.h
 	$(CC) $(CFLAGS) $(MINIZ_DEFS) -DBUILD_ID=\"$(BUILD_ID)\" -o $@ screenremote.c miniz.o
 
 clean:

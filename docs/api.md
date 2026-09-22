@@ -1100,7 +1100,16 @@ Either way, this makes the daemon itself the source of truth for mode state - no
 
 `BOOT` is the server-side boot gate (see "Boot gate" below) - `1` means the daemon does not yet consider the OS/UI genuinely up, and every mutating command is being rejected with `ERR BOOTING`. **While `BOOT=1`, `MODE` and `EDITCTX` are always forced to `0`** (their own pre-existing "unknown"/"none" values), regardless of what `eva_mode.ko`/the pixel fallback actually read - both can report confident-looking but wrong values during this window (that's the whole reason the gate exists), so the daemon never hands that reading to a caller at all rather than trusting the caller to notice `BOOT=1` and discard it itself. Poll `STATE` again once `BOOT` reads `0` for the real value.
 
-**`MODE_LIT`/`PAGE_LIT` (3.1.0+, Nautilus only).** The Nautilus replaces Kronos's row of discrete mode-select buttons with two popup-toggle buttons, MODE and PAGE, each with its own front-panel LED. There is no host-readable copy of that LED's on/off state anywhere on this hardware, so these two fields are a **software toggle**, not a hardware reading: `mode_page_hook.ko` hooks `CSTGFrontPanel::HandleSwitchEvent` read-only and flips a bit every time a real physical press of that button is observed (`eSTGButtonCode` 1 for MODE, 2 for PAGE - the same codes Kronos assigns to its physical COMBI/PROGRAM buttons, a separate pre-existing `BUTTON`-injection quirk on Nautilus this field does not address). Both start `0` (unlit) at daemon startup, matching the real hardware's boot-time default - there is no code path that starts this daemon without a full reboot, so the two can never desync. Omitted entirely on Kronos (those buttons don't exist there) or if `mode_page_hook.ko` failed to load (check stderr - not fatal to anything else).
+**`MODE_LIT`/`PAGE_LIT` (3.1.0+, Nautilus only).** The Nautilus replaces Kronos's row of discrete mode-select buttons with two popup-toggle buttons, MODE and PAGE, each with its own front-panel LED that is lit while its popup is open. There is no host-readable copy of that LED's state on this hardware, so the daemon reads it off the screen (3.1.1+): both popups have a close **X** at the top right, and only the MODE popup's title starts with the word **Mode** (the PAGE popup is titled "`<mode name>` Page Select").
+
+| Close X | "Mode" title | `MODE_LIT` | `PAGE_LIT` |
+|---|---|---|---|
+| yes | yes | 1 | 0 |
+| yes | no | 0 | 1 |
+| no | yes | 0 | 0 |
+| no | no | 0 | 0 |
+
+Each check samples about 90 points and matches at 95% agreement or better. It compares the sampled pixels with each other, not with stored colours. The check re-runs only when the streamed frame's dirty rectangle touches one of the two regions (x 0-79 or 722-799, rows 0-55), when `mode_page_hook.ko` sees a MODE/PAGE press, or on every `STATE` while no change-mode v3 client is streaming. Omitted entirely on Kronos (those buttons don't exist there).
 
 ---
 
@@ -1763,6 +1772,10 @@ Every authentication attempt (success or failure) is appended to `/korg/rw/scree
 ## 15. Changes by release
 
 Client-visible changes only. Internal changes are in the git history.
+
+### 3.1.1
+
+- **`STATE` `MODE_LIT`/`PAGE_LIT` (Nautilus)** are now detected from the MODE/PAGE popup on screen instead of counting button presses, so they no longer drift when a popup is closed by touch or a press is ignored. They are also reported when `mode_page_hook.ko` failed to load ([STATE](#state)).
 
 ### 3.0.2
 
