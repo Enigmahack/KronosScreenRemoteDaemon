@@ -1,0 +1,12 @@
+# ONE-SHOT diagnostic module - not embedded in the daemon, just insmod'd
+# directly during investigation. Read-only inline hook (logs, calls through
+# unchanged, restores original bytes on rmmod) - see led_hook.c's own header
+# comment for the full technique and provenance.
+KDIR ?= /home/build/linux-kronos
+PWD  := $(shell pwd)
+
+all:
+	$(MAKE) -C $(KDIR) M=$(PWD) modules
+
+clean:
+	$(MAKE) -C $(KDIR) M=$(PWD) clean

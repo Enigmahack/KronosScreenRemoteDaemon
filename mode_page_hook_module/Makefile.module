@@ -1,0 +1,22 @@
+# Permanent (not one-shot diagnostic) module, embedded into screenremote and
+# loaded at daemon startup - see mode_page_hook.c's own header comment and
+# try_load_mode_page_hook() in source/screenremote.c.
+#
+# /home/build/linux-kronos is Korg's actual kernel source, verified to
+# produce byte-accurate struct module layouts against real Korg .ko files -
+# see eva_mode_module/Makefile.module's own comment for the full citation.
+# patch_init_offset.py stays below purely as a cheap defensive check, same
+# as every other embedded module in this repo.
+KDIR   ?= /home/build/linux-kronos
+PWD    := $(shell pwd)
+PATCH  := ../patch_init_offset.py
+KO_HDR := ../source/mode_page_hook_ko.h
+
+all:
+	$(MAKE) -C $(KDIR) M=$(PWD) modules
+	python3 $(PATCH) mode_page_hook.ko
+	xxd -i mode_page_hook.ko $(KO_HDR)
+
+clean:
+	$(MAKE) -C $(KDIR) M=$(PWD) clean
+	rm -f $(KO_HDR)

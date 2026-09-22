@@ -33,6 +33,9 @@ nks4_inject_ko.h: ../nks4_inject_module/nks4_inject.c ../nks4_inject_module/Kbui
 eva_mode_ko.h: ../eva_mode_module/eva_mode.c ../eva_mode_module/Kbuild
 	$(MAKE) -C ../eva_mode_module -f Makefile.module
 
+mode_page_hook_ko.h: ../mode_page_hook_module/mode_page_hook.c ../mode_page_hook_module/Kbuild
+	$(MAKE) -C ../mode_page_hook_module -f Makefile.module
+
 midi_tcp_bin.h: midi_tcp.c
 	$(CC) $(CFLAGS) -o midi_tcp_bin midi_tcp.c
 	xxd -i midi_tcp_bin > $@
@@ -41,11 +44,11 @@ midi_tcp_bin.h: midi_tcp.c
 miniz.o: miniz.c miniz.h
 	$(CC) $(filter-out -Wall,$(CFLAGS)) $(MINIZ_DEFS) -c -o $@ miniz.c
 
-$(OUTDIR)/screenremote: screenremote.c miniz.o vkbd_ko.h midi_bridge_ko.h nks4_inject_ko.h eva_mode_ko.h midi_tcp_bin.h
+$(OUTDIR)/screenremote: screenremote.c miniz.o vkbd_ko.h midi_bridge_ko.h nks4_inject_ko.h eva_mode_ko.h mode_page_hook_ko.h midi_tcp_bin.h
 	$(CC) $(CFLAGS) $(MINIZ_DEFS) -DBUILD_ID=\"$(BUILD_ID)\" -o $@ screenremote.c miniz.o
 
 clean:
-	rm -f $(TARGETS) miniz.o vkbd_ko.h midi_bridge_ko.h nks4_inject_ko.h eva_mode_ko.h midi_tcp_bin.h midi_tcp_bin
+	rm -f $(TARGETS) miniz.o vkbd_ko.h midi_bridge_ko.h nks4_inject_ko.h eva_mode_ko.h mode_page_hook_ko.h midi_tcp_bin.h midi_tcp_bin
 	# Recurse into the kernel-module build dirs.  Without this, `make clean`
 	# leaves the old .ko/.o in place; kbuild then skips recompiling when the
 	# module source mtime isn't newer than the artifact (common right after a
@@ -56,5 +59,6 @@ clean:
 	$(MAKE) -C ../midi_module -f Makefile.module clean
 	$(MAKE) -C ../nks4_inject_module -f Makefile.module clean
 	$(MAKE) -C ../eva_mode_module -f Makefile.module clean
+	$(MAKE) -C ../mode_page_hook_module -f Makefile.module clean
 
 .PHONY: all clean

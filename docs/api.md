@@ -1069,6 +1069,7 @@ Query the current Kronos operating mode.
 ```
 Request:  STATE\n
 Response: MODE=<n> EDITCTX=<e> BOOT=<0|1>\n
+          MODE=<n> EDITCTX=<e> BOOT=<0|1> MODE_LIT=<0|1> PAGE_LIT=<0|1>\n   (Nautilus only)
 ```
 
 | Value | Mode |
@@ -1098,6 +1099,8 @@ Either way, this makes the daemon itself the source of truth for mode state - no
 `EDITCTX` flags the case where `MODE=3` (Program) but the top-right tempo-area widget is showing "COMBI" or "SEQ" instead of a tempo value, meaning the Program being edited was reached from inside a Combi or a Song, not selected standalone. `EDITCTX=2` (Sequence) is fully supported via the `eva_mode.ko` primary path (confirmed live 2026-07-17) - it's only the pixel *fallback* path that can't detect it (the client never captured a reference bitmap for that case either), so `EDITCTX=2` is only unreachable if `eva_mode.ko` isn't loaded/resolved.
 
 `BOOT` is the server-side boot gate (see "Boot gate" below) - `1` means the daemon does not yet consider the OS/UI genuinely up, and every mutating command is being rejected with `ERR BOOTING`. **While `BOOT=1`, `MODE` and `EDITCTX` are always forced to `0`** (their own pre-existing "unknown"/"none" values), regardless of what `eva_mode.ko`/the pixel fallback actually read - both can report confident-looking but wrong values during this window (that's the whole reason the gate exists), so the daemon never hands that reading to a caller at all rather than trusting the caller to notice `BOOT=1` and discard it itself. Poll `STATE` again once `BOOT` reads `0` for the real value.
+
+**`MODE_LIT`/`PAGE_LIT` (3.1.0+, Nautilus only).** The Nautilus replaces Kronos's row of discrete mode-select buttons with two popup-toggle buttons, MODE and PAGE, each with its own front-panel LED. There is no host-readable copy of that LED's on/off state anywhere on this hardware, so these two fields are a **software toggle**, not a hardware reading: `mode_page_hook.ko` hooks `CSTGFrontPanel::HandleSwitchEvent` read-only and flips a bit every time a real physical press of that button is observed (`eSTGButtonCode` 1 for MODE, 2 for PAGE - the same codes Kronos assigns to its physical COMBI/PROGRAM buttons, a separate pre-existing `BUTTON`-injection quirk on Nautilus this field does not address). Both start `0` (unlit) at daemon startup, matching the real hardware's boot-time default - there is no code path that starts this daemon without a full reboot, so the two can never desync. Omitted entirely on Kronos (those buttons don't exist there) or if `mode_page_hook.ko` failed to load (check stderr - not fatal to anything else).
 
 ---
 
@@ -1154,6 +1157,10 @@ Any of the three signals is sufficient. All are heuristics, not a true "construc
 
 Purely cosmetic, and entirely separate from the safety-critical `BOOT` gate above (this affects only what the video stream *looks like* while `BOOT=1`; it has no bearing on which commands are accepted).
 
+Kronos and Nautilus have **completely separate boot-screen paths**, and they need opposite things from this daemon: the Kronos needs its splash substituted in (the panel MCU draws it, so fb1 never sees it), while the Nautilus draws its own boot artwork into fb1 and needs nothing but the progress bar. They share no asset, no geometry and no colour - only the `BOOT=1` gate that turns both on. The Kronos path is described first; [the Nautilus path](#boot-splash-nautilus) follows.
+
+#### Kronos
+
 **The problem.** `/dev/fb1` genuinely doesn't contain the boot background during boot - only the green footer band's loading text (rows ~527-540). The KORG wordmark, engine badges, and "KRONOS / MUSIC WORKSTATION" title lockup - and the progress bar itself - are rendered by the touch panel's own separate firmware/MCU directly onto the physical LCD, never written to fb1 at all - confirmed against the reconstructed `OmapNKS4Module` driver (`kronosology/reconstructed/OmapNKS4Module/video.cpp`): the panel-local progress-bar opcode (`SendFillData`) never carries pixel data, and the only opcode that does (`SendPixelDataRegion`) only ever forwards whatever fb1 actually contains. So a client watching the raw stream during boot would otherwise see scattered text on an otherwise-black frame, nothing like the real screen.
 
 **The fix.** `screenremote.c` composites a static copy of that background under the live fb1 capture's top rows (`apply_boot_splash()`, called from `capture_to_staging()`, and the equivalent row substitution inline in `send_frame()` for pull mode) whenever `BOOT=1` and the asset is loaded - every row from there down (the footer band and anything else) is left exactly as fb1 itself reports it, so the real live loading text still comes through correctly. On top of that, `apply_boot_progress_bar()` (same two call sites) paints the front panel's own live progress bar directly into the outgoing frame - real-time `/proc/OmapNKS4ProgressBar` percent, reconstructed geometry/colours (see that function's own header comment for the kronosology sources), entirely server-side. A client needs no special handling at all: it just displays whatever frame it receives, exactly as it always has. None of this touches `fb1_map` itself, only the outgoing copy - `eva_mode.ko`/pixel-based mode detection keep reading the real, unmodified capture regardless.
@@ -1172,6 +1179,29 @@ Purely cosmetic, and entirely separate from the safety-critical `BOOT` gate abov
 `extract_boot_splash.py` also remaps the source firmware's own embedded palette (a 768-byte table sitting immediately before the bitmap in the VSB) onto `kronos_palette`'s indices via nearest-RGB matching, so the composited region renders correctly through the exact same `PALETTE`-derived LUT every client already uses - no client-side changes needed. The two palettes are 229/256 byte-identical in practice (per `KRONOS_V06R06.VSB.md`'s own cross-check), so only a couple dozen indices ever need real remapping.
 
 **A note on the VSB's splash offset.** `KRONOS_V06R06.VSB.md` originally documented the splash bitmap at payload offset `0x32800`. That offset renders as a horizontally-rolled image - every row starts partway into its true content and wraps, so the badge row and title lockup each appear as two swapped half-width copies side by side (e.g. `AL-1` wrapping around to sit next to `MS-20ex` instead of ending against a black margin). Fixing that (checking that the KORG wordmark and the KRONOS/MUSIC WORKSTATION title lockup both land within a pixel of dead-center against a real device photo, `BootScreen/Main.png`) landed on `0x326b5` (`0x32800 - 331`) - correct horizontally, but it placed the top of the KORG lettering flush against row 0, when on the real screen it sits 68px down. Row alignment is independent of column alignment for a flat row-major image (a shift of a whole number of rows, i.e. a multiple of 800 bytes, only changes which row content lands in), so shifting 68 more rows earlier fixes that without disturbing the horizontal centering already confirmed: `0x326b5 - 68*800 = 0x25235`, the final correct offset - the KORG glyph's first non-black row lands at exactly row 68 of the result. `extract_boot_splash.py` uses this value; `kronosology`'s `KRONOS_V06R06.VSB.md` has been corrected too (2026-07-19).
+
+<a id="boot-splash-nautilus"></a>
+#### Nautilus
+
+**Nothing is composited, and nothing needs to be.** The Kronos needs a substitute because its splash lives in the panel MCU and never reaches fb1. The Nautilus works the other way round: its panel firmware (`NAUTILUS_V01R10.VSB`) contains no boot bitmap at all - a hard negative result, not an unfinished search: the firmware's `Main` chunk is fully accounted for (code, palette table, dispatch tables, ~75 KB of zero padding) with no room for one, and there is no zlib/gzip/BMP/PNG signature anywhere in the file (see `Nautilus Research/MAIN/05_ui_eva/nautilus_boot_splash_search.md`). The machine instead draws its own near-full-screen NAUTILUS boot artwork straight into fb1, so the live capture already shows the real screen.
+
+That was confirmed the hard way on real hardware (2026-09-22): a 3.1.0 prerelease composited the `MainLogo` wordmark from Eva's `EXBITMAPS.PEG` here, and the result showed a visible **second** logo sitting over the machine's own. The overlay was dropped; there is no Nautilus equivalent of `boot_splash.bin`, no `KNLG` asset, and no extraction tool for one.
+
+What the Nautilus branch *does* need is to be kept away from the Kronos asset. The Kronos splash is explicitly **refused** on a Nautilus panel (`boot_splash_active_rows()` / `is_nautilus_boot_screen()`): it validates there by accident - same 800-pixel width, 526 rows fitting inside that fb's 600 - which is exactly how a `boot_splash_data.h` built for a Kronos ended up compositing the KORG/KRONOS artwork onto a Nautilus before 3.1.0.
+
+**Progress bar.** The bar *is* panel-drawn on Nautilus, exactly as on Kronos, so it still has to be composited - and now is. Before 3.1.0 `boot_progress_bar_state()` returned "this hw rev draws no bar at all" for panel hwver 2, which is what the *Kronos* `OmapNKS4Module.ko` does at that hwver - but the Nautilus ships a differently-built module that takes its own branch there. Constants read out of that module (`/sbin/OmapNKS4Module.ko` from a real Nautilus, `HWVER=02`, disassembled 2026-09-22):
+
+| | Kronos 1 | Kronos 2 | Nautilus |
+|---|---|---|---|
+| Panel `hwver` | (default) | 1 / 3 | 2 |
+| Row / col / width | 348 / 146 / 512 | 433 / 78 / 650 | 329 / 153 / 501 |
+| Filled, top row | index 9 (bright red) | index 9 | RGB565 `0xfaf4` = **(255, 93, 165)** pink |
+| Filled, bottom row | index 1 (dim red) | index 1 | same pink - one colour, not a pair |
+| Remainder | index `0xC0` (dark grey) | index `0xC0` | RGB565 `0x4228` = (66, 69, 66) |
+
+The colour difference is structural, not a tweak: the Kronos branches emit four 8bpp `SendFillData` opcodes (two rows x filled/remainder) with a bright/dim red pair, while the Nautilus branch emits two 16bpp `SendFillData16` opcodes, each covering both rows at once, so both rows necessarily carry the same colour. Its pink comes from a named constant in that module, `progressBarFgColor16bpp`. Row 329 is in panel coordinates - the 800x480 the LCD actually shows - which is exactly the crop the v3 stream carries, so no rebasing is needed. Confirmed correct on real hardware 2026-09-22 with no empirical nudge needed, unlike the Kronos 2 numbers. Also confirmed *necessary*: muting this compositing for one boot left the bar missing from the stream entirely, so - unlike the boot logo, which the machine does put in fb1 - the bar really is panel-drawn on Nautilus exactly as it is on Kronos.
+
+Because the Nautilus streams RGB565 natively and v2 clients are refused on that hardware (status `0x03 FORMAT_NEEDS_NEWER_VERSION`), the bar reaches it through the v3 compositor only. Each bar colour still carries both a palette index and an RGB565 word (`struct boot_bar_color`), so the INDEX8 and RGB565 painters can never disagree about what they are drawing.
 
 ---
 
@@ -1579,7 +1609,7 @@ All fields are plain ASCII decimal unless otherwise noted. Fields that cannot be
 | `AUDIO_MIDI_RT` | integer | MIDI output real-time call count |
 | `DISK_FREE_MB` | integer | Free space on `/korg/rw` in megabytes |
 | `DISK_TOTAL_MB` | integer | Total size of `/korg/rw` in megabytes |
-| `RW2_FREE_MB` | integer | Free space on `/korg/rw2` (second internal SSD) in megabytes |
+| `RW2_FREE_MB` | integer | Free space on `/korg/rw2` (second internal SSD) in megabytes. **Both RW2 fields are omitted entirely unless a second SSD is really mounted there** (3.1.0+) - see the note below the table |
 | `RW2_TOTAL_MB` | integer | Total size of `/korg/rw2` in megabytes |
 | `USB0_MNT` | string | Mount point of first USB drive |
 | `USB0_FREE_MB` | integer | Free space on first USB drive in megabytes |
@@ -1590,15 +1620,25 @@ All fields are plain ASCII decimal unless otherwise noted. Fields that cannot be
 | `USB_COUNT` | integer | Number of mounted USB drives detected (0-2) |
 | `BOARD_VENDOR` / `BOARD_NAME` / `BIOS_VERSION` | string | DMI motherboard identity (`ASRock` / `N3160TM-ITX-K` / `L0.07E` on the Nautilus AT board), `UNKNOWN` if the kernel exposes no DMI (3.0.2+) |
 | `PANEL_HWVER` / `FB_BPP` | integer | Same as the `MODEL` command's fields (3.0.2+) |
-| `HWMON` | string | The Super-IO sensor chip driver name (`nct6793` on the N3160TM-ITX-K) (3.0.2+) |
-| `TEMP<n>` | integer | Every temperature input the sensor chip exposes, in degrees Celsius, raw. **Unconnected inputs read garbage**: on the N3160TM-ITX-K, `SYSTIN` (`TEMP1`) reads 116 and `AUXTIN1-3` read 109 permanently. Display `TEMP_CPU` / `TEMP_ACPI`, not these. `TEMP1`-`TEMP3` keep their pre-3.0.2 position for existing clients. |
+| `SENSOR<n>` | string | Every temperature input found, on every hwmon chip, unfiltered and in discovery order: `<chip> <label> <celsius>` (label `-` if the chip publishes none). Diagnostics - includes the implausible readings that `TEMP<n>` filters out (3.1.0+) |
+| `HWMON` | string | Driver name of the chip the selected CPU probe came from (`nct6793` on the N3160TM-ITX-K) (3.0.2+) |
+| `TEMP<n>` | integer | The **selected** temperature probes in degrees Celsius, CPU first, implausible readings excluded - so `TEMP1` is always the one worth displaying (3.1.0+). Before 3.1.0 these were raw `temp<n>_input` in chip order, which put an unconnected 113-117 °C input in `TEMP1` on the N3160TM-ITX-K. The raw inputs are still reported, as `SENSOR<n>`. |
 | `TEMP<n>_LABEL` | string | The chip's label for `TEMP<n>` (`CPUTIN`, `SYSTIN`, `AUXTIN0`, ...) when it provides one (3.0.2+) |
-| `TEMP_CPU` | integer | The CPU temperature: the input whose label is `CPUTIN`/contains `CPU`, if it reads a plausible 1-99 °C (3.0.2+; 36 on the Nautilus AT at idle) |
+| `TEMP_CPU` | integer | The CPU temperature - the highest-scoring probe across every chip (see the selection note below), always equal to `TEMP1` when one was identified (3.0.2+; 35 on the Nautilus AT at idle) |
+| `TEMP_CPU_SRC` | string | Which probe `TEMP_CPU` came from, as `<chip> <label>` - e.g. `nct6793 CPUTIN`, or `coretemp Package_id_0` on a board with a working `coretemp` (3.1.0+) |
 | `TEMP_ACPI` | integer | `/sys/class/thermal/thermal_zone0` (ACPI), when present (3.0.2+) |
-| `FAN<n>_RPM` | integer | Every fan header the chip exposes. `FAN1_RPM` keeps its pre-3.0.2 meaning - but on the N3160TM-ITX-K the only populated header is `FAN2` (~400 RPM); `FAN1` is unused and reads 0. |
+| `FAN<n>_RPM` | integer | Every fan header the first fan-capable chip exposes. `FAN1_RPM` keeps its pre-3.0.2 meaning - but on the N3160TM-ITX-K the only populated header is `FAN2` (~400 RPM); `FAN1` is unused and reads 0. |
 | `FAN_RPM` | integer | The first fan header that is actually spinning (3.0.2+) - the value to display |
 | `MODE` | integer | Current Kronos mode (same values as STATE command) |
 | `EDITCTX` | integer | Program-edit-in-context sub-state (same values as STATE command) |
+
+**Second SSD (`RW2_*`).** `/korg/rw2` is an ordinary empty directory present on the root filesystem of every unit, whether or not a second SSD exists - so `statvfs()` on it always succeeds and, with no second disk, reports the *root* filesystem. That is why a single-SSD unit used to advertise a phantom ~1 GB "SSD 2". Since 3.1.0 the daemon applies the standard mount-point test (`/korg/rw2` must sit on a different `st_dev` from its parent `/korg`) and omits both fields otherwise. The test deliberately uses `st_dev` rather than a `/proc/mounts` path match, because it also rejects a bind mount of the root filesystem, which a path match would accept. Clients that hide their SSD-2 panel when `RW2_TOTAL_MB` is absent or zero need no change.
+
+**Temperature probe selection (3.1.0+).** Two things are board-dependent and neither can be assumed: *which* hwmon chip, and *which* probe on it. Before 3.1.0 the daemon took the first of `hwmon0..4` that answered `temp1_input` and reported its inputs in raw order. Both halves of that could be wrong - on a board that enumerates a Super-IO chip ahead of `coretemp`, the only true CPU-die sensor was never examined; and on the N3160TM-ITX-K the chip's *first* input is an unconnected `SYSTIN` pin reading 117 °C while the real CPU sensor is `CPUTIN` at 35 °C.
+
+The daemon now scans `hwmon0..9` (both the direct and this kernel-era's `/device/` sysfs layouts, one per device so probes are never double-counted), collects every input with its chip name and label, and scores each as a CPU candidate: `coretemp` package > `coretemp` core > `CPUTIN` > any other `CPU`-named label that isn't a `PCH_*` register > `acpitz` > unlabelled. Probes reading `<= 0 °C` or `>= 100 °C` are excluded from selection - the first is the "input present, nothing connected" case, the second the floating-analog-pin case (110-127 °C, physically impossible on a board that is still running). If no probe is plausible the daemon falls back to reporting them all in raw order, so a genuinely overheating unit can never be silenced. On a chip that publishes no labels at all, every probe scores equally and the first plausible one wins - the pre-3.1.0 behaviour, unchanged.
+
+Worth noting for this board specifically: it has no `coretemp` at all. This kernel's `coretemp` rejects the N3160 outright (`coretemp: Unknown CPU model 4c` in `dmesg`), so the Super-IO chip is the only temperature source and picking the right probe on it is the whole job.
 
 The response is terminated with:
 
@@ -1731,7 +1771,7 @@ Client-visible changes only. Internal changes are in the git history.
 - **Nautilus colours are correct.** 3.0.1 streamed Nautilus frames through the v2 index/palette path, which cannot represent an RGB565 buffer; the "wrong palette" symptoms were that, not a palette problem. There is no palette on Nautilus and no client-side palette fix-up is needed or possible - decode `RGB565LE`.
 - **Discovery** reply gained `PROTO=3 FMT=<INDEX8|RGB565LE> GEOM=<w>x<h>` ([2](#2-udp-discovery)).
 - **`MODEL`** gained `BOARD`, `PANEL_HWVER`, `CPUS`/`CORES`/`THREADS`, `STREAM_FMT`/`STREAM_GEOM`; `MODEL` codes are now board-derived and include `NAUTILUS_AT`; `NAUTILUS` now correctly identifies the original Nautilus on the Kronos 2 board ([MODEL](#model)).
-- **`SYSINFO`** gained `BOARD_VENDOR`/`BOARD_NAME`/`BIOS_VERSION`/`PANEL_HWVER`/`FB_BPP`, `CPU_COUNT`/`CPU_CORES`/`CPU_THREADS_PER_CORE`/`CPU_DAEMON_MASK`/`CPU_RT_MASK`, `HWMON`, `TEMP<n>_LABEL` for every sensor input (not just 1-3), `FAN<n>_RPM` for every header, and the display-ready `TEMP_CPU`/`TEMP_ACPI`/`FAN_RPM`. Clients showing a temperature or fan should switch to those three: on the Nautilus AT board `TEMP1`/`FAN1_RPM` are an unconnected sensor input (reads 116 °C) and an empty fan header ([11](#11-sysinfo-field-reference)). Existing fields keep their names and positions.
+- **`SYSINFO`** gained `BOARD_VENDOR`/`BOARD_NAME`/`BIOS_VERSION`/`PANEL_HWVER`/`FB_BPP`, `CPU_COUNT`/`CPU_CORES`/`CPU_THREADS_PER_CORE`/`CPU_DAEMON_MASK`/`CPU_RT_MASK`, `HWMON`, `TEMP<n>_LABEL` for every sensor input (not just 1-3), `FAN<n>_RPM` for every header, and the display-ready `TEMP_CPU`/`TEMP_ACPI`/`FAN_RPM`. Clients showing a temperature or fan should switch to those three ([11](#11-sysinfo-field-reference)). Existing fields keep their names and positions. **Superseded in 3.1.0**: `TEMP<n>` is now the *selected* probe list rather than the raw chip order, so `TEMP1` is the CPU wherever one can be identified and a client reading it is no longer showing an unconnected 117 °C input; the raw inputs moved to `SENSOR<n>`. `FAN1_RPM` is unchanged and can still be an empty header - `FAN_RPM` remains the one to display.
 - **`MIRROR_ON`** replies `ERR MIRROR_UNSUPPORTED` on Nautilus ([MIRROR_ON](#mirror_on)).
 - `REFRESH` applies to v3 sessions too.
 - Config keys `stream_max_kbps`, `stream_height`, `cpu_affinity` (server-side; `source/screenremote.cfg.example`).

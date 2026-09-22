@@ -208,6 +208,7 @@
 #include "midi_tcp_bin.h"
 #include "nks4_inject_ko.h"
 #include "eva_mode_ko.h"
+#include "mode_page_hook_ko.h"
 
 /* Optional, interim compile-time boot-splash fallback - see
  * tools/extract_boot_splash.py's --header option and load_boot_splash()
@@ -227,7 +228,7 @@
 #define KBD_EV_KEY  1
 
 /*  Version */
-#define SCREENREMOTE_VERSION "3.0.3"
+#define SCREENREMOTE_VERSION "3.1.0"
 #ifndef BUILD_ID
 #define BUILD_ID "dev"
 #endif
@@ -239,6 +240,7 @@
 #define MIDI_TCP_BIN      SCREENREMOTE_DIR "/midi_tcp"
 #define NKS4_INJECT_KO    SCREENREMOTE_DIR "/nks4_inject.ko"
 #define EVA_MODE_KO       SCREENREMOTE_DIR "/eva_mode.ko"
+#define MODE_PAGE_HOOK_KO SCREENREMOTE_DIR "/mode_page_hook.ko"
 
 #define FB_SRC       "/dev/fb1"
 #define FB_DST       "/dev/fb0"
@@ -375,6 +377,7 @@ static unsigned long g_cpu_rt_mask = 0;    /* CPUs hosting RTAI tasks (from /pro
 static uint8_t  *g_boot_splash      = NULL;
 static uint32_t  g_boot_splash_w    = 0;
 static uint32_t  g_boot_splash_rows = 0;
+
 
 static uint16_t  pal_r[PAL_ENTRIES];   /* raw palette - used for streaming handshake */
 static uint16_t  pal_g[PAL_ENTRIES];
@@ -558,6 +561,19 @@ static int        g_si_prev_valid = 0;
 static int nks4_fd      = -1;  /* fd to /proc/.nks4inject O_WRONLY */
 static int g_nks4_loaded = 0;  /* 1 once nks4_inject.ko is loaded and nks4_fd is open */
 static int g_nks4_load_pending = 0;  /* 1 = early load found OA not-yet-Live; retry from main loop */
+
+/* mode_page_hook.ko: permanent read-only HandleSwitchEvent hook tracking a
+ * software MODE/PAGE LED toggle. NAUTILUS ONLY - those popup-toggle buttons
+ * don't exist on Kronos, which has discrete mode-select buttons and its own
+ * eva_mode.ko-based mode-state monitoring instead; those buttons happen to
+ * share the same eSTGButtonCode numbers this hook watches (COMBI=1,
+ * PROGRAM=2), so hooking on Kronos would toggle these bits on every real
+ * mode-select press for no reason. Loaded once from the main loop, gated on
+ * g_model_family=="NAUTILUS" && g_nks4_loaded (see the check right before
+ * the sm_pommi_addr retry block). Left 0 forever on Kronos - STATE's
+ * MODE_LIT/PAGE_LIT fields stay absent there (see mode_page_hook_read()),
+ * same conditional-omission convention as RW2_* in SYSINFO. */
+static int g_mode_page_hook_loaded = 0;
 
 /* rtf5 degraded fallback - see header comment above for what this is and its known
  * limitations.  Only entered once nks4_inject.ko has been permanently given up on for
@@ -1809,7 +1825,16 @@ static uint32_t boot_splash_active_rows(void);
  * inline compositing below so the two can't disagree either. Defined near
  * apply_boot_splash() further down (needs nks4_progress_read(), declared
  * earlier in the file, plus g_boot_active/fb_w/fb_h). */
-struct boot_bar_geom { uint32_t row, col, max_width; };
+/* One bar colour in both of the stream formats this daemon can emit, so the
+ * INDEX8 (v2/Kronos) and RGB565 (v3/Nautilus) compositors never have to
+ * re-derive each other's answer. Kronos's colours are natively palette
+ * indices; the Nautilus's are natively RGB565 words out of its own panel
+ * driver - each fills in the other side once, in boot_progress_bar_state(). */
+struct boot_bar_color { uint8_t idx; uint16_t rgb565; };
+struct boot_bar_geom {
+    uint32_t row, col, max_width;
+    struct boot_bar_color top, bottom, bg;
+};
 static int boot_progress_bar_state(struct boot_bar_geom *g, int *out_filled);
 
 /* Boot curve, measured on hardware (fb1, 8 bpp, sampled every 37th byte):
@@ -1938,10 +1963,10 @@ static int send_frame(int fd)
                row1 < splash_rows ? g_boot_splash + (size_t)row1 * fb_w
                                    : fb1_map       + (size_t)row1 * fb1_stride,
                fb_w);
-        memset(bar_row0 + bg.col,          9,    (size_t)filled);
-        memset(bar_row0 + bg.col + filled, 0xC0, (size_t)(bg.max_width - filled));
-        memset(bar_row1 + bg.col,          1,    (size_t)filled);
-        memset(bar_row1 + bg.col + filled, 0xC0, (size_t)(bg.max_width - filled));
+        memset(bar_row0 + bg.col,          bg.top.idx,    (size_t)filled);
+        memset(bar_row0 + bg.col + filled, bg.bg.idx,     (size_t)(bg.max_width - filled));
+        memset(bar_row1 + bg.col,          bg.bottom.idx, (size_t)filled);
+        memset(bar_row1 + bg.col + filled, bg.bg.idx,     (size_t)(bg.max_width - filled));
 
         if (send_row_range(fd, 0, bg.row, splash_rows) < 0) goto fail;
         if (write_all_f(fd, bar_row0, fb_w) < 0) goto fail;
@@ -2042,16 +2067,58 @@ static uint16_t v3_index_to_565(uint8_t idx)
     return (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
 }
 
-static void v3_fill_px(uint8_t *row, uint32_t x, uint32_t n, uint8_t idx)
+/* The inverse, for colours that are natively RGB (the Nautilus panel
+ * driver's progress-bar constants) but still have to be expressible as a
+ * kronos_palette[] index for the INDEX8 stream. Plain nearest-squared-
+ * distance, the same approach tools/extract_boot_splash.py uses to remap the
+ * Kronos firmware's own palette. Called a handful of times per process, not
+ * per frame. */
+static uint8_t palette_nearest_index(uint8_t r, uint8_t g, uint8_t b)
+{
+    int best = 0, best_d = 1 << 30, i;
+    for (i = 0; i < PAL_ENTRIES; i++) {
+        int dr = (int)kronos_palette[i][0] - r;
+        int dg = (int)kronos_palette[i][1] - g;
+        int db = (int)kronos_palette[i][2] - b;
+        int d  = dr * dr + dg * dg + db * db;
+        if (d < best_d) { best_d = d; best = i; }
+    }
+    return (uint8_t)best;
+}
+
+/* A boot-bar colour given natively as an RGB565 word (the Nautilus case). */
+static struct boot_bar_color bar_color_565(uint16_t c)
+{
+    struct boot_bar_color out;
+    uint8_t r = (uint8_t)(((c >> 11) & 0x1F) * 255 / 31);
+    uint8_t g = (uint8_t)(((c >>  5) & 0x3F) * 255 / 63);
+    uint8_t b = (uint8_t)(( c        & 0x1F) * 255 / 31);
+    out.rgb565 = c;
+    out.idx    = palette_nearest_index(r, g, b);
+    return out;
+}
+
+/* A boot-bar colour given natively as a palette index (the Kronos case). */
+static struct boot_bar_color bar_color_idx(uint8_t idx)
+{
+    struct boot_bar_color out;
+    out.idx    = idx;
+    out.rgb565 = v3_index_to_565(idx);
+    return out;
+}
+
+/* Fill n pixels of one stream row with a boot-bar colour, in whichever
+ * format this stream is carrying - see struct boot_bar_color for why each
+ * colour already carries both representations. */
+static void v3_fill_px(uint8_t *row, uint32_t x, uint32_t n, struct boot_bar_color c)
 {
     if (g_stream_bpp == 8) {
-        memset(row + x, idx, n);
+        memset(row + x, c.idx, n);
     } else {
-        uint16_t v = v3_index_to_565(idx);
         uint32_t i;
         for (i = 0; i < n; i++) {
-            row[(x + i) * 2]     = (uint8_t)(v & 0xFF);
-            row[(x + i) * 2 + 1] = (uint8_t)(v >> 8);
+            row[(x + i) * 2]     = (uint8_t)(c.rgb565 & 0xFF);
+            row[(x + i) * 2 + 1] = (uint8_t)(c.rgb565 >> 8);
         }
     }
 }
@@ -2083,10 +2150,10 @@ static void v3_composite_boot(uint8_t *buf)
     if (boot_progress_bar_state(&g, &filled) && g.row + 1 < g_stream_h) {
         uint8_t *r0 = buf + (size_t)g.row * g_stream_pitch;
         uint8_t *r1 = r0 + g_stream_pitch;
-        v3_fill_px(r0, g.col,          (uint32_t)filled,                 9);
-        v3_fill_px(r0, g.col + filled, g.max_width - (uint32_t)filled, 0xC0);
-        v3_fill_px(r1, g.col,          (uint32_t)filled,                 1);
-        v3_fill_px(r1, g.col + filled, g.max_width - (uint32_t)filled, 0xC0);
+        v3_fill_px(r0, g.col,          (uint32_t)filled,               g.top);
+        v3_fill_px(r0, g.col + filled, g.max_width - (uint32_t)filled, g.bg);
+        v3_fill_px(r1, g.col,          (uint32_t)filled,               g.bottom);
+        v3_fill_px(r1, g.col + filled, g.max_width - (uint32_t)filled, g.bg);
     }
 }
 
@@ -2858,6 +2925,40 @@ static int eva_mode_read(int *out_mode, int *out_editctx, int *out_slot, int *ou
         *out_slot = slot;
     if (out_pid)
         *out_pid = pid;
+    return 1;
+}
+
+/* Reads mode_page_hook.ko's /proc/.mode_page_hook - read fresh every call
+ * (no caching), same live-read philosophy as eva_mode_read() above. Returns
+ * 1 and fills out_mode_lit/out_page_lit on success; returns 0 (leaving both
+ * untouched) if the module isn't loaded or the read/parse failed. Defined
+ * here (well before try_load_mode_page_hook(), which actually loads the
+ * module) purely so it's available to STATE's handler earlier in this same
+ * translation unit - this file has no header declarations, only definition
+ * order, matching eva_mode_read()'s own position right above it. */
+static int mode_page_hook_read(int *out_mode_lit, int *out_page_lit)
+{
+    char buf[160];
+    int fd, installed = 0, mode_lit = 0, page_lit = 0;
+    ssize_t n;
+
+    if (!g_mode_page_hook_loaded)
+        return 0;
+    fd = open("/proc/.mode_page_hook", O_RDONLY);
+    if (fd < 0)
+        return 0;
+    n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0)
+        return 0;
+    buf[n] = '\0';
+
+    if (sscanf(buf, "INSTALLED=%d TARGET=%*x TOTAL_CALLS=%*u MODE_LIT=%d PAGE_LIT=%d",
+               &installed, &mode_lit, &page_lit) != 3 || !installed)
+        return 0;
+
+    *out_mode_lit = mode_lit;
+    *out_page_lit = page_lit;
     return 1;
 }
 
@@ -3656,6 +3757,37 @@ static int cmd_class(const char *line)
  * update_boot_state() above), which is what actually decides whether
  * commands are accepted; this only affects what the video stream looks
  * like while that gate is closed. */
+/* Whether this unit shows a NAUTILUS boot screen rather than a Kronos one.
+ * The two are completely different mechanisms, and only the Kronos one needs
+ * anything composited at all:
+ *
+ *   Kronos 1/2 - the panel MCU renders the whole splash (KORG wordmark,
+ *     engine badges, "KRONOS / MUSIC WORKSTATION" title lockup) from a bitmap
+ *     baked into its own firmware, straight onto the LCD. It never reaches
+ *     fb1, so a client watching the stream would otherwise see an almost
+ *     black frame - hence the KSPL asset and apply_boot_splash().
+ *   Nautilus - its panel firmware contains no boot bitmap at all (a hard
+ *     negative result, see `Nautilus Research/MAIN/05_ui_eva/
+ *     nautilus_boot_splash_search.md`). The machine draws its own
+ *     near-full-screen NAUTILUS boot artwork into fb1 instead, so the live
+ *     capture already shows the real thing and there is nothing to
+ *     substitute - confirmed on real hardware 2026-09-22, when compositing a
+ *     wordmark here produced a visible SECOND logo over the machine's own.
+ *
+ * So this exists only to keep the Kronos asset off a Nautilus. Keyed on the
+ * panel subsystem's own hardware-version byte (/proc/OmapNKS4HardwareVersion;
+ * 2 = the Nautilus AM335x panel), because it is the PANEL that decides
+ * whether any boot artwork reaches fb1, with the framebuffer's native depth
+ * as a fallback for a unit whose panel byte is unreadable - exactly the same
+ * two signals, in the same priority order, detect_device_model() already
+ * reconciles for FAMILY=NAUTILUS. */
+static int is_nautilus_boot_screen(void)
+{
+    if (g_panel_hwver >= 0)
+        return g_panel_hwver == 2;
+    return fb1_native_bpp == 16;
+}
+
 #define BOOT_SPLASH_PATH  LOG_DIR "/boot_splash.bin"   /* FTP-visible - user deploys by hand, see docs/api.md */
 #define BOOT_SPLASH_MAGIC "KSPL"
 #define BOOT_SPLASH_VERSION 1
@@ -3771,6 +3903,17 @@ static uint32_t boot_splash_active_rows(void)
 {
     if (!g_boot_active || !g_boot_splash || g_boot_splash_w != fb_w)
         return 0;
+    /* Kronos-class panels only. The KSPL asset IS the Kronos panel firmware's
+     * own splash - KORG wordmark, engine badges, "KRONOS / MUSIC WORKSTATION"
+     * title lockup - and a Nautilus shows none of that on its real screen, so
+     * substituting it there would be actively wrong rather than merely
+     * imprecise. It also happens to validate on a Nautilus (same 800-pixel
+     * width, 526 rows <= this fb's 600), which is exactly how a stray
+     * boot_splash.bin/boot_splash_data.h built for a Kronos ended up being
+     * composited on one. A Nautilus needs no substitute - it puts its own
+     * boot artwork in fb1, which the live capture already carries. */
+    if (is_nautilus_boot_screen())
+        return 0;
     return g_boot_splash_rows;
 }
 
@@ -3793,17 +3936,30 @@ static void apply_boot_splash(uint8_t *buf)
  * hardware revision draws no bar at all, or the reconstructed geometry
  * doesn't fit the live framebuffer's resolution.
  *
- * Geometry/colours reconstructed from two independent disassemblies that land
- * on the same numbers: the host driver
- * (kronosology/reconstructed/OmapNKS4Module/driver.cpp,
- * COmapNKS4Driver::SetProgressBarPercent) and the panel firmware itself
- * (kronosology/reconstructed/K1_V06R06/clcdc.c, clcdc_progress_bar). The real
- * bar is exactly 2 scanlines tall - palette index 9 (bright red "highlight")
- * on the top row, index 1 (dim red "base") on the bottom row, for the filled
- * portion; the unfilled remainder is index 0xC0 (dark neutral grey) on both
- * rows - see apply_boot_progress_bar() below for where those indices actually
- * get written. Geometry forks on the panel's hardware-version byte - see
- * nks4_progress_read()'s own header comment for the Kronos-1-vs-2 mapping. */
+ * Everything forks on the panel subsystem's own hardware-version byte, which
+ * identifies the panel that draws the bar rather than the host board - see
+ * nks4_progress_read()'s own header comment for where that byte comes from.
+ * Each branch below carries its own source citation; in outline:
+ *
+ *   hwver 1 / 3 (Kronos 2) and the default branch (Kronos 1) - geometry and
+ *     colours reconstructed from two independent disassemblies that land on
+ *     the same numbers: the host driver
+ *     (kronosology/reconstructed/OmapNKS4Module/driver.cpp,
+ *     COmapNKS4Driver::SetProgressBarPercent) and the panel firmware itself
+ *     (kronosology/reconstructed/K1_V06R06/clcdc.c, clcdc_progress_bar). Two
+ *     scanlines tall, palette index 9 (bright red "highlight") on the top row
+ *     and index 1 (dim red "base") on the bottom for the filled portion, with
+ *     index 0xC0 (dark neutral grey) as the unfilled remainder on both rows.
+ *   hwver 2 (Nautilus) - same two scanlines, but ONE pink (RGB565 0xfaf4 =
+ *     255,93,165) for both filled rows and RGB565 0x4228 for the remainder,
+ *     at its own geometry, taken from that machine's own differently-built
+ *     OmapNKS4Module.ko. Before 3.1.0 this returned 0 here ("this hw rev
+ *     draws no bar at all"), read from the KRONOS module's hwver==2 early
+ *     return - true of that build, not of the Nautilus's own.
+ *
+ * apply_boot_progress_bar() / v3_composite_boot() / send_frame() are where
+ * the resulting colours actually get written; none of them knows which
+ * machine it is on. */
 static int boot_progress_bar_state(struct boot_bar_geom *g, int *out_filled)
 {
     int pct, hwver;
@@ -3813,9 +3969,43 @@ static int boot_progress_bar_state(struct boot_bar_geom *g, int *out_filled)
     if (!nks4_progress_read(&pct, &hwver))
         return 0;
 
-    if (hwver == 2)
-        return 0;   /* this hw rev draws no bar at all */
-    if (hwver == 1 || hwver == 3) {
+    if (hwver == 2) {
+        /* Nautilus / AM335x panel subsystem. Its OmapNKS4Module.ko is a
+         * DIFFERENT build from the Kronos one and takes its own branch in
+         * COmapNKS4Driver::SetProgressBarPercent - where the Kronos branches
+         * emit four 8bpp SendFillData opcodes (two rows x fill/remainder),
+         * this one emits two 16bpp SendFillData16 opcodes, each covering both
+         * rows at once, so both rows are ONE colour here rather than the
+         * Kronos's bright/dim red pair.
+         *
+         * Constants read straight out of that module's own hwver==2 path
+         * (/sbin/OmapNKS4Module.ko on a real Nautilus, HWVER=02, disassembled
+         * 2026-09-22):
+         *     mov  esi, 0x1f5                  ; bar width   = 501 px
+         *     imul eax, [screenWidth], 0x149   ; row         = 329
+         *     add  eax, 0x99                   ; col         = 153
+         *     mov  edx, 0x4228                 ; remainder   = RGB565 0x4228
+         *     movzx edi, word [progressBarFgColor16bpp]  ; = RGB565 0xfaf4
+         * 0xfaf4 expands to (255, 93, 165) - the pink the real unit shows,
+         * matching the colour reported from hardware; 0x4228 to (66, 69, 66),
+         * a dark neutral grey, the same role index 0xC0 plays on Kronos.
+         *
+         * Row 329 is in PANEL coordinates, i.e. the 800x480 the Nautilus LCD
+         * actually shows, which is exactly the crop the v3 stream carries -
+         * no rebasing needed. Confirmed correct on a real Nautilus boot
+         * 2026-09-22 - unlike the Kronos 2 numbers below, these needed no
+         * empirical nudge on top of the disassembly.
+         *
+         * Also confirmed NECESSARY, the same day, by muting this branch for
+         * one boot: the bar then vanished from the stream entirely. So the
+         * Nautilus splits the two - it draws its boot LOGO into fb1 (which
+         * is why nothing is composited for that, see
+         * is_nautilus_boot_screen()) but draws its progress BAR panel-side
+         * over USB, exactly as Kronos does, where fb1 never sees it. */
+        g->row = 329; g->col = 153; g->max_width = 501;
+        g->top = g->bottom = bar_color_565(0xfaf4);
+        g->bg  = bar_color_565(0x4228);
+    } else if (hwver == 1 || hwver == 3) {
         /* Kronos 2 / D2550. row=434/col=75 are the raw reconstructed constants
          * (driver.cpp's SetProgressBarPercent); EMPIRICALLY CORRECTED 2026-07-19
          * against a real D2550 unit (HWVER=01) - the raw constants rendered 3px
@@ -3827,8 +4017,10 @@ static int boot_progress_bar_state(struct boot_bar_geom *g, int *out_filled)
          * stays visible. The Kronos 1 branch below has NOT been verified
          * against real hardware and may need the same kind of correction. */
         g->row = 433; g->col = 78;  g->max_width = 650;   /* Kronos 2 / D2550 */
+        g->top = bar_color_idx(9); g->bottom = bar_color_idx(1); g->bg = bar_color_idx(0xC0);
     } else {
         g->row = 348; g->col = 146; g->max_width = 512;   /* Kronos 1 (v06R06) and unknown/default - UNVERIFIED against real hardware */
+        g->top = bar_color_idx(9); g->bottom = bar_color_idx(1); g->bg = bar_color_idx(0xC0);
     }
     if (g->row + 1 >= fb_h || g->col + g->max_width > fb_w)
         return 0;   /* doesn't fit this resolution - skip rather than write out of bounds */
@@ -3854,10 +4046,10 @@ static void apply_boot_progress_bar(uint8_t *buf)
     int filled;
     if (!boot_progress_bar_state(&g, &filled))
         return;
-    memset(buf + g.row       * fb_w + g.col,          9,    (size_t)filled);
-    memset(buf + g.row       * fb_w + g.col + filled, 0xC0, (size_t)(g.max_width - filled));
-    memset(buf + (g.row + 1) * fb_w + g.col,          1,    (size_t)filled);
-    memset(buf + (g.row + 1) * fb_w + g.col + filled, 0xC0, (size_t)(g.max_width - filled));
+    memset(buf + g.row       * fb_w + g.col,          g.top.idx,    (size_t)filled);
+    memset(buf + g.row       * fb_w + g.col + filled, g.bg.idx,     (size_t)(g.max_width - filled));
+    memset(buf + (g.row + 1) * fb_w + g.col,          g.bottom.idx, (size_t)filled);
+    memset(buf + (g.row + 1) * fb_w + g.col + filled, g.bg.idx,     (size_t)(g.max_width - filled));
 }
 
 /* eSTGAnalogDeviceCode raw byte packing, derived from ShortInvertNkS4AnalogValue's
@@ -4410,6 +4602,68 @@ static int disk_mb(const char *path, unsigned long *free_mb, unsigned long *tota
     return 1;
 }
 
+/* Hardware-monitor probe discovery limits. Ten hwmon devices and twelve
+ * temperature inputs each covers every board this project has seen with
+ * room to spare (the widest, nct6793, exposes ten), and the combined cap
+ * bounds the on-stack probe table. */
+#define SI_HWMON_MAX    10
+#define SI_HWMON_TEMPS  12
+#define SI_PROBE_MAX    24
+
+/* Is this reading worth putting in front of a user at all?
+ *
+ * Both bounds exclude readings that cannot be a real temperature rather
+ * than merely a surprising one. <= 0 is the "input present but nothing
+ * connected/enabled" case (the nct6793's PECI and PCH_* inputs all read
+ * exactly 0 on a Nautilus). >= 100 C is the unconnected-analog-input case:
+ * a floating AUXTIN/SYSTIN pin reads 110-127 C, which is both physically
+ * impossible for a board that is still running and well above the point any
+ * of these CPUs would have thermal-throttled or shut down. A genuinely hot
+ * unit is not silenced by this - implausible readings are still reported
+ * verbatim as SENSORn, and if EVERY probe fails this test the caller falls
+ * back to reporting them all. */
+static int si_temp_plausible(int milli)
+{
+    return milli > 0 && milli < 100000;
+}
+
+/* How good a CPU-temperature candidate this probe is; higher wins, and the
+ * first probe at the winning score is kept. Scores are ordered by how
+ * directly the sensor measures the CPU:
+ *
+ *   coretemp    - Intel's on-die DTS. The only sensor that is definitively
+ *                 the CPU, so it outranks everything. Within it, a
+ *                 package-wide reading beats an individual core.
+ *   CPUTIN      - the Winbond/Nuvoton super-I/O convention for the header
+ *                 wired to the CPU thermal diode. The right answer on the
+ *                 Nautilus / Kronos 3 board.
+ *   *CPU*       - any other label naming the CPU, except the PCH's own
+ *                 CPU-related registers (PCH_CPU_TEMP,
+ *                 PCH_CHIP_CPU_MAX_TEMP) - those are chipset readings that
+ *                 merely have "CPU" in the name, and read 0 on hardware here.
+ *   acpitz      - the ACPI thermal zone: real and board-independent, but
+ *                 coarse and often tracking the board rather than the die.
+ *                 A fallback, not a choice.
+ *   everything else scores 0, so on a board whose chip publishes no labels
+ *   at all (older super-I/O drivers on this kernel) the first plausible
+ *   probe wins - i.e. exactly the pre-selection behaviour, unchanged.
+ *
+ * Labels arrive via read_sys_string(), which maps spaces to underscores -
+ * hence "Package_id_0"/"Core_0" rather than the sysfs spelling. */
+static int si_cpu_probe_score(const char *chip, const char *label)
+{
+    if (strcmp(chip, "coretemp") == 0) {
+        if (strncmp(label, "Package_id", 10) == 0 ||
+            strncmp(label, "Physical_id", 11) == 0) return 100;
+        if (strncmp(label, "Core_", 5) == 0)        return 90;
+        return 80;
+    }
+    if (strcmp(label, "CPUTIN") == 0)                          return 70;
+    if (strstr(label, "CPU") && !strstr(label, "PCH"))         return 60;
+    if (strcmp(chip, "acpitz") == 0)                           return 20;
+    return 0;
+}
+
 /* Build a SYSINFO response into out[outsz].  Returns bytes written.
  * Updates g_si_prev so successive calls yield accurate CPU deltas.
  * Must only be called when a client is connected (no background polling). */
@@ -4552,10 +4806,34 @@ static int sysinfo_collect(char *out, int outsz)
             SI_APPEND("DISK_FREE_MB=%lu\nDISK_TOTAL_MB=%lu\n", free_mb, total_mb);
     }
 
-    /*  /korg/rw2 disk space (SSD 2) */
+    /*  /korg/rw2 disk space (SSD 2) - reported ONLY when a second SSD is
+     * actually mounted there.
+     *
+     * /korg/rw2 is an ordinary empty directory that ships on the root
+     * filesystem of every unit, second SSD or not (confirmed on a real
+     * Nautilus 2026-09-22: mode 755, owner pocky, dated 2014, and absent
+     * from /proc/mounts entirely). statvfs() on it therefore always
+     * succeeds and reports the ROOT filesystem - which is how a unit with
+     * one SSD ended up advertising a ~1 GB "SSD 2" to the client, being the
+     * free space on /dev/root rather than any second disk at all.
+     *
+     * The test is the standard mount-point check: a directory that is a
+     * mount lives on a different st_dev from its parent. That is stronger
+     * than scanning /proc/mounts for the path, because it also rejects a
+     * bind mount of the root filesystem (same st_dev, so still not a second
+     * disk) which a /proc/mounts match would happily accept. stat() is used
+     * rather than fstat() - see load_boot_splash()'s header comment for why
+     * fstat() is unconditionally broken on this kernel.
+     *
+     * Emitting nothing is exactly what the client wants: it hides its whole
+     * RW2 section when RW2_TOTAL_MB is absent/zero, so no client change is
+     * needed for a single-SSD unit to stop showing a phantom volume. */
     {
         unsigned long free_mb, total_mb;
-        if (disk_mb("/korg/rw2", &free_mb, &total_mb))
+        struct stat st_rw2, st_parent;
+        if (stat("/korg/rw2", &st_rw2) == 0 && stat("/korg", &st_parent) == 0 &&
+                st_rw2.st_dev != st_parent.st_dev &&
+                disk_mb("/korg/rw2", &free_mb, &total_mb))
             SI_APPEND("RW2_FREE_MB=%lu\nRW2_TOTAL_MB=%lu\n", free_mb, total_mb);
     }
 
@@ -4581,74 +4859,176 @@ static int sysinfo_collect(char *out, int outsz)
         SI_APPEND("USB_COUNT=%d\n", usb_n);
     }
 
-    /* Hardware monitor */
-    /* hwmon index is non-deterministic across boots/module loads.
-     * Try hwmon0..4 with both the old /device/ sub-path and the
-     * newer direct layout. */
+    /* Hardware monitor - probe discovery and CPU-sensor selection.
+     *
+     * Two things here are board-dependent and must NOT be assumed:
+     *
+     *   1. WHICH hwmon device. The index is non-deterministic across boots
+     *      and module loads, and a board can expose more than one chip at
+     *      once (typically a super-I/O monitor AND Intel's coretemp). The
+     *      old code took the first hwmon0..4 that answered temp1_input and
+     *      stopped, so on a board where the super-I/O enumerates first,
+     *      coretemp - the only true CPU-die sensor - was never even looked
+     *      at. Both sysfs layouts are still tried per device: the modern
+     *      direct one and this kernel-era's /device/ sub-path.
+     *
+     *   2. WHICH probe on that chip is the CPU. Super-I/O chips expose
+     *      every input they physically have, wired or not, and an
+     *      unconnected input does not read as an error - it reads as a
+     *      plausible-looking number. On the Nautilus / Kronos 3 board
+     *      (ASRock N3160TM-ITX-K, nct6793, measured 2026-09-22) temp1
+     *      SYSTIN reads 117 C and temp4-6 AUXTIN1-3 read 110 C, all
+     *      unconnected, while the REAL CPU sensor is temp2 CPUTIN at 35 C.
+     *      Reporting temp1 as "the" temperature is what put a 113 C CPU in
+     *      front of the user. (That board has no coretemp at all, by the
+     *      way: this kernel's coretemp rejects the N3160 outright -
+     *      "coretemp: Unknown CPU model 4c" in dmesg - so the super-I/O is
+     *      the only source there, and picking the right probe on it is the
+     *      whole game.)
+     *
+     * So: collect every temperature input on every chip, score each one as
+     * a CPU-temperature candidate, and let the best score win. TEMP1..TEMPn
+     * are then the SELECTED, plausible probes with the CPU first - TEMP1 is
+     * what the client displays, so it has to be the one worth displaying.
+     * Every raw input stays available unfiltered as SENSORn for
+     * diagnostics, so nothing that used to be visible has been lost, and an
+     * implausible reading is still reportable without being promoted to the
+     * headline number. */
     {
-        char  tpath[80];
-        int   tv;
-        /* Temperatures - use whichever hwmon responds for temp1 */
-        int   hwmon_base = -1;
-        int   use_device = 0;
-        for (int hi = 0; hi <= 4 && hwmon_base < 0; hi++) {
-            /* try new ABI first (direct), then old ABI (/device/) */
-            snprintf(tpath, sizeof(tpath),
-                     "/sys/class/hwmon/hwmon%d/temp1_input", hi);
-            f = fopen(tpath, "r");
-            if (f) { fclose(f); hwmon_base = hi; use_device = 0; continue; }
-            snprintf(tpath, sizeof(tpath),
-                     "/sys/class/hwmon/hwmon%d/device/temp1_input", hi);
-            f = fopen(tpath, "r");
-            if (f) { fclose(f); hwmon_base = hi; use_device = 1; }
-        }
-        if (hwmon_base >= 0) {
-            const char *sub = use_device ? "/device" : "";
-            int temp_cpu = -1000, fan_rpm = -1;
-            char hname[32] = "";
-            snprintf(tpath, sizeof(tpath), "/sys/class/hwmon/hwmon%d%s/name", hwmon_base, sub);
-            read_sys_string(tpath, hname, sizeof(hname));
-            SI_APPEND("HWMON=%s\n", hname[0] ? hname : "UNKNOWN");
-            /* Every temperature input the chip exposes, with its label. On the
-             * Nautilus/Kronos 3 board (ASRock N3160TM-ITX-K, NCT6793) SYSTIN
-             * and AUXTIN1-3 are unconnected inputs that read 109-116 C - real
-             * artefacts of the sensor, reported as-is; TEMP_CPU below is the
-             * one to display. TEMP1-3/FAN1_RPM keep their pre-3.0.2 meaning. */
-            for (int i = 1; i <= 10; i++) {
-                char lbl[32] = "";
+        char tpath[96];
+        int  tv;
+
+        struct si_probe { char chip[24]; char label[32]; int milli; };
+        struct si_probe probes[SI_PROBE_MAX];
+        int  np = 0;
+        int  sel[SI_PROBE_MAX];      /* indices into probes[], selected order */
+        int  nsel = 0;
+        int  best = -1, best_score = -1;
+        int  fan_dev = -1, fan_use_device = 0;
+
+        for (int hi = 0; hi < SI_HWMON_MAX && np < SI_PROBE_MAX; hi++) {
+            char chip[24] = "";
+            const char *sub = NULL;
+
+            /* Pick ONE layout per device, direct first. Testing both and
+             * keeping both would double-count every probe, because
+             * hwmonN/device/ is frequently a valid path to the same chip. */
+            for (int dv = 0; dv < 2 && !sub; dv++) {
+                const char *try_sub = dv ? "/device" : "";
                 snprintf(tpath, sizeof(tpath),
-                         "/sys/class/hwmon/hwmon%d%s/temp%d_input",
-                         hwmon_base, sub, i);
+                         "/sys/class/hwmon/hwmon%d%s/temp1_input", hi, try_sub);
+                f = fopen(tpath, "r");
+                if (!f) {
+                    snprintf(tpath, sizeof(tpath),
+                             "/sys/class/hwmon/hwmon%d%s/fan1_input", hi, try_sub);
+                    f = fopen(tpath, "r");
+                }
+                if (f) { fclose(f); sub = try_sub; }
+            }
+            if (!sub)
+                continue;
+
+            snprintf(tpath, sizeof(tpath), "/sys/class/hwmon/hwmon%d%s/name", hi, sub);
+            read_sys_string(tpath, chip, sizeof(chip));
+
+            for (int i = 1; i <= SI_HWMON_TEMPS && np < SI_PROBE_MAX; i++) {
+                snprintf(tpath, sizeof(tpath),
+                         "/sys/class/hwmon/hwmon%d%s/temp%d_input", hi, sub, i);
                 f = fopen(tpath, "r");
                 if (!f) continue;
-                tv = 0; fscanf(f, "%d", &tv); fclose(f);
+                tv = 0;
+                if (fscanf(f, "%d", &tv) != 1) tv = 0;
+                fclose(f);
+
+                snprintf(probes[np].chip, sizeof(probes[np].chip), "%s",
+                         chip[0] ? chip : "unknown");
+                probes[np].label[0] = '\0';
                 snprintf(tpath, sizeof(tpath),
-                         "/sys/class/hwmon/hwmon%d%s/temp%d_label",
-                         hwmon_base, sub, i);
-                read_sys_string(tpath, lbl, sizeof(lbl));
-                SI_APPEND("TEMP%d=%d\n", i, tv / 1000);
-                if (lbl[0]) SI_APPEND("TEMP%d_LABEL=%s\n", i, lbl);
-                if (temp_cpu == -1000 && lbl[0] &&
-                    (strcmp(lbl, "CPUTIN") == 0 || strstr(lbl, "CPU")) && tv > 0 && tv < 100000)
-                    temp_cpu = tv / 1000;
+                         "/sys/class/hwmon/hwmon%d%s/temp%d_label", hi, sub, i);
+                read_sys_string(tpath, probes[np].label, sizeof(probes[np].label));
+                probes[np].milli = tv;
+                np++;
             }
+
+            if (fan_dev < 0) {
+                snprintf(tpath, sizeof(tpath),
+                         "/sys/class/hwmon/hwmon%d%s/fan1_input", hi, sub);
+                f = fopen(tpath, "r");
+                if (f) { fclose(f); fan_dev = hi; fan_use_device = (sub[0] != '\0'); }
+            }
+        }
+
+        /* The ACPI thermal zone is a last-resort CPU candidate and a useful
+         * extra reading in its own right - it is a real, board-independent
+         * sensor, just a coarse one. Kept in the same pool so it can fill a
+         * TEMPn slot on a board whose super-I/O has almost nothing wired. */
+        f = fopen("/sys/class/thermal/thermal_zone0/temp", "r");
+        if (f) {
+            tv = 0;
+            if (fscanf(f, "%d", &tv) != 1) tv = 0;
+            fclose(f);
+            SI_APPEND("TEMP_ACPI=%d\n", tv / 1000);
+            if (np < SI_PROBE_MAX) {
+                snprintf(probes[np].chip,  sizeof(probes[np].chip),  "acpitz");
+                snprintf(probes[np].label, sizeof(probes[np].label), "acpitz");
+                probes[np].milli = tv;
+                np++;
+            }
+        }
+        for (int i = 0; i < np; i++) {
+            SI_APPEND("SENSOR%d=%s %s %d\n", i + 1, probes[i].chip,
+                      probes[i].label[0] ? probes[i].label : "-",
+                      probes[i].milli / 1000);
+            if (!si_temp_plausible(probes[i].milli))
+                continue;
+            int sc = si_cpu_probe_score(probes[i].chip, probes[i].label);
+            if (sc > best_score) { best_score = sc; best = i; }
+        }
+
+        if (best >= 0) {
+            sel[nsel++] = best;
+            for (int i = 0; i < np && nsel < SI_PROBE_MAX; i++)
+                if (i != best && si_temp_plausible(probes[i].milli))
+                    sel[nsel++] = i;
+        } else {
+            /* Nothing looked plausible - report the raw order rather than
+             * nothing at all, which is exactly what this block did before
+             * any selection existed. A unit genuinely running hot must
+             * still be able to say so. */
+            for (int i = 0; i < np && nsel < SI_PROBE_MAX; i++)
+                sel[nsel++] = i;
+        }
+
+        if (nsel > 0) {
+            SI_APPEND("HWMON=%s\n", probes[sel[0]].chip);
+            for (int i = 0; i < nsel; i++) {
+                struct si_probe *pr = &probes[sel[i]];
+                SI_APPEND("TEMP%d=%d\n", i + 1, pr->milli / 1000);
+                if (pr->label[0]) SI_APPEND("TEMP%d_LABEL=%s\n", i + 1, pr->label);
+            }
+            if (best >= 0) {
+                SI_APPEND("TEMP_CPU=%d\n", probes[best].milli / 1000);
+                SI_APPEND("TEMP_CPU_SRC=%s %s\n", probes[best].chip,
+                          probes[best].label[0] ? probes[best].label : "-");
+            }
+        }
+
+        if (fan_dev >= 0) {
+            const char *sub = fan_use_device ? "/device" : "";
+            int fan_rpm = -1;
             for (int i = 1; i <= 5; i++) {
                 snprintf(tpath, sizeof(tpath),
-                         "/sys/class/hwmon/hwmon%d%s/fan%d_input",
-                         hwmon_base, sub, i);
+                         "/sys/class/hwmon/hwmon%d%s/fan%d_input", fan_dev, sub, i);
                 f = fopen(tpath, "r");
                 if (!f) continue;
-                tv = 0; fscanf(f, "%d", &tv); fclose(f);
+                tv = 0;
+                if (fscanf(f, "%d", &tv) != 1) tv = 0;
+                fclose(f);
                 SI_APPEND("FAN%d_RPM=%d\n", i, tv);
                 if (fan_rpm < 0 && tv > 0) fan_rpm = tv;
             }
-            /* The values a UI should show: the CPU sensor (by label), the
-             * first fan header that is actually spinning, and the ACPI zone. */
-            if (temp_cpu != -1000) SI_APPEND("TEMP_CPU=%d\n", temp_cpu);
-            if (fan_rpm >= 0)      SI_APPEND("FAN_RPM=%d\n", fan_rpm);
+            if (fan_rpm >= 0) SI_APPEND("FAN_RPM=%d\n", fan_rpm);
         }
-        f = fopen("/sys/class/thermal/thermal_zone0/temp", "r");
-        if (f) { tv = 0; fscanf(f, "%d", &tv); fclose(f); SI_APPEND("TEMP_ACPI=%d\n", tv / 1000); }
     }
 
     /* Mode - forced to the safe 0/0 "unknown"/"none" sentinels during boot,
@@ -6005,8 +6385,9 @@ static void process_ctrl_cmd(const char *line, int fd)
         REPLY_S("OK\n");
 
     } else if (strcmp(line, "STATE") == 0) {
-        char resp[48];
+        char resp[96];
         int  rlen, mode, editctx; const char *src;
+        int  mode_lit = 0, page_lit = 0, have_mode_page;
         get_mode_state(&mode, &editctx, &src);
         /* Don't report synth state we don't trust yet - see update_boot_state()'s
          * block comment for exactly why a raw eva_mode.ko/pixel reading can look
@@ -6018,8 +6399,17 @@ static void process_ctrl_cmd(const char *line, int fd)
          * accurate - it's how a client knows to stop trusting 0/0 as a real
          * reading and start polling again. */
         if (g_boot_active) { mode = 0; editctx = 0; }
-        rlen = snprintf(resp, sizeof(resp), "MODE=%u EDITCTX=%d BOOT=%d\n",
-                         (unsigned)mode, editctx, g_boot_active);
+        /* MODE_LIT/PAGE_LIT: Nautilus-only front-panel LED state for the MODE/
+         * PAGE popup-toggle buttons - a software toggle, not a hardware read
+         * (see mode_page_hook.c's header comment). Omitted entirely on
+         * Kronos, same conditional-omission convention as RW2_* in SYSINFO -
+         * those buttons don't exist there. */
+        have_mode_page = strcmp(g_model_family, "NAUTILUS") == 0 &&
+                          mode_page_hook_read(&mode_lit, &page_lit);
+        rlen = snprintf(resp, sizeof(resp),
+                         have_mode_page ? "MODE=%u EDITCTX=%d BOOT=%d MODE_LIT=%d PAGE_LIT=%d\n"
+                                        : "MODE=%u EDITCTX=%d BOOT=%d\n",
+                         (unsigned)mode, editctx, g_boot_active, mode_lit, page_lit);
         REPLY(resp, (size_t)rlen);
 
     } else if (strcmp(line, "MODE_DETAIL") == 0) {
@@ -6094,7 +6484,7 @@ static void process_ctrl_cmd(const char *line, int fd)
         REPLY(resp, (size_t)rlen);
 
     } else if (strcmp(line, "SYSINFO") == 0) {
-        char si[2048];
+        char si[4096];
         int  silen = sysinfo_collect(si, (int)sizeof(si));
         REPLY(si, (size_t)silen);
 
@@ -6738,6 +7128,65 @@ static int try_load_nks4_inject(int live_wait_ds)
     }
     fprintf(stderr, "screenremote: nks4_inject failed (%ld)\n", ret);
     return -1;
+}
+
+/* Loads mode_page_hook.ko - see its own header comment for why this is
+ * safe, and g_mode_page_hook_loaded's own comment for why this is
+ * NAUTILUS-ONLY. Callers gate on g_nks4_loaded (HandleSwitchEvent's
+ * kallsyms entry only exists once OA is Live) and
+ * g_model_family=="NAUTILUS". Not retried if it fails: no client-visible
+ * command depends on this loading - MODE_LIT/PAGE_LIT just won't appear in
+ * STATE - so a permanent failure is logged and left at that.
+ *
+ * Resolves HandleSwitchEvent's address via its own single-symbol
+ * kallsyms_resolve() probe rather than reusing nks4_inject's fn_switch (a
+ * local variable inside try_load_nks4_inject(), not exposed) - keeps the
+ * two features decoupled. */
+static void try_load_mode_page_hook(void)
+{
+    unsigned long fn_switch = 0;
+    char params[64];
+    long ret;
+    int fd, i;
+
+    if (g_mode_page_hook_loaded)
+        return;
+
+    {
+        struct sym_probe probes[] = {
+            { "HandleSwitchEventE14eSTGButtonCodeb", &fn_switch },
+        };
+        kallsyms_resolve(probes, (int)(sizeof(probes) / sizeof(probes[0])));
+    }
+    if (!fn_switch) {
+        fprintf(stderr, "screenremote: mode_page_hook: HandleSwitchEvent not in "
+                "kallsyms - MODE/PAGE LED tracking unavailable\n");
+        return;
+    }
+
+    snprintf(params, sizeof(params), "target=0x%lx", fn_switch);
+    extract_ko(MODE_PAGE_HOOK_KO, mode_page_hook_ko, mode_page_hook_ko_len);
+    ret = syscall(SYS_init_module, (void *)mode_page_hook_ko,
+                  (unsigned long)mode_page_hook_ko_len, params);
+    if (ret != 0 && errno != EEXIST) {
+        fprintf(stderr, "screenremote: mode_page_hook load failed (%ld) - "
+                "MODE/PAGE LED tracking unavailable\n", ret);
+        return;
+    }
+
+    fd = -1;
+    for (i = 0; i < 20 && fd < 0; i++) {
+        usleep(100000);
+        fd = open("/proc/.mode_page_hook", O_RDONLY);
+    }
+    if (fd < 0) {
+        fprintf(stderr, "screenremote: mode_page_hook loaded but /proc/.mode_page_hook "
+                "never appeared - MODE/PAGE LED tracking unavailable\n");
+        return;
+    }
+    close(fd);
+    g_mode_page_hook_loaded = 1;
+    fprintf(stderr, "screenremote: mode_page_hook loaded\n");
 }
 
 /* ---- Boot kernel-log capture (stock non-rooted diagnosis) ---------------
@@ -7595,6 +8044,18 @@ int main(void)
                 rebind_module_load = 0;
             }
         }
+
+        /* mode_page_hook.ko: Nautilus only - see g_mode_page_hook_loaded's
+         * own comment for why. Checked every tick; fires at most once
+         * (g_mode_page_hook_loaded latches). Placed in the main loop rather
+         * than at either try_load_nks4_inject() call site because
+         * detect_device_model() (which sets g_model_family) is a one-time
+         * synchronous call in main() before the loop starts, so every loop
+         * iteration is guaranteed to see it populated regardless of when
+         * nks4_inject itself finished loading. */
+        if (g_nks4_loaded && !g_mode_page_hook_loaded &&
+            strcmp(g_model_family, "NAUTILUS") == 0)
+            try_load_mode_page_hook();
 
         /* Deferred sm_pommi_addr autodetect retry - own block, same shape as
          * nks4_inject's above (own throttle/give-up-anchor vars, doesn't share
