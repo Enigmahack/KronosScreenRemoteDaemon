@@ -37,8 +37,12 @@
  *   TOUCH_DOWN nx ny        - pen-down only
  *   TOUCH_MOVE nx ny        - pen-move (client coalesces consecutive moves)
  *   TOUCH_UP nx ny          - pen-up only
- *   BUTTON name             - press + release a named front-panel button (see btn_table[])
- *   CHORD [hold_ms] name1 name2 ...  - press left-to-right, release right-to-left
+ *   BTN code                - press + release raw NKS4 button code 0-127 (no name lookup)
+ *   BTN_DOWN code           - press only; held until BTN_UP, owner loss, ctrl session
+ *                              close, or BTN_HOLD_MAX_S (see g_btn_held)
+ *   BTN_UP code             - release only
+ *   BUTTON name             - DEPRECATED: press + release a named Kronos button (btn_table[])
+ *   CHORD [hold_ms] name1 name2 ...  - DEPRECATED: press left-to-right, release right-to-left
  *   WHEEL CW|CCW            - one data-wheel tick clockwise or counter-clockwise
  *   SLIDER n value          - set physical Slider n (1 - 8) to value (0 - 127)
  *   KNOB n value            - set physical RT Knob n (1 - 8) to value (0 - 127)
@@ -88,6 +92,9 @@
  *                              caller confirm eva_mode.ko is in play rather than the pixel
  *                              fallback without needing to infer it from SOURCE alone.
  *   VERSION                 -> VER=x.x.x BUILD=xxx\n
+ *   CAL_GET                 -> CAL <text>\n | CAL NONE\n  (owner only; the client's touch
+ *                              calibration mesh, stored on the unit - see cal_store())
+ *   CAL_SET <text>          -> OK\n | ERR INVALID\n | ERR WRITE_FAILED\n
  *   MODEL                   -> FAMILY=KRONOS|NAUTILUS MODEL=<code> FB_BPP=8|16\n
  *                            Which physical unit this daemon is running on - see
  *                              detect_device_model()'s header comment for how FAMILY (from
@@ -232,7 +239,7 @@
 #define KBD_EV_KEY  1
 
 /*  Version */
-#define SCREENREMOTE_VERSION "3.1.1"
+#define SCREENREMOTE_VERSION "3.1.2"
 #ifndef BUILD_ID
 #define BUILD_ID "dev"
 #endif
@@ -2674,6 +2681,78 @@ static int nks4_write(const char *fmt, ...)
     return write_all(nks4_fd, buf, (size_t)n) == 0 ? 0 : -1;
 }
 
+/* Raw button codes held by BTN_DOWN and not yet released.  A client that sends
+ * BTN_DOWN is assumed to still be holding the button until it sends BTN_UP, so
+ * the daemon never releases one on its own except as a safety net:
+ *   - the owner that pressed it is no longer the control owner (stream client
+ *     disconnected, replaced, or the listen IP was rebound),
+ *   - the persistent ctrl session closed (see ctrl_fd_close()),
+ *   - BTN_HOLD_MAX_S passed since the last BTN_DOWN for that code,
+ *   - the daemon is shutting down.
+ * Indexed by the raw code (0-127), so a repeated BTN_DOWN for a held code just
+ * refreshes its owner and timer. */
+#define BTN_CODE_MAX   127
+#define BTN_HOLD_MAX_S 15
+static struct {
+    unsigned char   held;
+    uint32_t        owner;
+    struct timespec since;
+} g_btn_held[BTN_CODE_MAX + 1];
+
+/* Strict decimal 0-127 with nothing trailing; -1 otherwise.  Out-of-range codes
+ * are rejected rather than clamped: a clamped code is a different button. */
+static int btn_parse_code(const char *s)
+{
+    int v = 0, digits = 0;
+
+    for (; *s >= '0' && *s <= '9'; s++) {
+        v = v * 10 + (*s - '0');
+        if (++digits > 3) return -1;
+    }
+    if (digits == 0 || *s != '\0' || v > BTN_CODE_MAX) return -1;
+    return v;
+}
+
+static void btn_held_set(int code)
+{
+    g_btn_held[code].held  = 1;
+    g_btn_held[code].owner = g_ctrl_allowed_ip;
+    clock_gettime(CLOCK_MONOTONIC, &g_btn_held[code].since);
+}
+
+static void btn_held_release(int code, const char *why)
+{
+    if (!g_btn_held[code].held) return;
+    g_btn_held[code].held = 0;
+    nks4_write("BTN_UP %d\n", code);
+    fprintf(stderr, "screenremote: released held button %d (%s)\n", code, why);
+}
+
+static void btn_held_release_all(const char *why)
+{
+    int c;
+    for (c = 0; c <= BTN_CODE_MAX; c++)
+        btn_held_release(c, why);
+}
+
+/* Main-loop safety net: release anything whose owner lost control or whose
+ * hold outlived BTN_HOLD_MAX_S.  Resolution is the main loop's select()
+ * timeout (at most 1 s), which is fine against a 15 s limit. */
+static void btn_held_pump(void)
+{
+    struct timespec now;
+    int c;
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    for (c = 0; c <= BTN_CODE_MAX; c++) {
+        if (!g_btn_held[c].held) continue;
+        if (g_btn_held[c].owner != g_ctrl_allowed_ip)
+            btn_held_release(c, "owner gone");
+        else if (now.tv_sec - g_btn_held[c].since.tv_sec >= BTN_HOLD_MAX_S)
+            btn_held_release(c, "hold timeout");
+    }
+}
+
 /* Reads onscreen_touch_pad_mode from /proc/.nks4inject_status - this is
  * CSTGFrontPanel::sInstance[0x104], which nks4_inject.c already exposes
  * read-only (see its own touch_pad_mode_read()). Confirmed (2026-07-14, via
@@ -3795,6 +3874,66 @@ static void update_boot_state(void)
     }
 }
 
+/* Touch calibration storage.
+ *
+ * The client's calibration mesh describes this unit's touch panel, so it lives
+ * on the unit rather than on whichever PC happens to connect: one file,
+ * LOG_DIR/calibration.txt, reachable over FTP so a user can delete it to go
+ * back to an uncalibrated mapping. The daemon never interprets the text, it
+ * only stores and returns it; the format belongs to the client ("G=<n>
+ * M=<c,r,dx,dy;...> D=<x,y;...>"). cal_text_valid() limits it to that
+ * character set and length so the file can't hold anything else. */
+#define CAL_FILE     LOG_DIR "/calibration.txt"
+#define CAL_TEXT_MAX 4096
+
+static int cal_text_valid(const char *t)
+{
+    size_t n = 0;
+    for (; t[n]; n++) {
+        if (n >= CAL_TEXT_MAX) return 0;
+        if (!strchr("0123456789-,;= GMD", t[n])) return 0;
+    }
+    return n > 0;
+}
+
+/* Same-directory temp file + rename, so a power loss mid-write leaves either
+ * the old file or the new one, never a truncated one. */
+static int cal_store(const char *text)
+{
+    const char *tmp = CAL_FILE ".tmp";
+    size_t len = strlen(text);
+    int fd, ok;
+
+    mkdir(LOG_DIR, 0775);
+    fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return -1;
+    set_cloexec(fd);
+    ok = write_all(fd, text, len) == 0 && write_all(fd, "\n", 1) == 0 && fsync(fd) == 0;
+    close(fd);
+    if (!ok || rename(tmp, CAL_FILE) != 0) {
+        unlink(tmp);
+        return -1;
+    }
+    return 0;
+}
+
+/* 0 and the stored text (trailing newline stripped) if a valid calibration
+ * file exists; -1 if it is missing, unreadable or not valid calibration text. */
+static int cal_load(char *out, size_t outsz)
+{
+    FILE *f = fopen(CAL_FILE, "r");
+    size_t n;
+
+    if (!f) return -1;
+    set_cloexec(fileno(f));
+    n = fread(out, 1, outsz - 1, f);
+    fclose(f);
+    out[n] = '\0';
+    while (n > 0 && (out[n - 1] == '\n' || out[n - 1] == '\r'))
+        out[--n] = '\0';
+    return cal_text_valid(out) ? 0 : -1;
+}
+
 /* Command classes for access control and the boot gate (see docs/api.md's
  * "Read-only allowlist exception" and update_boot_state()'s block comment):
  *   CMD_RO_ALWAYS    - read-only AND answered even during boot: STATE/
@@ -3808,12 +3947,16 @@ static void update_boot_state(void)
  *                      exists while BOOT=1) or, for PIXEL/REGION, could be read
  *                      as a claim about live UI content that isn't trustworthy
  *                      yet.
+ *   CMD_OWNER_ALWAYS - ownership required but answered even during boot:
+ *                      CAL_GET, which a client reads once right after
+ *                      connecting (often while the unit is still booting).
  *   CMD_MUTATING     - everything else: ownership required, rejected in boot.
  * Shared by the ctrl-accept path (ownership bypass) and process_ctrl_cmd()
  * (boot-gate enforcement) so the two can never drift apart. */
 #define CMD_MUTATING      0
 #define CMD_RO_BOOTGATED  1
 #define CMD_RO_ALWAYS     2
+#define CMD_OWNER_ALWAYS  3
 static int cmd_class(const char *line)
 {
     if (strcmp(line, "PALETTE") == 0 ||
@@ -3829,6 +3972,8 @@ static int cmd_class(const char *line)
         strncmp(line, "PIXEL ", 6) == 0 ||
         strncmp(line, "REGION ", 7) == 0)
         return CMD_RO_BOOTGATED;
+    if (strcmp(line, "CAL_GET") == 0)
+        return CMD_OWNER_ALWAYS;
     return CMD_MUTATING;
 }
 
@@ -5805,6 +5950,7 @@ static void ctrl_fd_close(void)
         sysex_cap_offset = 0;
         sysex_in_f0      = 0;
     }
+    btn_held_release_all("ctrl session closed");
     close(ctrl_fd);
     ctrl_fd          = -1;
     ctrl_lb_n        = 0;
@@ -5976,10 +6122,11 @@ static void process_ctrl_cmd(const char *line, int fd)
 } while (0)
 
     /* Hard read-only enforcement during boot (see update_boot_state()'s block
-     * comment): everything except CMD_RO_ALWAYS is rejected here, uniformly,
+     * comment): everything except CMD_RO_ALWAYS/CMD_OWNER_ALWAYS is rejected here, uniformly,
      * whether it arrived through the one-shot accept path or an established
      * CTRL_PERSIST session.  See cmd_class() for why each class is what it is. */
-    if (g_boot_active && cmd_class(line) != CMD_RO_ALWAYS) {
+    if (g_boot_active && cmd_class(line) != CMD_RO_ALWAYS &&
+        cmd_class(line) != CMD_OWNER_ALWAYS) {
         REPLY_S("ERR BOOTING\n");
         return;
     }
@@ -6195,7 +6342,32 @@ static void process_ctrl_cmd(const char *line, int fd)
             REPLY_S("ERR\n");
         }
 
+    } else if (strncmp(line, "BTN ", 4) == 0 ||
+               strncmp(line, "BTN_DOWN ", 9) == 0 ||
+               strncmp(line, "BTN_UP ", 7) == 0) {
+        /* Raw NKS4 button code, passed straight to HandleSwitchEvent with no name
+         * lookup and no per-model meaning: the client decides which code is which
+         * button on its FAMILY/MODEL.  No rtf5 fallback - that path uses an
+         * unrelated (dev,code) space and only exists for the named commands. */
+        int down = line[4] == 'D';
+        int up   = line[4] == 'U';
+        int code = btn_parse_code(line + (down ? 9 : up ? 7 : 4));
+        int rc;
+        NKS4_GUARD_STRICT();
+        if (code < 0) { REPLY_S("ERR\n"); return; }
+        if (down) {
+            rc = nks4_write("BTN_DOWN %d\n", code);
+            if (rc == 0) btn_held_set(code);
+        } else {
+            rc = nks4_write(up ? "BTN_UP %d\n" : "BTN %d\n", code);
+            g_btn_held[code].held = 0;
+        }
+        if (rc != 0) REPLY_S("ERR INJECT_FAILED\n");
+        else         REPLY_S("OK\n");
+
     } else if (strncmp(line, "BUTTON ", 7) == 0) {
+        /* Deprecated: named buttons are Kronos-specific (codes 1/2 are MODE/PAGE on
+         * Nautilus, not COMBI/PROGRAM).  New clients use BTN/BTN_DOWN/BTN_UP. */
         const char *bname = line + 7;
         const struct btn_def *b;
         NKS4_GUARD();
@@ -6229,6 +6401,7 @@ static void process_ctrl_cmd(const char *line, int fd)
         }
 
     } else if (strncmp(line, "CHORD ", 6) == 0) {
+        /* Deprecated alongside BUTTON: clients build chords from BTN_DOWN/BTN_UP. */
         char names[8][16];
         const struct btn_def *btns[8];
         const struct rtf5_btn_def *rbtns[8];
@@ -6583,6 +6756,22 @@ static void process_ctrl_cmd(const char *line, int fd)
                              g_stream_w, g_stream_h);
         REPLY(resp, (size_t)rlen);
 
+    } else if (strcmp(line, "CAL_GET") == 0) {
+        char resp[CAL_TEXT_MAX + 8];
+        char text[CAL_TEXT_MAX + 1];
+        int  rlen;
+        if (cal_load(text, sizeof(text)) == 0)
+            rlen = snprintf(resp, sizeof(resp), "CAL %s\n", text);
+        else
+            rlen = snprintf(resp, sizeof(resp), "CAL NONE\n");
+        REPLY(resp, (size_t)rlen);
+
+    } else if (strncmp(line, "CAL_SET ", 8) == 0) {
+        const char *text = line + 8;
+        if (!cal_text_valid(text))       REPLY_S("ERR INVALID\n");
+        else if (cal_store(text) != 0)   REPLY_S("ERR WRITE_FAILED\n");
+        else                             REPLY_S("OK\n");
+
     } else if (strcmp(line, "SYSINFO") == 0) {
         char si[4096];
         int  silen = sysinfo_collect(si, (int)sizeof(si));
@@ -6825,7 +7014,8 @@ static int ctrl_dispatch_line(int cfd, const struct sockaddr_in *cpeer,
         return 0;
     }
 
-    is_readonly = cmd_class(firstline) != CMD_MUTATING;
+    is_readonly = cmd_class(firstline) == CMD_RO_ALWAYS ||
+                  cmd_class(firstline) == CMD_RO_BOOTGATED;
     owned = (g_ctrl_allowed_ip != 0 &&
              cpeer->sin_addr.s_addr == g_ctrl_allowed_ip);
 
@@ -7110,8 +7300,9 @@ static void load_midi_bridge(void)
     }
     snprintf(params, sizeof(params),
              "receive_fn=0x%lx register_fn=0x%lx regoutport=0x%lx eva_ready=1 tap_shared=1 "
-             "fn_inports_get=0x%lx fn_outports_get=0x%lx",
-             recv_fn, reg_fn, outport_fn, inports_get, outports_get);
+             "fn_inports_get=0x%lx fn_outports_get=0x%lx%s",
+             recv_fn, reg_fn, outport_fn, inports_get, outports_get,
+             strcmp(g_model_family, "NAUTILUS") == 0 ? " nautilus=1" : "");
     extract_ko(MIDI_BRIDGE_KO, midi_bridge_ko, midi_bridge_ko_len);
     ret = syscall(SYS_init_module, (void *)midi_bridge_ko,
                   (unsigned long)midi_bridge_ko_len, params);
@@ -8050,6 +8241,8 @@ int main(void)
          * than by sleeping inside the command handler. */
         int ramp_pending = nks4_analog_ramp_pump();
 
+        btn_held_pump();
+
         /* Boot-state gate - see update_boot_state()'s block comment. Throttled
          * to 1/s (plenty for its 600ms debounce window - the streak clock is
          * wall-clock-driven via clock_gettime(), not tied to poll cadence) and
@@ -8762,6 +8955,7 @@ int main(void)
     /* Land any in-flight TEMPO/DAMPER ramp on its commanded target first, while
      * nks4_inject is still loaded - see nks4_analog_ramp_finish_all(). */
     nks4_analog_ramp_finish_all();
+    btn_held_release_all("shutdown");
     if (kmsg_pid > 0) { kill(kmsg_pid, SIGTERM); waitpid(kmsg_pid, NULL, 0); kmsg_pid = -1; }
     if (client_fd >= 0) close(client_fd);
     if (handshake.fd >= 0) close(handshake.fd);

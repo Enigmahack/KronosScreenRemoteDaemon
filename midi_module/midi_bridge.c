@@ -111,11 +111,28 @@ module_param(fn_outports_get, ulong, 0444);
 static int in_port = -1;
 module_param(in_port, int, 0644);
 
-/* Port-type byte (CSTGMidiInPort +0x25) of the USB in-port, used for auto-select.
+/* Port-id byte (CSTGMidiInPort + inport_id_off) of the USB in-port, used for auto-select.
  * The codec's two inputs are type 0x00 (DIN) and 0x01 (USB), mirroring the two
  * out-ports; 0x01 is USB. Param so it can be retargeted per OS version if needed. */
 static int in_type = 0x01;
 module_param(in_type, int, 0644);
+
+/* Set by screenremote only when it detected FAMILY=NAUTILUS. Everything that
+ * differs between the Kronos and Nautilus OA builds is gated on this, so a
+ * Kronos (nautilus=0) takes exactly the Kronos code path. */
+static int nautilus = 0;
+module_param(nautilus, int, 0444);
+
+/* Offset of CSTGMidiInPort's eSTGMidiPort id byte; the active-flags byte (bit1 =
+ * active, tested by CSTGMidiInPortGeneric::Receive) is the byte after it.
+ * Kronos: fixed 0x25. Nautilus: the object is laid out differently (0x29 in the
+ * current OA.ko), so find_port_object() reads it from RegisterMidiInPort's own
+ * `movsx edx, byte [eax+disp8]` operand. Reading the wrong offset picks a port
+ * whose active bit is really unrelated data, and OA then silently drops every
+ * injection. */
+#define KRONOS_INPORT_ID_OFF 0x25
+static int inport_id_off = KRONOS_INPORT_ID_OFF;
+#define INPORT_FLAGS_OFF (inport_id_off + 1)
 
 /* Tap the SHARED performance queues (q1,q2) in addition to the per-port bulk-dump
  * queues (q3)?  q2 carries live notes/CC/program-change/combi SysEx, so tapping it
@@ -899,15 +916,28 @@ static void *find_port_object(void)
 
         ports_array = (uint32_t *)(unsigned long)
                       *(uint32_t *)(fn_bytes + 7);   /* local copy - safe */
-        printk(KERN_INFO "midi_bridge: sMidiInPorts at %p\n", ports_array);
+        if (nautilus) {
+            /* disp8 is signed and the id byte lives past the vtable/queue
+             * header, so anything outside this window means the pattern
+             * matched something else - refuse rather than read an arbitrary
+             * field as "active". */
+            if (fn_bytes[3] < 0x08 || fn_bytes[3] > 0x7e) {
+                printk(KERN_ERR "midi_bridge: RegisterMidiInPort id offset 0x%02x implausible\n",
+                       fn_bytes[3]);
+                return NULL;
+            }
+            inport_id_off = fn_bytes[3];
+        }
+        printk(KERN_INFO "midi_bridge: sMidiInPorts at %p (%s, port id @+0x%02x, flags @+0x%02x)\n",
+               ports_array, nautilus ? "nautilus" : "kronos", inport_id_off, INPORT_FLAGS_OFF);
     }
 
-    /* Enumerate for diagnosis: type (+0x25), active-flag (+0x26 bit1), vtable. */
+    /* Enumerate for diagnosis: port id, active-flag (bit1), vtable. */
     for (i = 0; i < 8; i++) {
         uint32_t addr = inport_at(i), vtbl;
         uint8_t type, flags;
         if (addr > 0x40000000 &&
-            tap_read8(addr + 0x25, &type) && tap_read8(addr + 0x26, &flags) &&
+            tap_read8(addr + inport_id_off, &type) && tap_read8(addr + INPORT_FLAGS_OFF, &flags) &&
             tap_read32(addr, &vtbl))
             printk(KERN_INFO "midi_bridge:   inport[%d]=%08x type=0x%02x flags=0x%02x vtbl=%08x\n",
                    i, addr, type, flags, vtbl);
@@ -934,7 +964,7 @@ static void *find_port_object(void)
         uint32_t addr = inport_at(i);
         uint8_t type, flags;
         if (addr > 0x40000000 &&
-            tap_read8(addr + 0x25, &type) && tap_read8(addr + 0x26, &flags)) {
+            tap_read8(addr + inport_id_off, &type) && tap_read8(addr + INPORT_FLAGS_OFF, &flags)) {
             if ((flags & 0x02) && type == (uint8_t)in_type) {
                 printk(KERN_INFO "midi_bridge: injecting into USB in-port sMidiInPorts[%d]=%08x (type=0x%02x)\n",
                        i, addr, type);
@@ -947,7 +977,7 @@ static void *find_port_object(void)
     for (i = 0; i < 8; i++) {
         uint32_t addr = inport_at(i);
         uint8_t flags;
-        if (addr > 0x40000000 && tap_read8(addr + 0x26, &flags)) {
+        if (addr > 0x40000000 && tap_read8(addr + INPORT_FLAGS_OFF, &flags)) {
             if (flags & 0x02) {
                 printk(KERN_INFO "midi_bridge: no USB in-port (type 0x%02x); "
                        "falling back to first active sMidiInPorts[%d]=%08x\n", in_type, i, addr);

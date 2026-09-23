@@ -453,7 +453,7 @@ All commands respond with `OK\n` on success or `ERR\n` on invalid arguments, exc
 
 As of 1.10.0, these commands write to `/proc/.nks4inject`, exposed by a small companion kernel module (`nks4_inject.ko`, extracted from an embedded buffer and loaded early at startup) that calls OA's real `CSTGFrontPanel::HandleSwitchEvent` / `HandleTouchPanel` / `HandleRotary` / `HandleAnalogController` directly - the exact functions a physical press/touch/turn dispatches through. Injected events get the same response as hardware, independent of whatever mode Eva is currently in.
 
-**If `nks4_inject.ko` is permanently given up on for this boot** (symbol resolution failure against `/proc/kallsyms`, the boot-safety kill-switch present, or OA never reaching the Live module state within the retry deadline), the daemon falls back to writing raw packets to `/dev/rtf5` - the old pre-1.10.0 path - for `TOUCH*`, `BUTTON`, `CHORD`, `WHEEL`, `SLIDER`, and `VSLIDER` only. This is a **degraded** fallback, not a substitute: it inherits every limitation described above (sequencer transport, `TAP_TEMPO`, `SMPL_REC`/`SMPL_START`, and some MIDI-triggering touch actions silently do nothing even though the daemon still replies `OK\n`, because rtf5 only reaches Eva's UI-mirroring code, never the real OA-side action). `KNOB`, `JOYSTICK`, `VECTOR`, `RIBBON`, `AFTERTOUCH`, `PEDAL`, `FOOTSWITCH`, `DAMPER`, `TEMPO`, and `PADCHORD` have no rtf5 equivalent (added after rtf5 was retired) and always return `ERR NKS4_NOT_LOADED\n` in fallback mode; a `BUTTON`/`CHORD` name with no historical rtf5 mapping returns `ERR RTF5_UNSUPPORTED\n` instead. Entering fallback is logged to stderr and appended to `/korg/rw/HD/ScreenRemote/rtf5_fallback.log` (FTP-visible) so a degraded boot is never silent - check that log (or watch for `ERR RTF5_UNSUPPORTED\n`/dead transport buttons) if front-panel control seems partially broken.
+**If `nks4_inject.ko` is permanently given up on for this boot** (symbol resolution failure against `/proc/kallsyms`, the boot-safety kill-switch present, or OA never reaching the Live module state within the retry deadline), the daemon falls back to writing raw packets to `/dev/rtf5` - the old pre-1.10.0 path - for `TOUCH*`, `BUTTON`, `CHORD`, `WHEEL`, `SLIDER`, and `VSLIDER` only. This is a **degraded** fallback, not a substitute: it inherits every limitation described above (sequencer transport, `TAP_TEMPO`, `SMPL_REC`/`SMPL_START`, and some MIDI-triggering touch actions silently do nothing even though the daemon still replies `OK\n`, because rtf5 only reaches Eva's UI-mirroring code, never the real OA-side action). `KNOB`, `JOYSTICK`, `VECTOR`, `RIBBON`, `AFTERTOUCH`, `PEDAL`, `FOOTSWITCH`, `DAMPER`, `TEMPO`, `PADCHORD`, and `BTN`/`BTN_DOWN`/`BTN_UP` have no rtf5 equivalent (added after rtf5 was retired) and always return `ERR NKS4_NOT_LOADED\n` in fallback mode; a `BUTTON`/`CHORD` name with no historical rtf5 mapping returns `ERR RTF5_UNSUPPORTED\n` instead. Entering fallback is logged to stderr and appended to `/korg/rw/HD/ScreenRemote/rtf5_fallback.log` (FTP-visible) so a degraded boot is never silent - check that log (or watch for `ERR RTF5_UNSUPPORTED\n`/dead transport buttons) if front-panel control seems partially broken.
 
 **Input validation policy.** Every numeric argument below is either **snapped** into its valid range or the request is **rejected outright** - never silently passed through out-of-range or forwarded to the kernel unchecked:
 - A value with a natural nearest-valid interpretation (a slider/knob index, a 0-127 magnitude, a touch coordinate, a chord hold duration) is **clamped** to the nearest in-range value. `SLIDER 99 500` is accepted as `SLIDER 8 127`, not rejected.
@@ -789,7 +789,44 @@ What actually gates firing now is `on_pads_page()`, a **framebuffer pixel finger
 
 ---
 
+### BTN / BTN_DOWN / BTN_UP
+
+Press and/or release a front-panel button by its raw NKS4 button code. This is the model-agnostic way to drive buttons, and replaces `BUTTON` and `CHORD`.
+
+```
+Request:  BTN <code>\n         press + release
+          BTN_DOWN <code>\n    press only
+          BTN_UP <code>\n      release only
+Response: OK\n
+          ERR\n                 (code is not a plain decimal integer 0-127)
+          ERR INJECT_FAILED\n
+          ERR NKS4_NOT_LOADED\n
+```
+
+| Argument | Type | Description |
+|----------|------|-------------|
+| code | integer | Raw button code, 0-127, decimal digits only. Anything else is rejected, not clamped: a clamped code would be a different button. |
+
+The code goes straight to `CSTGFrontPanel::HandleSwitchEvent(this, code, pressed)`, the function the NKS4 panel controller's own button events reach (the controller's 7-bit button field is passed through unchanged). The daemon does no name lookup and gives the code no meaning: what a code does depends on the unit's OS. For example codes 1 and 2 are COMBI and PROGRAM on a Kronos but MODE and PAGE on a Nautilus. Clients choose codes per `FAMILY`/`MODEL` (from [UDP discovery](#2-udp-discovery) or [`MODEL`](#model)). The Kronos codes are listed in [Section 9](#9-button-name-reference); every value 0-127 is accepted, including codes no physical button produces.
+
+Unlike `BUTTON`, these commands do not update the daemon's fallback mode tracking; `STATE`'s `MODE` comes from mode detection as usual.
+
+**Holding a button.** After `BTN_DOWN` the daemon treats the button as held until the client sends `BTN_UP`, so a client can hold one button while pressing others (a chord or a shifted press). Sending `BTN_DOWN` again for a button that is already held restarts its hold timer. As a safety net the daemon sends the release itself when:
+
+- the control owner changes or disconnects (the stream client that pressed it is gone),
+- the persistent control session (`CTRL_PERSIST`) closes,
+- 15 seconds pass since the last `BTN_DOWN` for that code,
+- the daemon shuts down.
+
+`BTN` (press + release) or `BTN_UP` on a held code clears it. Holds survive one-shot control connections closing, so `BTN_DOWN` and `BTN_UP` can arrive on separate connections.
+
+There is no `/dev/rtf5` fallback for these commands (see [Section 7.0](#70-front-panel-injection-architecture-as-of-1100)); they reply `ERR NKS4_NOT_LOADED` whenever `nks4_inject.ko` is not in use.
+
+---
+
 ### BUTTON
+
+> **Deprecated.** Use [`BTN`](#btn--btn_down--btn_up). Button names describe Kronos buttons only: on a Nautilus, `BUTTON COMBI` and `BUTTON PROGRAM` send codes 1 and 2, which open the MODE and PAGE popups. `BUTTON` keeps working until it is removed in a later release.
 
 Press and release a named front-panel button. See [Section 9](#9-button-name-reference) for the full list of button names.
 
@@ -819,6 +856,8 @@ BTN_UP <code>\n     release only (used by CHORD)
 ---
 
 ### CHORD
+
+> **Deprecated.** Use [`BTN_DOWN` / `BTN_UP`](#btn--btn_down--btn_up), which also allow holds longer than `CHORD`'s 5 s and don't block the daemon while held. `CHORD` keeps working until it is removed in a later release.
 
 Press two or more buttons as a chord: buttons are pressed left-to-right, then released right-to-left, so all buttons are held simultaneously at the midpoint.
 
@@ -1148,7 +1187,7 @@ The daemon itself decides whether the Kronos OS/UI is genuinely up, rather than 
 Response: ERR BOOTING\n
 ```
 
-Within the read-only allowlist itself, only `STATE`/`MODE_DETAIL`/`SYSINFO` (and `PALETTE`/`VERSION`/`MODEL`, which aren't synth state at all - `PALETTE` in particular is what a client needs just to decode the video stream, boot splash included, and `MODEL` is fixed device identity a client may well want to check before the UI is even up) stay answerable during boot - `LASTTOUCH`/`PADMAP_LIST`/`PADMAP_STATE`/`PIXEL`/`REGION` also get `ERR BOOTING` while `BOOT=1`, since none of them need to stay pollable for boot-completion detection the way `STATE` does, and PIXEL/REGION in particular could otherwise be read as a claim about live UI content that isn't trustworthy yet. `STATE`/`MODE_DETAIL`/`SYSINFO` keep answering, but with `MODE`/`EDITCTX` (and `MODE_DETAIL`'s `EDITSLOT`/`SOURCE`) forced to safe values rather than whatever was actually read - see each command's own doc above. The screen stream and these three queries are how a client discovers the moment `BOOT` clears.
+Within the read-only allowlist itself, only `STATE`/`MODE_DETAIL`/`SYSINFO` (and `PALETTE`/`VERSION`/`MODEL`, which aren't synth state at all - `PALETTE` in particular is what a client needs just to decode the video stream, boot splash included, and `MODEL` is fixed device identity a client may well want to check before the UI is even up) stay answerable during boot - `LASTTOUCH`/`PADMAP_LIST`/`PADMAP_STATE`/`PIXEL`/`REGION` also get `ERR BOOTING` while `BOOT=1`, since none of them need to stay pollable for boot-completion detection the way `STATE` does, and PIXEL/REGION in particular could otherwise be read as a claim about live UI content that isn't trustworthy yet. One command outside the allowlist is also answered during boot: `CAL_GET`, which still requires ownership. `STATE`/`MODE_DETAIL`/`SYSINFO` keep answering, but with `MODE`/`EDITCTX` (and `MODE_DETAIL`'s `EDITSLOT`/`SOURCE`) forced to safe values rather than whatever was actually read - see each command's own doc above. The screen stream and these three queries are how a client discovers the moment `BOOT` clears.
 
 **Why this exists.** `eva_mode.ko`'s `RESOLVED=1` only means the `sm_poMMI->CMMI::modeManager` pointer chain didn't hit NULL/out-of-bounds - it does not mean the `CModeManager` object has finished constructing. Freshly-allocated-but-not-yet-constructed heap memory reads back as small integers, and `SYS_MODE=0`/`EDITCTX_RAW=1` decode to exactly `MODE=3 EDITCTX=1` ("Program edit while in Combi") - a false-confident reading that looks identical to a real one from the wire format alone. `BOOT` exists specifically to keep that window from ever reaching a client as if it were real state, and to keep it from accepting interactive commands (touch/button/wheel/MIDI/etc.) while nothing meaningful exists yet to receive them.
 
@@ -1232,6 +1271,27 @@ VER=1.7.14 BUILD=20260702-1.7.14\n
 `BUILD` is set at compile time from the date and version string.
 
 ---
+
+### CAL_GET / CAL_SET
+
+Store and read back the client's touch calibration mesh on the unit itself, so the calibration follows the instrument rather than the PC that made it.
+
+```
+Request:  CAL_GET\n
+Response: CAL <text>\n
+          CAL NONE\n            (no calibration stored, or the file is not valid)
+
+Request:  CAL_SET <text>\n
+Response: OK\n
+          ERR INVALID\n         (empty, over 4096 bytes, or a character outside the set below)
+          ERR WRITE_FAILED\n
+```
+
+`<text>` is opaque to the daemon: it stores and returns it unchanged. The Windows client uses `G=<grid> M=<col,row,dx,dy;...> D=<x,y;...>` (grid size, non-zero mesh node offsets, bias dots). The daemon only accepts the characters `0-9 - , ; = G M D` and space, up to 4096 bytes.
+
+The text is kept in `/korg/rw/HD/ScreenRemote/calibration.txt` (FTP: `SSD1/ScreenRemote/calibration.txt`). Deleting that file returns the unit to an uncalibrated mapping on the next connect. Writes go to a temp file in the same folder and are renamed into place, so a power loss never leaves a truncated file.
+
+Both commands require ownership. `CAL_GET` is also answered while `BOOT=1`, so a client can read it right after connecting. `CAL_SET` is rejected during boot like any other mutating command (3.1.2+).
 
 ### MODEL
 
@@ -1461,6 +1521,8 @@ Also avoid **connection churn**: if you inject via the one-shot control port (`M
 ---
 
 ## 9. Button name reference
+
+The names below are used only by the deprecated `BUTTON` and `CHORD` commands and describe the **Kronos** panel. The codes are what [`BTN`](#btn--btn_down--btn_up) takes on a Kronos; other models (Nautilus) assign different buttons to some codes.
 
 Button names are case-sensitive and must be uppercase. The `code` column is the button's flat NKS4 hardware scan code (0-127) - see [Section 7.0](#70-front-panel-injection-architecture-as-of-1100) for what that means and how it was obtained. Every code below was captured directly off a real unit's NKS4 test/calibration mode (one physical press per button) and independently cross-checked against `OA.ko`'s own `ButtonPressHandler` disassembly.
 
@@ -1743,6 +1805,7 @@ Every authentication attempt (success or failure) is appended to `/korg/rw/scree
 | midi_bridge.ko open poll at startup | 2 seconds | 20 x 100 ms; MIDI disabled if /proc/.midi_in never appears |
 | nks4_inject.ko open poll at startup | 2 seconds | 20 x 100 ms; front-panel injection (BUTTON/CHORD/TOUCH*/WHEEL/SLIDER/KNOB/VSLIDER) unavailable if /proc/.nks4inject never appears |
 | midi_tcp connect poll at startup | 6 seconds | 30 x 200 ms; SysEx capture unavailable if connection fails |
+| BTN_DOWN hold limit | 15 s | `BTN_HOLD_MAX_S`; a held button is released automatically this long after its last `BTN_DOWN` |
 | CHORD max buttons | 8 | `name1`..`name8`; a 9th name is silently ignored (parser stops filling the array) |
 | CHORD hold_ms range | 0 - 5000 ms | Snapped, not rejected - see Section 7.0 |
 | SLIDER / KNOB index range | 1 - 8 | Snapped, not rejected |
@@ -1772,6 +1835,12 @@ Every authentication attempt (success or failure) is appended to `/korg/rw/scree
 ## 15. Changes by release
 
 Client-visible changes only. Internal changes are in the git history.
+
+### 3.1.2
+
+- **`BTN` / `BTN_DOWN` / `BTN_UP`**: drive buttons by raw NKS4 button code (0-127) instead of by name, so the same command works on any model. Held buttons are released automatically if the owner disconnects, the persistent control session closes, or after 15 s ([BTN / BTN_DOWN / BTN_UP](#btn--btn_down--btn_up)).
+- **`BUTTON` and `CHORD` are deprecated** and will be removed in a later release. They keep working unchanged.
+- **`CAL_GET` / `CAL_SET`**: the client's touch calibration mesh is stored on the unit (`/korg/rw/HD/ScreenRemote/calibration.txt`, deletable over FTP) instead of on the PC ([CAL_GET / CAL_SET](#cal_get--cal_set)).
 
 ### 3.1.1
 
