@@ -23,11 +23,8 @@
  *                 mirrored branches, NOT independently confirmed)
  *   +0x34  int    timbre/track slot being Program-edited, -1 if none
  *
- * Eva (/korg/Eva/Eva, exec'd as user pocky per kronosology/docs/workflow/
- * deploying_patches.md) is a plain ET_EXEC x86 binary, image base 0x08048000
- * (kronosology/docs/modules/Eva.md) - not PIE/ASLR'd, so 0x0ae431b0 is a
- * constant VA every boot, no per-run relocation needed, unlike OA.ko/
- * loadmod.ko's kallsyms-dependent addresses elsewhere in this project.
+ * Eva is a plain ET_EXEC x86 binary (base 0x08048000) - not PIE/ASLR'd, so
+ * 0x0ae431b0 is a constant VA every boot, no per-run relocation needed.
  *
  * This is READ-ONLY and does NOT hook or patch Eva - it locates Eva's
  * task_struct by scanning the process list for comm==eva_comm (default
@@ -37,12 +34,9 @@
  * no hooking" bar as ../shm_peek_module/shm_peek.c and
  * ../chord_probe_module/chord_probe.c.
  *
- * CALIBRATION STATUS: FULLY CONFIRMED live on real hardware 2026-07-17 - see
- * docs/EVA_ModeManager_probe.md for the full session. Every SYS_MODE value
- * and every EDITCTX_RAW value was independently cross-checked against
- * screenremote's own pixel-based ground truth (mode_detect_refs.h scoring
- * against live REGION/PALETTE dumps) while the user stood in each state on
- * the physical unit:
+ * CALIBRATION STATUS: Every SYS_MODE and EDITCTX_RAW confirmed against
+ * pixel ground truth on real hardware. Diagnostic only - eva_mode.ko is the
+ * production version.
  *
  *   SYS_MODE: 0=Program 1=Combi 2=Global 3=Disk 4=Sequence 5=Sampling 6=Setlist
  *   EDITCTX_RAW: 0=none 1=Program-edit-from-Combi 2=Program-edit-from-Sequence
@@ -53,12 +47,8 @@
  * apparently arbitrary C++ enum declaration order - don't assume either of
  * those other numberings applies here.)
  *
- * The initial live test (2026-07-16, see git history / the doc above) DID
- * NOT match ground truth on first read - that turned out to be simply the
- * ordinal-mapping guess being wrong, not a bug in the read mechanism
- * (pointer chain and offsets were already reading real, live, correct
- * values the whole time). Confirmed via a full interactive calibration
- * pass, not yet wired into screenremote.c's MODE/EDITCTX reporting.
+ * Diagnostic only - not wired into screenremote.c's MODE/EDITCTX reporting.
+ * Production version is eva_mode.ko.
  *
  * Usage: insmod eva_mode_peek.ko [eva_comm=Eva] [sm_pommi_addr=0x0ae431b0]
  * Then repeatedly: cat /proc/.eva_mode_peek

@@ -127,25 +127,11 @@
  *   grep _ZN14CSTGFrontPanel22HandleAnalogControllerE20eSTGAnalogDeviceCodeht /proc/kallsyms
  *   grep ShortInvertNkS4AnalogValue                                /proc/kallsyms
  *
- * CSTGFrontPanel::sInstance is NOT resolvable this way - it's a .bss data
- * symbol and this kernel's /proc/kallsyms only exposes function symbols
- * (confirmed live, 2026-07: absent even though `nm OA.ko` shows it as a
- * normal global). Same technique already used elsewhere in this project
- * (midi_bridge.c's "resolve sMidiInPorts via the byte pattern in
- * RegisterMidiInPort") applies here: wherever OA's own code loads that
- * singleton it does so with `mov eax,ds:<sInstance>` carrying an R_386_32
- * relocation - by link/load time the module loader has already filled in
- * the real resolved address as a literal 4-byte immediate embedded in that
- * already-loaded, already-relocated machine code. We're a kernel module
- * too, so we just read those 4 bytes directly out of OA's live .text at a
- * fixed, ground-truthed offset - no separate address to resolve.
- *
- * IMPORTANT (corrected 2026-08-09): the anchor for that read is
- * CSTGFrontPanelMsgHandler::SetLED, NOT HandleSwitchEvent. This module used
- * to read HandleSwitchEvent+0x25, which relocates against CSTGGlobal::
- * sInstance, not CSTGFrontPanel::sInstance - see the long derivation comment
- * at SETLED_SINSTANCE_OFFSET below for the byte-level proof, why three of the
- * four handlers never cared, and why HandleTouchPanel did.
+ * CSTGFrontPanel::sInstance is a .bss symbol (not in /proc/kallsyms). OA loads
+ * it via mov eax,ds:<sInstance> with an R_386_32 relocation - the resolved
+ * address is embedded in OA's live .text. We read those bytes directly at a fixed
+ * offset. The anchor is CSTGFrontPanelMsgHandler::SetLED (see SETLED_SINSTANCE_OFFSET)
+ * not HandleSwitchEvent (which relocates against CSTGGlobal::sInstance).
  *
  * Command interface: write one line to /proc/.nks4inject
  *   BTN <code>              press + release a raw scan code (0-127)
@@ -172,16 +158,9 @@
  * see project_oa_hot_swap_bug notes - the notifier only protects THIS
  * module's own calls, not the documented /proc/.shm refcount issue.
  *
- * VM-testing alternative (optional, off by default): the from-scratch
- * OA.ko reconstruction under kronosology/reconstructed/OA is a differently
- * compiled binary, so SINSTANCE_REL_OFFSET's fixed byte offset into
- * HandleSwitchEvent's machine code does not apply to it. That project
- * exposes a small non-real, testing-only accessor,
- * CSTGFrontPanel_GetInstanceForTest(), that returns CSTGFrontPanel::sInstance
- * directly. Passing its resolved address as the new `fn_sinstance_get`
- * module param makes nks4_inject_setup()/frontpanel_this() call it instead
- * of doing the offset read. Leaving `fn_sinstance_get` at its default (0)
- * reproduces today's real-hardware behaviour exactly.
+ * VM-testing alternative (optional, off by default): pass fn_sinstance_get
+ * param to use alternate accessor instead of offset read. Default (0)
+ * reproduces real-hardware behaviour.
  */
 
 #include <linux/module.h>
@@ -230,23 +209,10 @@ static unsigned long fn_chord = 0;         /* RT_chord_trigger(uchar,uchar,uchar
                                              * slot-index convention. */
 module_param(fn_chord, ulong, 0444);
 
-static unsigned long fn_recv_trigger = 0;  /* CSTGDrumPadInterface::ReceiveTriggerEvent(this,
-                                             * event) - ALTERNATE PADCHORD path for an OA.ko
-                                             * build where RT_chord_trigger (fn_chord above)
-                                             * doesn't exist at all - confirmed on a real
-                                             * Nautilus unit 2026-09-18 (no _Z16RT_chord_trigger*
-                                             * or Do_KM_note_out_chord_trig symbol anywhere in
-                                             * kallsyms; the whole KARMA pad-trigger path is
-                                             * routed through this class instead). Public,
-                                             * designed for exactly this - multiple unrelated
-                                             * MIDI/message-handler classes already call it as
-                                             * their own pad-trigger producer. Resolved directly
-                                             * via kallsyms as
-                                             * _ZN20CSTGDrumPadInterface19ReceiveTriggerEventE22STGDrumPadTriggerEvent
-                                             * - see resolve_nks4_kallsyms() in screenremote.c.
-                                             * Used only when fn_chord is 0 - see inject_chord().
-                                             * Full writeup:
-                                             * kronosology/docs/hardware/nautilus_padchord.md */
+static unsigned long fn_recv_trigger = 0;  /* CSTGDrumPadInterface::ReceiveTriggerEvent -
+                                             * alternate PADCHORD path when RT_chord_trigger
+                                             * doesn't exist. Resolved via kallsyms. Used only
+                                             * when fn_chord is 0. See inject_chord(). */
 module_param(fn_recv_trigger, ulong, 0444);
 
 static unsigned long fn_setled = 0;        /* CSTGFrontPanelMsgHandler::SetLED - NEVER called.
@@ -343,8 +309,8 @@ static char last_cmd[64];
  * .text: wherever OA itself loads that singleton, the module loader has already
  * patched the real runtime address in as a literal 4-byte R_386_32 immediate.
  *
- * CORRECTED 2026-08-09 - this code previously read the WRONG immediate.
- * =====================================================================
+ * This code reads the correct immediate. Previously read the wrong one.
+ * ====================================================================
  * SINSTANCE_REL_OFFSET was documented as "the `mov 0x0,%eax` that relocates
  * against CSTGFrontPanel::sInstance". Verified against the real shipping OA.ko
  * (.rel.text relocations + raw opcode bytes), HandleSwitchEvent @ .text+0xc0f0
@@ -415,9 +381,8 @@ static char last_cmd[64];
 #define SETLED_OPCODE_OFF         0x01   /* the `a1` opcode byte guarding it */
 #define OPCODE_MOV_EAX_MOFFS32    0xa1
 
-/* CSTGDrumPadInterface::ReceiveTriggerEvent's OWN entry is its own anchor for
- * &CSTGDrumPadInterface::sInstance - no separate thunk needed, unlike the
- * CSTGFrontPanel derivation above. Real bytes (Nautilus OA.ko, 2026-09-18):
+/* CSTGDrumPadInterface::ReceiveTriggerEvent is its own anchor for
+ * &CSTGDrumPadInterface::sInstance - no separate thunk needed. Real bytes:
  *     +0x0: 8b 0d <reloc &CSTGDrumPadInterface::sInstance>   mov ecx,ds:sInstance
  *     +0x6: 53                                               push ebx
  *     +0x7: 80 79 48 00                                      cmpb $0,0x48(ecx)
@@ -447,12 +412,9 @@ static unsigned long drumpad_sinstance_addr; /* &CSTGDrumPadInterface::sInstance
 
 /* ---- Fault-safe reads of OA-owned memory --------------------------------
  *
- * kptr_ok()/oa_read8/oa_read32/oa_write8/oa_read_ptr now come from
- * ../common/oa_safe.h (byte-identical to what midi_bridge.c independently
- * grew for the same reason - merged 2026-09-19; see that header for the full
- * "why probe_kernel_read/write, not a raw deref" rationale and the real
- * oops it's fixing). Kept as macros over the shared oa_probe_* names rather
- * than renaming every call site in this file.
+ * kptr_ok()/oa_read8/oa_read32/oa_write8/oa_read_ptr from ../common/oa_safe.h.
+ * Macros over shared oa_probe_* names to avoid renaming every call site.
+ * See oa_safe.h for the fault-safe rationale and why probe_kernel_read is needed.
  *
  * Every address this module dereferences is externally supplied and only ever
  * range-checked:
@@ -798,10 +760,8 @@ static int inject_write_proc(struct file *file, const char __user *buf,
  * garbage in the out-params would make that regression test pass for the wrong
  * reason, which is worse than no test at all.  Callers must not read the
  * out-params unless this returns 0. */
-/* this_ptr: caller-resolved frontpanel_this() result, not re-derived here -
- * its one caller (status_read_proc()) already needs its own copy of that
- * same resolution for this_ok, and a second independent frontpanel_this()
- * call here was pure duplication of the identical probe (found 2026-09-19). */
+/* this_ptr: caller-resolved frontpanel_this() result. The caller already
+ * derives this for this_ok, avoiding duplication. */
 static int touch_pad_mode_read(void *this_ptr, unsigned char *flag_out,
                                 unsigned char *latch_out, unsigned char *stored_out)
 {
@@ -809,10 +769,8 @@ static int touch_pad_mode_read(void *this_ptr, unsigned char *flag_out,
 
     if (!p)
         return -1;
-    /* probe_kernel_read for every one - these were the four derefs the
-     * 2026-08-17 review found still raw after commit d1f565a moved the rest of
-     * this module's OA accesses onto the fault-safe path.  kptr_ok() cannot
-     * tell a plausible address from an unmapped one (see oa_read8's header),
+    /* probe_kernel_read for every one. kptr_ok() cannot tell a plausible
+     * address from an unmapped one (see oa_read8's header),
      * and this function is reachable from a world-readable /proc node. */
     if (!oa_read8(p + 0x104, flag_out)  ||
         !oa_read8(p + 0x105, latch_out) ||
@@ -847,12 +805,8 @@ static int status_read_proc(char *page, char **start, off_t off,
         this_ok = 0;
         blind_ok = 0;
     } else {
-        /* Resolved once and reused for both this_ok and touch_pad_mode_read();
-         * blind_ok derives from it too rather than calling blind_this() (which
-         * would just re-derive the same frontpanel_this() result internally
-         * before falling back) - three independent probes of the same .bss
-         * slot collapsed to one, plus a fallback probe only when it's
-         * actually needed (found 2026-09-19). */
+        /* Resolved once and reused. Avoids three independent probes of the
+         * same .bss slot. Fallback probe only when needed. */
         void *this_ = frontpanel_this();
         this_ok  = (this_ != NULL);
         pad_rc   = touch_pad_mode_read(this_, &pad_flag, &pad_latch, &pad_stored);

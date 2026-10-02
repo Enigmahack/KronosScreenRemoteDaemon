@@ -33,30 +33,19 @@
  * even looked at. Client-injected keystrokes land correctly in vkbd's own
  * input_dev, but Eva is reading a different device entirely - invisible.
  *
- * Rather than fight Eva for a slot (impossible to win reliably - a keyboard
- * already attached at boot always registers before we do, and Eva doesn't
- * rescan once bound), this module tracks, via a standard input_handler
- * (vkbd_relay_* below), whichever device we believe Eva is currently bound
- * to - real or vkbd_dev itself - and injects into THAT device. Since
- * input_event() delivers to every handler currently attached to a device
- * (evdev included, which is what Eva reads through), this reaches Eva no
- * matter which single device it happens to be bound to, without ever
- * displacing a real keyboard, which keeps working as itself throughout.
+ * This module tracks via input_handler whichever device Eva is currently
+ * bound to and injects into THAT device. input_event() delivers to every
+ * handler attached to a device, so this reaches Eva regardless of which
+ * device it's bound to, without displacing a real keyboard. See
+ * NonCodeTechnicalInfo.md §2 for the full strategy.
  *
  * Sticky target selection - the part that's easy to get wrong
  * ---------------------------------------------------------------
- * A first version of this preferred "any connected external device" over
- * vkbd_dev unconditionally. That's wrong: once vkbd_dev has *already* become
- * what Eva is bound to (see slot reclaim below), a real keyboard plugging in
- * later must NOT preempt it as our injection target - Eva only rescans when
- * its current device disappears, never just because another one appears.
- * Confirmed live 2026-07-19: after a successful reclaim, a real keyboard was
- * plugged back in, our relay switched its injection target to it (matching
- * the old, wrong "prefer external" rule) - but Eva stayed bound to vkbd_dev
- * (which hadn't gone anywhere), so from that point neither the real keyboard
- * (typing landed on a device Eva wasn't reading) nor vkbd (same reason)
- * reached Eva, though both still worked fine as ordinary input devices (e.g.
- * to the local console) throughout.
+ * Once vkbd_dev becomes what Eva is bound to, a real keyboard plugging in
+ * later must NOT preempt it as the injection target. Eva only rescans when
+ * its current device disappears, not just because another one appears.
+ * Target selection must mirror Eva's behavior exactly. See
+ * NonCodeTechnicalInfo.md §2 for the incident this was based on.
  *
  * The fix: target selection is sticky. vkbd_current_ext (NULL meaning
  * "target is vkbd_dev itself") is only ever set in two places: (a) during
@@ -126,19 +115,8 @@ static int vkbd_initial_scan_done;
 static int vkbd_relay_registered;
 static struct work_struct vkbd_reclaim_work;
 
-/* TEST-ONLY, default 0 = zero production behaviour change.  Delays the start of
- * the deferred setup work so the unload-vs-setup race in vkbd_exit() becomes
- * deterministic instead of depending on whether keventd happens to win.
- *
- * The window is between vkbd_init()'s schedule_work() and vkbd_setup() actually
- * running: an unload landing inside it used to skip input_unregister_handler()
- * (the flag it tests is set BY that work) and then have flush_scheduled_work()
- * register the handler on the way out - leaving a function pointer into freed
- * module text on the global input_handler_list.  On an idle box keventd almost
- * always wins, so tests/kernel_safety/t3_vkbd_leak reported "not reproduced"
- * without clearing the code path at all.  Load with setup_delay_ms=500 and the
- * race is guaranteed: the bug reproduces on the old ordering, and the fixed
- * ordering stays clean.  See that test's README section. */
+/* TEST-ONLY (default 0). Delays deferred setup to make unload-vs-setup race
+ * deterministic. Exists only for tests/kernel_safety/t3_vkbd_leak. */
 static int setup_delay_ms;
 module_param(setup_delay_ms, int, 0444);
 MODULE_PARM_DESC(setup_delay_ms, "test-only: ms to delay deferred setup (default 0)");

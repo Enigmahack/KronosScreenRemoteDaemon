@@ -2,7 +2,6 @@ cmd_/home/share/KronosScreenRemoteDaemon/mode_page_hook_module/mode_page_hook.o 
 
 deps_/home/share/KronosScreenRemoteDaemon/mode_page_hook_module/mode_page_hook.o := \
   /home/share/KronosScreenRemoteDaemon/mode_page_hook_module/mode_page_hook.c \
-    $(wildcard include/config/preempt.h) \
   /home/share/KronosScreenRemoteDaemon/mode_page_hook_module/../source/no_tracepoints.h \
     $(wildcard include/config/tracepoints.h) \
   include/linux/module.h \
@@ -232,6 +231,7 @@ deps_/home/share/KronosScreenRemoteDaemon/mode_page_hook_module/mode_page_hook.o
   include/linux/spinlock.h \
     $(wildcard include/config/debug/spinlock.h) \
     $(wildcard include/config/generic/lockbreak.h) \
+    $(wildcard include/config/preempt.h) \
   include/linux/preempt.h \
     $(wildcard include/config/preempt/notifiers.h) \
   include/linux/thread_info.h \

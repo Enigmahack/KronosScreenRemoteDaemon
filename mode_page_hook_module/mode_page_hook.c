@@ -1,52 +1,10 @@
 /*
  * mode_page_hook.c - permanent, read-only inline hook on
- * CSTGFrontPanel::HandleSwitchEvent(eSTGButtonCode, bool) in OA.ko. Tracks a
- * software lit/unlit toggle for the Nautilus MODE and PAGE front-panel
- * buttons (loaded on Nautilus only - see try_load_mode_page_hook() in
- * screenremote.c). There is no host-visible copy of the real LED state
- * anywhere on this hardware, so this is a software model, not a hardware
- * reading: every observed physical press flips the corresponding bit,
- * starting from 0 (unlit) at module load, which always matches a fresh
- * boot's real state since this daemon can't run without one.
- *
- * HandleSwitchEvent is the single dispatch point every physical button
- * press (and BUTTON injection) goes through. MODE = eSTGButtonCode 1,
- * PAGE = eSTGButtonCode 2 - the same codes this daemon's btn_table[] uses
- * for COMBI/PROGRAM, an unrelated pre-existing BUTTON-injection issue on
- * Nautilus this module does not address.
- *
- * State is kept in a branch-free combined-index histogram
- * (index = (code & 0xFF) | ((pressed & 1) << 8)) inside the trampoline, so
- * the patched code path never needs a comparison or conditional jump. Only
- * two slots matter (MODE-pressed = index 0x101, PAGE-pressed = index
- * 0x102); their parity (odd/even count) is the current lit/unlit state.
- *
- * Calling convention: regparm(3), `this` in EAX (unused), eSTGButtonCode in
- * EDX, bool pressed in ECX.
- *
- * Patch site: HandleSwitchEvent+0x0a, a single 5-byte `mov eax,[abs32]`
- * (a1 imm32, the CPowerOffTimer::sInstance load) following a 10-byte
- * prologue that touches neither EDX nor ECX. Replacing exactly one whole
- * instruction with an equal-length `jmp rel32` means no instruction
- * boundary moves: a task preempted anywhere in the function (the kernel is
- * CONFIG_PREEMPT) resumes on a valid instruction whether it stopped before
- * or after the patch. Patching the 3-instruction prologue instead would
- * leave a task preempted at +1/+3 resuming in the middle of the jmp.
- *
- * The 5 patched bytes lie inside one naturally aligned qword (the function
- * is 16-byte aligned, so +0x08..+0x0f), and both install and removal
- * rewrite that qword with a single `lock cmpxchg8b`. Every other CPU (Linux
- * or RTAI domain, which a CPU rendezvous such as stop_machine() cannot
- * stop) therefore fetches either the complete original instruction or the
- * complete jmp, never a jmp with a partially written target. The bytes
- * before the patch site (55 89 e5 83 e4 f0 8d 64 24 f0 a1) are verified
- * first; a mismatch (wrong VA, different OA.ko build) or an unaligned
- * target makes the module refuse to install rather than patch unknown code.
- *
- * The trampoline, its counters and histogram share one vmalloc block that
- * is intentionally never freed once the hook has been live: a task
- * preempted inside the trampoline when the module is unloaded must still
- * find valid code and counters when it resumes.
+ * CSTGFrontPanel::HandleSwitchEvent in OA.ko. Tracks Nautilus MODE/PAGE
+ * button LED state in software (no hardware reading available). Loaded on
+ * Nautilus only. See NonCodeTechnicalInfo.md §4 for the design and
+ * NonCodeTechnicalInfo.md §11 for hooking strategy (same as nks4_inject.ko
+ * but simpler: single instruction replacement with lock cmpxchg8b).
  *
  * Usage (loaded by screenremote.c - see try_load_mode_page_hook(), not
  * meant to be insmod'd by hand):

@@ -1,27 +1,15 @@
 /*
- * eva_mode.c - READ-ONLY kernel memory read of Eva's live CModeManager
- * state, exposed via /proc/.eva_mode for screenremote.c to consume as the
- * primary source for its MODE=/EDITCTX= reporting (STATE, SYSINFO,
- * MODE_DETAIL). Production counterpart of ../tools/diagnostic_modules/eva_mode_peek_module/
- * eva_mode_peek.c, the diagnostic this was calibrated with - see
- * docs/EVA_ModeManager_probe.md for the full calibration session (all 7
- * SYS_MODE values and all 3 EDITCTX_RAW values independently confirmed live
- * against screenremote's own pixel ground truth, 2026-07-17) and
- * eva_mode_peek.c's header comment for the pointer-chain provenance this
- * shares verbatim (sm_poMMI -> CMMI::modeManager -> CModeManager fields).
+ * eva_mode.c - READ-ONLY kernel read of Eva's live CModeManager state,
+ * exposed via /proc/.eva_mode for screenremote MODE=/EDITCTX= reporting.
+ * Production version of eva_mode_peek.c diagnostic module. See
+ * NonCodeTechnicalInfo.md §3 for the full design.
  *
- * Trimmed from eva_mode_peek.c for production use: no DUMP hexdump (that
- * was for the Help/Compare exploratory pass, unrelated to mode detection),
- * single-line /proc output for a trivial sscanf() in screenremote.c, and
- * the field offsets are #defines exactly as calibrated - not module params,
- * same rationale as eva_mode_peek.c (a wrong offset needs re-deriving from
- * the decompile, not a live numeric tweak).
+ * Differences from eva_mode_peek.c: single-line /proc output, field offsets
+ * as #defines (not module params - wrong offsets need re-deriving, not tweaking).
  *
- * Deliberately reports RAW SYS_MODE (0-6, Eva's own arbitrary ESysMode
- * ordinal) and RAW EDITCTX_RAW (0-2), NOT translated into screenremote's
- * public MODE=1..7/EDITCTX=0..2 wire numbering - that translation lives in
- * screenremote.c (eva_mode_read(), source/screenremote.c) so a mapping fix
- * only needs a daemon rebuild, not a kernel module rebuild+reload.
+ * Reports RAW SYS_MODE (0-6) and RAW EDITCTX_RAW (0-2), not the wire-format
+ * translation. Translation lives in screenremote.c so fixes need only daemon
+ * rebuild, not kernel module rebuild+reload.
  *
  * Lowest-PID tiebreak in find_eva_mm() and the RCU-only task-list walk (no
  * tasklist_lock/get_task_struct - neither carries an EXPORT_SYMBOL on this
@@ -34,22 +22,11 @@
  * isn't up yet / the pointer chain doesn't resolve - not an error, just
  * means the caller should fall back to pixel detection).
  *
- * STAGE= (added after a real console-less production unit sat with
- * RESOLVED=0 for 30+ minutes with no way to tell why - see
- * docs/EVA_ModeManager_probe.md): which hop failed, same three stages
- * eva_mode_peek.c's diagnostic STAGE= field already distinguished -
- * find_task (no process named eva_comm - the same condition
- * screenremote.c's own independent find_eva_pid() fallback needs to see
- * Eva to ever clear the boot gate via EVA_BOOT_UPTIME_OVERRIDE_S), or
- * read_sm_pommi/read_modemgr_ptr (Eva process found, but sm_pommi_addr or
- * its +OFF_CMMI_MODEMGR hop doesn't hold the expected pointer for this
- * Eva build - address recalibration needed, not a "Eva hasn't started
- * yet" condition). Previously both collapsed into a bare "RESOLVED=0\n",
- * indistinguishable without swapping in eva_mode_peek.c and reading it
- * interactively - not possible on a unit with no console/dropbear.
- * screenremote.c's own eva_mode_read() is unaffected: it already stops
- * scanning at "RESOLVED=%d" failing to reach 5 sscanf'd fields, so the
- * extra STAGE=/... lines after a RESOLVED=0 are inert to it.
+ * STAGE= output distinguishes why RESOLVED=0: find_task (Eva not found),
+ * read_sm_pommi (sm_pommi_addr doesn't resolve), or read_modemgr_ptr
+ * (pointer chain broken). Without this, both "Eva hasn't started" and
+ * "address needs recalibration" collapsed into bare RESOLVED=0. See
+ * NonCodeTechnicalInfo.md §3 for context.
  */
 
 #include <linux/module.h>
@@ -69,26 +46,17 @@
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Read-only: exposes Eva's live CModeManager mode/edit-context state to screenremote via /proc/.eva_mode");
 
-/* CModeManager field offsets - fully calibrated live 2026-07-17, see
- * docs/EVA_ModeManager_probe.md. Kept as #defines, not module params - see
- * eva_mode_peek.c's identical rationale. */
+/* CModeManager field offsets - calibrated via eva_mode_peek.c diagnostic.
+ * Kept as #defines, not module params (wrong offsets need recalibration). */
 #define OFF_CMMI_MODEMGR   0x04UL
 #define OFF_MM_SYSMODE     0x04UL
 #define OFF_MM_EDITCTX     0x30UL
 #define OFF_MM_EDITSLOT    0x34UL
 
-/* 0644, not 0444: screenremote.c's resolve_eva_sm_pommi_addr() (source/
- * screenremote.c) autodetects the real value for whatever Eva build is
- * actually running - by reading CMMI::sm_poMMI straight out of Eva's own
- * on-disk ELF .symtab, since the shipped binary isn't stripped - and
- * live-corrects this via /sys/module/eva_mode/parameters/sm_pommi_addr the
- * moment that becomes possible (Eva.img's cryptoloop mount has to exist
- * first). The compiled-in default below is calibrated against the 3.2.2
- * Eva build only (see docs/EVA_ModeManager_probe.md) and is a fallback for
- * if that autodetection never manages to run this boot, not the expected
- * steady-state value on every unit. eva_mode_read_proc() re-reads this
- * global fresh on every /proc/.eva_mode call (no caching), so a sysfs write
- * takes effect on the very next read, no module reload required. */
+/* 0644, not 0444: writable via sysfs. screenremote.c autodetects the real
+ * value by reading Eva's ELF .symtab and live-corrects via sysfs when Eva.img
+ * is mounted. Default below is Eva 3.2.2 calibration, fallback only. Re-read
+ * fresh on every /proc/.eva_mode call, no caching. */
 static unsigned long sm_pommi_addr = 0x0ae431b0UL;
 module_param(sm_pommi_addr, ulong, 0644);
 MODULE_PARM_DESC(sm_pommi_addr, "VA of Eva's sm_poMMI global (CMMI*), default 0x0ae431b0 - "
@@ -98,23 +66,10 @@ static char eva_comm[TASK_COMM_LEN] = "Eva";
 module_param_string(eva_comm, eva_comm, sizeof(eva_comm), 0444);
 MODULE_PARM_DESC(eva_comm, "task comm name to search for (default \"Eva\")");
 
-/* Second, independent match criterion alongside eva_comm - a substring to
- * look for in a candidate process's resolved exe path (via mm->exe_file +
- * d_path(), the same mechanism /proc/<pid>/exe uses - both exported/
- * directly-accessible on this kernel, no tasklist_lock/get_task_struct
- * trap like find_eva_mm()'s own header comment warns about elsewhere).
- * Exists because eva_comm alone is one hardcoded 16-byte task name (the
- * TASK_COMM_LEN truncation of argv[0]) that a different Eva build, a
- * differently-named wrapper/supervisor process, or any future OS revision
- * could legitimately not match, with nothing to fall back on - see
- * docs/EVA_ModeManager_probe.md's real-hardware incident where RESOLVED=0
- * held for 30+ minutes with STAGE=find_task and no way to tell whether
- * that meant "Eva isn't running" or "Eva IS running under a name we
- * didn't anticipate". A process matching either eva_comm OR eva_exe_path
- * is now a candidate; find_eva_mm() picks the lowest PID among the union,
- * the same tiebreak already used for the transient-same-comm-process case
- * (see below) - a transient process could equally share a exe path
- * (e.g. a re-exec of the same binary) as share a comm. */
+/* Secondary match criterion: substring in resolved exe path. Exists
+ * because eva_comm alone (16-byte task name truncation) could legitimately
+ * not match on a differently-named build or wrapper. Matches on eva_comm
+ * OR eva_exe_path; find_eva_mm() picks lowest PID among union. */
 static char eva_exe_path[64] = "/Eva/Eva";
 module_param_string(eva_exe_path, eva_exe_path, sizeof(eva_exe_path), 0444);
 MODULE_PARM_DESC(eva_exe_path, "substring to match against a process's resolved exe path (default \"/Eva/Eva\")");

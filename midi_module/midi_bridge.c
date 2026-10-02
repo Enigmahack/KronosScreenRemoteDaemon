@@ -23,12 +23,9 @@
  * stream: performance appears once (per-port queues don't echo it - verified) and a
  * dump to ANY destination is captured. q0 (active-sensing) is excluded.
  *
- * On-hardware measurement (2026-07-09) and a full trace of the OA out-port
- * construction proved OA registers exactly 2 out-ports (fixed at compile time in
- * CKorgUsbAudioDriverMidiPorts's static init), so each queue's reader count is a
- * stable 2 with free slots. Because OA never grows the count at runtime, we are
- * always the top reader on each queue, so on unload we atomically give the slots
- * back (no leak, clean reload). See project-midi-out-queue-tap-feasibility.
+ * OA registers exactly 2 out-ports (fixed at compile time), so each queue's
+ * reader count is stable with free slots. We're always the top reader, and slots
+ * are atomically returned on unload (no leak, clean reload). See TechCodeManual §4.
  *
  * The drain runs when /proc/.midi_ring is READ (in the reader's process context),
  * not on a timer or the shared workqueue and with no console output - a read-only
@@ -87,13 +84,9 @@ module_param(register_fn, ulong, 0444);
 static unsigned long regoutport = 0;
 module_param(regoutport, ulong, 0444);
 
-/* VM-testing only, optional (default 0 = unused on real hardware). The from-scratch
- * OA.ko reconstruction under kronosology/reconstructed/OA exposes
- * CSTGMidiPortManager::sMidiInPorts/sMidiOutPorts directly via two small non-real
- * accessor functions, so find_port_object()/resolve_out_ports() can skip the
- * RegisterMidiInPort/RegisterMidiOutPort byte-pattern scan (calibrated to real
- * hardware's specific GCC-4.5.0 codegen and not applicable to a differently
- * compiled binary) and just call the accessor directly instead. */
+/* VM-testing only (default 0 = unused on real hardware). Optional accessor
+ * functions to skip byte-pattern scanning when testing against reconstruction
+ * builds. Not applicable to production hardware. */
 static unsigned long fn_inports_get = 0;   /* CSTGMidiPortManager_GetInPortsArrayForTest() */
 module_param(fn_inports_get, ulong, 0444);
 
@@ -157,13 +150,9 @@ static uint32_t inject_ok;      /* count of injections that reached OA (fn calle
 static uint32_t inject_bytes;   /* total bytes handed to MidiInPortGeneric7Receive */
 static uint8_t  inject_first;   /* first byte of the most recent injection */
 
-/* Drain window.  The per-port queues live in the codec's ioremapped memory, and
- * even IDLE 1 kHz wpos polling there contends with the RT engine under load
- * (framebuffer stream + rtf5 touch + a Program/Combi load) and stalls it -> EVA
- * freeze.  Dumps are always client-request-driven, so we poll/drain the codec
- * region ONLY inside a window opened by an injection (the dump request) and kept
- * alive while reply bytes are still flowing.  Outside the window tap_drain touches
- * no codec memory at all.  jiffies-based; best-effort, no lock needed. */
+/* Drain window: poll the codec region ONLY when a dump request opens a window
+ * and keep it alive while reply bytes flow. Prevents contention with RT engine
+ * during idle polling. Jiffies-based, best-effort, no lock. See TechCodeManual §4. */
 static unsigned long drain_until;          /* drain active while time_before(jiffies, this) */
 static int slots_held;                      /* 1 while reader slots are claimed (dump window) */
 #define DRAIN_OPEN_MS    3000   /* window after a dump request (covers OA reply latency);
@@ -259,23 +248,10 @@ struct tapq {
 static struct tapq taps[6];   /* shared q1,q2 + up to 4 per-port q3 */
 static int ntaps;             /* number of queues we successfully tapped */
 
-/* kptr_ok()/tap_read8/tap_read32/tap_readn now come from ../common/oa_safe.h
- * (byte-identical to what nks4_inject.c independently grew for the same
- * reason - merged 2026-09-19). Kept as macros over the shared oa_probe_*
- * names rather than renaming every call site in this file.
- *
- * kptr_ok() only rejects obviously-garbage pointers (null, misaligned, out of
- * kernel range) - it cannot tell a plausible pointer from one that's since gone
- * stale.  t->ringctl/t->buf are resolved ONCE, at setup (tap_claim_reader runs a
- * single time), and OA can free/move a queue's control structure during normal
- * operation - e.g. a Program/Combi load's codec-MIDI reconfiguration - with no
- * module unload involved at all.  A raw dereference of a since-freed t->ringctl
- * oopsed on real hardware (2026-07-16): rmmod OA -> midi_module_notify ->
- * tap_release_reader -> tap_release_slots, EIP in tap_release_slots, CR2 a
- * plausible-looking but no-longer-mapped address.  probe_kernel_read/write use
- * the kernel's fault exception tables to turn that into a clean failure instead
- * of an oops - every touch of a t->ringctl-derived control-structure address in
- * tap_claim_slots/tap_release_slots/tap_drain_one's wpos read goes through these. */
+/* kptr_ok()/tap_read8/tap_read32/tap_readn from oa_safe.h. Macros over
+ * oa_probe_* to avoid renaming every call site. probe_kernel_read/write guard
+ * against stale queue pointers (OA can reconfigure MIDI during normal operation).
+ * Prevents oops from freed/moved queue control structures. */
 #define tap_read32 oa_probe_read32
 #define tap_read8  oa_probe_read8
 #define tap_readn  oa_probe_readn
@@ -373,13 +349,9 @@ static int tap_claim_one(unsigned long portp, int qslot)
     qbuf = v;
     if (!kptr_ok(qptr) || !kptr_ok(qbuf))
         return -1;
-    /* Two taps resolving the SAME ringctl (e.g. two ports whose queue
-     * pointers happen to alias) would defeat tap_release_slots()'s "we are
-     * always the top reader" invariant - the lower-index one releases first,
-     * fails the top-reader check, and gets retired while the real top reader
-     * (the other tap on the same queue) never frees its slot, permanently
-     * inflating OA's reader count by one. Refuse the duplicate outright
-     * rather than relying on release order to save it (found 2026-09-19). */
+    /* Refuse duplicate queue taps (aliased ringctl). Prevents permanent reader
+     * slot leak when lower-index tap releases first, fails top-reader check, and
+     * retires while the actual top reader keeps its slot forever. */
     {
         int j;
         for (j = 0; j < ntaps; j++)
@@ -476,13 +448,9 @@ static void tap_claim_slots(void)
 static void tap_release_slots(void)
 {
     int i;
-    /* Descending, not ascending: the "we are always the top reader" comment
-     * above assumes stack discipline (last claimed, first released). Reader
-     * indices are handed out in ascending claim order (tap_claim_slots()'s
-     * __sync_fetch_and_add), so releasing taps[] in the same ascending order
-     * is backwards for that invariant - tap_claim_one() now refuses a
-     * duplicate ringctl so this can't matter in practice, but descending
-     * order is the actually-correct one to have regardless (found 2026-09-19). */
+    /* Descending release order enforces stack discipline (last claimed, first
+     * released), matching the "top reader" invariant. Reader indices are handed
+     * out in ascending order, so releasing in ascending order is backwards. */
     for (i = ntaps - 1; i >= 0; i--) {
         struct tapq *t = &taps[i];
         volatile uint8_t *rcount;
@@ -536,10 +504,8 @@ static int tap_claim_reader(void)
     /* Single pass over the 4 out-ports (was two - an identical re-read of
      * the same 4 entries, once just to find the first valid one for p0, once
      * to claim q3 on every valid one including that same port again).
-     * First activated out-port carries the shared queue pointers (q1/q2 -
-     * identical across all out-ports, so claimed exactly once, off the
-     * first valid port encountered); every valid out-port (that one
-     * included) also gets its own per-port q3 claimed (found 2026-09-19). */
+     * First out-port carries shared queue pointers (q1/q2, claimed once).
+     * Every valid out-port also gets its own per-port q3 claimed. */
     for (i = 0; i < 4; i++) {
         uint32_t v;
         if (!tap_read32(out_ports + i * 4, &v) || !kptr_ok(v))
@@ -621,16 +587,10 @@ static void tap_drain_one(struct tapq *t)
     take  = (avail < space) ? avail : space;
 
     /* Fault-safe, wrap-split copy.  t->buf points into the codec's ioremapped
-     * region and is captured once at setup - exactly the staleness class that
-     * oopsed on a raw t->ringctl deref (2026-07-16).  A plain C load here has no
-     * exception-table entry, so if that region is unmapped between the (safe)
-     * wpos read above and this copy it is an oops in process context, while
-     * holding ring_lock, on a board with no console.
-     *
-     * BOTH wraps have to be split, not just the source: uni_ring is a fixed
-     * 64 KB array, so a copy sized only against the queue's own wrap can run off
-     * its end.  At most three iterations.  Bytes already copied before a fault
-     * are kept (uni_wpos/cursor advance by `done`) rather than dropped. */
+     * region and is captured once at setup. A plain C load has no exception-table
+     * entry, so unmapped regions between wpos read and copy cause oops. Split both
+     * wraps: uni_ring is fixed 64 KB, copy oversizes against queue-only wrap.
+     * Keep bytes already copied before fault (uni_wpos/cursor advance by done). */
     done = 0;
     while (done < take) {
         uint32_t soff = (t->cursor + done) & t->mask;
@@ -798,10 +758,7 @@ static ssize_t ring_fops_write(struct file *file, const char __user *buf,
             uint32_t wpos;
             if (!t->ringctl || t->reader_idx < 0)
                 continue;
-            /* Safe read/write - see tap_read32's comment. Same stale-t->ringctl
-             * class as the crash this whole safe-read/write conversion fixed;
-             * this call site (a new client resyncing) was left raw and only
-             * caught on review (2026-07-16). */
+            /* Safe read/write - protects against stale t->ringctl. */
             if (!tap_read32(t->ringctl + RC_WPOS, &wpos)) {
                 t->ringctl = 0;
                 t->reader_idx = -1;
@@ -839,12 +796,8 @@ static int ports_read_proc(char *page, char **start, off_t off,
         struct tapq *t = &taps[i];
         uint8_t rc = 0;
         uint32_t wpos = 0;
-        /* t->ringctl can be 0 here (a prior safe-read fault cleared it - see
-         * tap_read32's comment) while ntaps is left unchanged, so this diagnostic
-         * dump must not raw-deref it unconditionally the way it used to: that
-         * would fault reading offset 0x20/0x0c off a null pointer - a NEW crash
-         * this whole safe-read conversion would otherwise have introduced here,
-         * caught only on review (2026-07-16). Missing/faulted reads just show 0. */
+        /* t->ringctl can be 0 after safe-read faults. Don't unconditionally deref.
+         * Missing/faulted reads just show 0. */
         if (t->ringctl) {
             tap_read8(t->ringctl + RC_RCOUNT, &rc);
             tap_read32(t->ringctl + RC_WPOS, &wpos);

@@ -2,13 +2,10 @@
  * screenremote.c  - Kronos/Nautilus framebuffer streaming daemon
  *
  * Streams /dev/fb1 over TCP port 7373 (default; set by config):
- *   Kronos 1/X/2 : 800x600, 8bpp palette-indexed (OmapVideoModule 8bpp default)
+ *   Kronos 1/X/2 : 800x600, 8bpp palette-indexed
  *   Nautilus     : 800x480 visible rows of an 800x600 RGB565 little-endian
- *                  truecolor buffer (OmapVideoModule 16bpp default; Eva renders
- *                  RGB888 -> RGB565 itself and NEVER sends the kernel a palette -
- *                  see kronosology/docs/hardware/nautilus_color_palette.md
- *                  "Round 6"). There is no palette to apply on this hardware;
- *                  the daemon ships the native pixels and the client decodes.
+ *                  truecolor buffer. Eva renders RGB888 -> RGB565 directly.
+ *                  See TechCodeManual §1 for the 16bpp architecture.
  * Mirrors fb1 to /dev/fb0 (VGA out) when /korg/rw/screenremote/.mirror_enable exists.
  *
  * Stream handshake (TCP port 7373) - two protocol versions, selected by the
@@ -63,50 +60,17 @@
  *   MIDI_STATUS             -> MIDI_LOADED=n\nMIDI_IN=n\nMIDI_CAPTURE=n\nOK\n
  *   SS_TIMEOUT n            - set screensaver timeout at runtime (seconds; 0 = disable)
  *   STATE                   -> MODE=N EDITCTX=E BOOT=B\n
- *                            MODE (0=init/undetected 1=Setlist 2=Combi 3=Program 4=Sequence
- *                              5=Sampling 6=Global 7=Disk) and EDITCTX (0=none 1=Program-edit-
- *                              from-Combi 2=Program-edit-from-Sequence) are read live via
- *                              get_mode_state() - see that function for the full priority
- *                              order. Primary source is eva_mode.ko, a small kernel module
- *                              loaded at startup that reads Eva's own live CModeManager state
- *                              directly out of its process memory (exact - no thresholds, and
- *                              the only source that can report EDITCTX=2, fully calibrated
- *                              live against pixel ground truth 2026-07-17, see
- *                              docs/EVA_ModeManager_probe.md). Falls back to framebuffer pixel
- *                              detection (detect_ui_mode()/detect_program_edit_context(),
- *                              mode_detect_refs.h) when eva_mode.ko isn't loaded or hasn't
- *                              resolved yet (e.g. early boot before Eva has started) - pixel
- *                              detection's own fallback to the last BUTTON-commanded mode
- *                              applies in that path only. Either way this is the daemon's own
- *                              source of truth, not an echo of client-side screen comparison.
+ *                            Live mode and edit context (see TechCodeManual §9).
  *                            Nautilus appends MODE_LIT=0|1 PAGE_LIT=0|1: the MODE/PAGE
- *                              button LEDs, detected from the popup each one opens (see
- *                              lit_state(), lit_detect_refs.h).
+ *                              button LEDs, detected from on-screen popups (lit_detect_refs.h).
  *   MODE_DETAIL             -> SOURCE=eva|pixel MODE=N EDITCTX=E EDITSLOT=S EVA_LOADED=0|1
  *                              EVA_RESOLVED=0|1\n
- *                            Richer counterpart to STATE (same spirit as PADMAP_STATE
- *                              alongside PADMAP_*): SOURCE says which of the two paths above
- *                              actually answered MODE/EDITCTX this call; EDITSLOT is the
- *                              timbre/track index being Program-edited (-1 if EDITCTX=0, or
- *                              if eva_mode.ko didn't resolve); EVA_LOADED/EVA_RESOLVED let a
- *                              caller confirm eva_mode.ko is in play rather than the pixel
- *                              fallback without needing to infer it from SOURCE alone.
+ *                            Richer version of STATE with source info and edit slot index.
  *   VERSION                 -> VER=x.x.x BUILD=xxx\n
- *   CAL_GET                 -> CAL <text>\n | CAL NONE\n  (owner only; the client's touch
- *                              calibration mesh, stored on the unit - see cal_store())
+ *   CAL_GET                 -> CAL <text>\n | CAL NONE\n  (owner only; touch calibration stored on unit)
  *   CAL_SET <text>          -> OK\n | ERR INVALID\n | ERR WRITE_FAILED\n
  *   MODEL                   -> FAMILY=KRONOS|NAUTILUS MODEL=<code> FB_BPP=8|16\n
- *                            Which physical unit this daemon is running on - see
- *                              detect_device_model()'s header comment for how FAMILY (from
- *                              fb1's native bpp, hardware-confirmed) and MODEL (from
- *                              /proc/cpuinfo, narrows within FAMILY) are derived, and which
- *                              MODEL codes exist (KRONOS1/KRONOSX/KRONOS2/KRONOS3/
- *                              KRONOS_UNKNOWN/NAUTILUS/NAUTILUS_UNKNOWN - KRONOS3 and a
- *                              NAUTILUS_UNKNOWN caused by an Atom CPU string are both an
- *                              INFERRED conflict resolution, logged loudly, not a confirmed
- *                              mapping like the rest). Static for the life of the
- *                              process. SYSINFO's MODEL_FAMILY/MODEL/MODEL_CPU repeat this
- *                              (plus the raw CPU string) for a caller already polling SYSINFO.
+ *                            Physical unit identification (see TechCodeManual §6).
  *   SYSINFO                 -> multi-line key=value block terminated by OK\n
  *                            (UPTIME, LOAD, MEM_*, CPU_*, AUDIO_*, DISK_*, USB_*, TEMP*, FAN*,
  *                              MODE, EDITCTX, MODEL_FAMILY, MODEL, MODEL_CPU)
@@ -140,42 +104,10 @@
  * until the folder is removed.  Deleting .boot by hand only skips the current boot's guard; it is
  * not the way to make a fix stick.
  *
- * Front-panel injection (BUTTON, CHORD, the TOUCH commands, WHEEL, SLIDER, KNOB,
- * VSLIDER): as of 1.10.0 these no
- * longer write raw packets to /dev/rtf5.  rtf5 is OA.ko's own OUTBOUND notification FIFO to Eva
- * (created by OA in stg_rtfifo_init, direction OA-RT -> Eva) - genuine hardware events reach OA
- * through a completely separate path (CSTGOmapNKSMsgHandler::ProcessNextNKSEvent() pulling raw
- * NKS4 commands via the exported OmapNKS4InputFifo_ReadCommand and dispatching directly to
- * CSTGFrontPanel::Handle*), so writing a synthetic packet to rtf5 only ever fooled Eva's own
- * UI-mirroring code - it never touched the real OA-side action.  That's exactly why touch/mode
- * buttons "mostly worked" (Eva's own widget hit-testing reconstructed the right behaviour from
- * the mirrored packet) while sequencer transport, tempo, and some MIDI-triggering touch actions
- * did nothing (their real effect lives inside OA and was never reached).
- *
- * nks4_inject.ko (extracted from the embedded buffer below, loaded early at startup - see
- * try_load_nks4_inject()) calls OA's real CSTGFrontPanel::HandleSwitchEvent / HandleTouchPanel /
- * HandleRotary / HandleAnalogController directly via /proc/.nks4inject, i.e. the exact function
- * a physical press/touch/turn dispatches through - so injected events get bit-for-bit the same
- * response as hardware, independent of whatever mode Eva happens to be in.  See g_nks4_loaded.
- *
- * rtf5 fallback (g_rtf5_fallback_active): if nks4_inject.ko is ever given up on for a boot
- * (permanent load failure, or OA never reaching Live within NKS4_LOAD_DEADLINE_S of the deferred
- * retry starting - see the main loop), BUTTON, CHORD, the TOUCH commands, WHEEL, SLIDER, and
- * VSLIDER fall back to writing raw packets to /dev/rtf5, OA's own OUTBOUND notification FIFO to
- * Eva (stg_rtfifo_init, direction OA-RT -> Eva) - the pre-1.10.0 injection mechanism.  This is a
- * DEGRADED path, not a substitute: genuine hardware events reach OA through a completely separate
- * route (CSTGOmapNKSMsgHandler::ProcessNextNKSEvent() -> CSTGFrontPanel::Handle*), so a synthetic
- * rtf5 packet only ever fools Eva's own UI-mirroring code - it never touches the real OA-side
- * action.  That's why touch/mode buttons "mostly work" this way (Eva's own widget hit-testing
- * reconstructs the right behaviour from the mirrored packet) while sequencer transport
- * (SEQ_START/SEQ_REC/SEQ_LOCATE/SEQ_FF/SEQ_REW/SEQ_PAUSE), TAP_TEMPO, SMPL_REC/SMPL_START, and
- * some MIDI-triggering touch actions silently do nothing even though the daemon still replies OK -
- * their real effect lives inside OA and is never reached.  KNOB/JOYSTICK/VECTOR/RIBBON/
- * AFTERTOUCH/PEDAL/FOOTSWITCH/DAMPER/TEMPO/PADCHORD have no rtf5 equivalent at all (added after
- * rtf5 was retired) and still return "ERR NKS4_NOT_LOADED\n" in fallback mode; a BUTTON/CHORD name
- * that exists in btn_table[] but has no historical rtf5 (dev,code) mapping (see rtf5_btn_table[])
- * returns "ERR RTF5_UNSUPPORTED\n" instead.  Entering fallback is logged to both stderr and
- * RTF5_FALLBACK_LOG (FTP-visible under LOG_DIR) so a degraded boot is never silent.
+ * Front-panel injection uses nks4_inject.ko, which calls OA's real CSTGFrontPanel handlers
+ * (HandleSwitchEvent, HandleTouchPanel, HandleRotary, HandleAnalogController) via /proc/.nks4inject,
+ * delivering bit-for-bit hardware-equivalent behavior. See TechCodeManual §3 for the injection
+ * architecture and rtf5 fallback behavior.
  */
 
 #define _GNU_SOURCE   /* for sched_setaffinity / CPU_SET */
@@ -290,26 +222,8 @@ static uint32_t  fb1_stride, fb0_stride;
 static uint32_t  fb_w, fb_h;           /* 800, 600 */
 static uint32_t  frame_bytes;          /* fb_w * fb_h */
 
-/* Nautilus fb1 (kronosology/docs/hardware/nautilus_fb1_16bpp.md + nautilus_color_
- * palette.md "Round 6"): the Kronos family's fb1 is a real 8bpp indexed buffer,
- * but the Nautilus's OmapVideoModule build defaults to bits_per_pixel=16 and the
- * buffer is genuine RGB565 little-endian truecolor (Eva renders RGB888 into a
- * virtual framebuffer and ScreenUtil::Convert24bppTo16bppRGB() flushes it here).
- * FBIOGET_FSCREENINFO's line_length (800) and the 8/8/8@0 channel descriptors
- * are stale metadata copied from the Kronos 8bpp default - Eva ignores them and
- * so do we. fb1_native_bpp/fb1_hw_map/fb1_hw_stride hold the raw device mapping.
- *
- * fb1_map/fb1_stride keep meaning what they always have (a byte-per-pixel,
- * fb_w-strided buffer) by pointing at fb1_shadow, refreshed once per tick by
- * fb1_refresh_shadow() with the LOW byte of each RGB565 word (GGGBBBBB). That
- * byte is NOT a palette index - it is only a cheap luminance-ish proxy that the
- * non-streaming heuristics (boot gate fb_metrics(), screensaver change sampling,
- * VGA mirror, pixel-fingerprint mode detection) keep consuming exactly as in
- * 3.0.1 so their Nautilus behaviour is unchanged by this release. Nothing that
- * reaches a client is derived from it any more: the v3 stream reads
- * fb1_hw_map directly (see the "Native (v3) stream" block further down), and v2
- * clients are refused on this hardware rather than fed that byte as an index
- * (which is exactly what 3.0.1 did, and why its Nautilus colours were wrong). */
+/* Nautilus fb1 architecture: See TechCodeManual §1 for the Nautilus/Kronos
+ * framebuffer differences and the two-buffer approach (fb1_hw_map vs. fb1_shadow). */
 static int       fb1_native_bpp = 8;
 static uint8_t  *fb1_hw_map = NULL;
 static uint32_t  fb1_hw_stride = 0;
@@ -343,13 +257,9 @@ static int       v3_shadow_valid = 0;
 static uint8_t   client_ver = 2;      /* hello version byte of the connected stream client */
 static int       v3_pull_pending = 0; /* pull request deferred by the byte-rate cap: 0/0xFF/0xFE */
 
-/* Byte-rate cap (token bucket). On the Nautilus the only NIC is a USB2 dongle
- * that shares the single xHCI bus (and its IRQ core) with the NKS4 front-panel
- * link - the same bus every panel video flush and all USB-MIDI travel over - so
- * an uncapped burst of page-switch frames can crowd the panel itself. The cap
- * bounds our share of that bus; fps floats underneath it. 0 = unlimited (the
- * Kronos default: PCIe NIC, TWI panel, no shared bus). stream_max_kbps= in
- * screenremote.cfg overrides either default. */
+/* Byte-rate cap (token bucket). On Nautilus, prevents streaming bursts from
+ * crowding the front-panel link (see TechCodeManual §10). Default on Nautilus is
+ * 24 Mbps; Kronos default is unlimited. Overridable via stream_max_kbps= in config. */
 #define NAUTILUS_DEFAULT_MAX_KBPS 24000
 static int       g_stream_max_kbps = -1;          /* -1 = not configured, pick per hardware */
 static double    g_bucket_bytes = 0;              /* tokens available right now, in bytes */
@@ -368,11 +278,8 @@ static char      g_board_name[48]   = "";   /* /sys/class/dmi/id/board_name */
 static char      g_bios_version[32] = "";   /* /sys/class/dmi/id/bios_version */
 static int       g_panel_hwver      = -1;   /* /proc/OmapNKS4HardwareVersion (panel subsystem), -1 unknown */
 
-/* CPU topology, probed once by cpu_topology_probe() (from /sys/devices/system/
- * cpuN/topology) and reported verbatim by MODEL and SYSINFO so clients never
- * have to infer core counts from FAMILY - the Kronos 1/X/2 are 2 cores x 2
- * threads, the Nautilus / Kronos 3 are 4 cores x 1 thread, both 4 logical
- * CPUs. g_cpu_daemon_mask / g_cpu_rt_mask are filled by pick_cpu_affinity(). */
+/* CPU topology from /sys/devices/system/cpuN/topology, cached for affinity
+ * assignment (see TechCodeManual §8). Reported in MODEL/SYSINFO. */
 static int           g_cpu_logical = 0;    /* online logical CPUs */
 static int           g_cpu_cores   = 0;    /* distinct physical core ids */
 static int           g_cpu_threads = 0;    /* logical per core (1 = no HT) */
@@ -421,84 +328,24 @@ static time_t   last_ss_chk   = 0;
 static uint8_t  ss_prev[SS_SAMPLE_N];
 static int      ss_prev_valid = 0;
 
-/* Touch calibration - pixel -> 8-bit-per-axis ADC, empirically tuned against real
- * hardware. Overridable per unit via screenremote.cfg.
- *
- * The values below are the KRONOS-family defaults. The HORIZONTAL pair is shared
- * with the Nautilus unchanged; only the VERTICAL pair differs, and only by a
- * gain (see NAUTILUS_TOUCH_Y_* below and its application in main()).
- *
- * Why x needs no per-device value and y does: Eva converts ADC back to pixels in
- * an 800x600 logical canvas on BOTH families (CEditor::CPanelIfcTask::
- * OnTouchPanelEvent; both builds hardcode /800 and /600 in
- * CFormDlogGlobalCalibTouchPanel::ProcessLeftTop/ProcessRightBottom, and
- * ScreenManager::GetScreenXMax/YMax return 799/599 on both). Horizontally that
- * canvas reaches the panel 1:1, so the same constants land correctly. Vertically
- * it does not: ScreenManager::CreateScreens attaches a KorgDisplayBilinearScalerSSE
- * mapping the 800x600 canvas onto PegRect{0,0,799,521}, so a canvas row is
- * compressed by ~522/600 before it reaches the rows this daemon streams. The
- * vertical constants have to absorb that. */
+/* Touch calibration: pixel -> 8-bit ADC per axis. Kronos defaults below.
+ * Nautilus HORIZONTAL pair shared; VERTICAL pair differs due to display scaling.
+ * See TechCodeManual §2 for why and how. Overridable via screenremote.cfg. */
 static int g_touch_x_offset = 10;   /* pixels added to x before ADC scaling      */
 static int g_touch_x_range  = 813;  /* total pixel span -> ADC 0-255             */
 static int g_touch_y_offset = 20;   /* pixels added to y before ADC scaling      */
 static int g_touch_y_range  = 638;  /* total pixel span -> ADC 0-255             */
 
-/* Nautilus HORIZONTAL touch constants - second calibration pass, 2026-09-21.
- *
- * The first pass appeared to show x needing no correction (offsets 0, 0, ~1), but
- * those nodes had simply never been adjusted - an exactly-zero row is what an
- * untouched grid looks like, and the 70 px vertical error dominated that session.
- * Once y was correct (544/18 below), a clean x measurement became possible and
- * showed a real 5.4% gain error that had been there all along. Nothing about the
- * y change can affect x: inject_touch() computes h_adc and v_adc independently
- * and packs them into separate bytes, which Eva then scales with separate margin
- * pairs and separate spans.
- *
- *     sent x=0   -> landed  -13.7      sent x=400 -> landed 408.0
- *     sent x=799 -> landed 830.3  (i.e. 31 px off the right edge of the panel)
- *
- * Fitting the left and middle columns only - the right-hand nodes sit off-screen
- * at the old constants, so they can't be placed by hand - gives
- * landed = 1.05418*x - 13.67, gives range 857.1 / offset 24.2, and independently
- * predicts that unplaceable right column to within 1.7 px. 857/24 holds the whole
- * 0-799 sweep to under 2 px.
- *
- * Per-column scatter was 1-3 px (versus up to 18 px per row on the y axis), so
- * this is the better-conditioned of the two measurements.
- *
- * NOT applied to the Kronos: 813/10 is long-standing there and this was measured
- * on a Nautilus. Worth re-checking on a Kronos, since 813/10 may carry the same
- * error - it was last touched by a commit whose message says "hopefully removing
- * the need for calibration entirely", which is not a measurement. */
+/* Nautilus HORIZONTAL touch constants. See TechCodeManual §2 for calibration
+ * methodology and why these differ from Kronos values. NOT applied to Kronos. */
 #define NAUTILUS_TOUCH_X_RANGE   857
 #define NAUTILUS_TOUCH_X_OFFSET   24
 static int g_touch_x_range_from_config  = 0;
 static int g_touch_x_offset_from_config = 0;
 
-/* Nautilus VERTICAL touch constants - third and final calibration pass, 2026-09-21.
- *
- * Refined on a screen the user had calibrated and with the horizontal axis already
- * correct (857/24 above), which is what made a clean vertical read possible: the
- * per-row scatter dropped to 2 px at the top and 7 px at the bottom, against up to
- * 18 px in the previous pass. Measured against 544/18:
- *
- *     sent y=0   -> landed -10.0        sent y=479 -> landed 492.0
- *
- * The middle row was left unadjusted, and the two-point fit
- * landed = 1.04802*y - 10 predicts only +1.5 px of error there - so "untouched"
- * is corroboration here, not a gap. Solving back gives range 570.1 / offset 28.9;
- * 570/29 holds the full 0-479 sweep to 1.35 px.
- *
- * Superseded values, for reference: 510 (3.0.2's 480/600 guess, ~37 px low at the
- * bottom), 638 (3.0.3's no-scaling cut, ~72 px high), 544 (first measured pass,
- * ~13 px low at the bottom).
- *
- * CAVEAT - these constants describe this daemon PLUS Eva's own ADC->pixel step,
- * and Eva's half depends on sm_aucTouchPanelMargin, which Global > Touch Panel
- * Calibration rewrites (see
- * kronosology/docs/hardware/nautilus_touch_calibration.md). Re-running that
- * on-device calibration changes the mapping and invalidates these numbers; the
- * screenremote.cfg overrides exist for exactly that case. */
+/* Nautilus VERTICAL touch constants. See TechCodeManual §2 for calibration
+ * methodology, physical mismatch reasons, and caveats about Eva's calibration
+ * affecting these values. Overridable via screenremote.cfg on per-unit basis. */
 #define NAUTILUS_TOUCH_Y_RANGE   570
 #define NAUTILUS_TOUCH_Y_OFFSET   29
 /* Set once read_config() has seen an explicit touch_y_range= / touch_y_offset=
@@ -509,15 +356,9 @@ static int g_touch_y_range_from_config  = 0;
 static int g_touch_y_offset_from_config = 0;
 
 /* Pad-tap detection: touch (x,y) in framebuffer pixel space -> PADCHORD.
- * Regions calibrated 2026-07-14 against real hardware: 32 corner taps (4 per
- * pad) captured live with LASTTOUCH via tools/pad_calibration_monitor.py,
- * then quantized to 8 uniform 94x335 boxes via linear regression on the pad
- * centers (raw click widths varied 88-97px from click imprecision; centers
- * fit a clean line, spacing ~99.8px, ~6px gaps between pads) rather than
- * used as-is. All 8 pads share one row (Y range is constant, only X
- * varies), in on-screen left-to-right order matching PADCHORD's pad_index.
- * Detection still stays off by default (g_padmap_enabled=0) - flip
- * PADMAP_ON once ready. See docs/api.md's PADMAP section. */
+ * Regions derived via linear regression on calibration data, quantized to
+ * 8 uniform boxes. All 8 pads share one row (Y constant, X varies) in
+ * left-to-right order matching PADCHORD's pad_index. Detection defaults off. */
 #define NUM_PAD_REGIONS 8
 struct pad_region { int x0, y0, x1, y1; };
 static struct pad_region g_pad_regions[NUM_PAD_REGIONS] = {
@@ -533,10 +374,8 @@ static struct timespec g_chord_down_time;  /* when g_active_pad's trigger was se
  * sent - see inject_touch()'s pen-up handler for why this exists. */
 #define PADCHORD_MIN_HOLD_MS 80
 /* Backstop (s): force-release a held pad if nothing has released it by hand
- * (overlapping TOUCH_DOWN and PADMAP_OFF already do). Covers the case a
- * client can't: it simply disconnects between TOUCH_DOWN and TOUCH_UP with no
- * further command ever arriving, which would otherwise strand a chord
- * sounding forever (found 2026-07-16, see the main loop's watchdog check). */
+ * (overlapping TOUCH_DOWN and PADMAP_OFF already do). Prevents stranding a
+ * chord indefinitely when a client disconnects between TOUCH_DOWN and TOUCH_UP. */
 #define PADCHORD_MAX_HOLD_S 10
 static int g_last_touch_x = -1, g_last_touch_y = -1;   /* for LASTTOUCH calibration query */
 /* Diagnostic trail of the last type==1 (pen-down) gate evaluation, for

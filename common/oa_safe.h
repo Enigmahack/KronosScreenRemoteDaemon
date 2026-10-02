@@ -2,14 +2,11 @@
  * oa_safe.h - shared fault-safe accessors for OA-owned kernel memory.
  *
  * nks4_inject.ko and midi_bridge.ko both read/write memory whose lifetime
- * they don't control (OA.ko's .text, and codec-owned ring-buffer control
- * structures that OA can free or move during normal operation - e.g. a
- * Program/Combi load's codec-MIDI reconfiguration, with no module unload
- * involved at all). A raw dereference of a since-freed address oopsed on
- * real hardware (2026-07-16, midi_bridge's tap_release_slots -> a
- * plausible-looking but no-longer-mapped t->ringctl). probe_kernel_read/write
- * route every such touch through the kernel's fault exception tables,
- * turning that into a clean failure instead of an oops.
+ * they don't control (OA.ko's .text, codec ring-buffer control structures
+ * that OA can free/move during normal operation). A raw dereference of a
+ * since-freed address causes an oops. probe_kernel_read/write route every
+ * such touch through the kernel's fault exception tables, turning that into
+ * a clean failure instead. See NonCodeTechnicalInfo.md §1 for details.
  *
  * kptr_ok() only rejects obviously-garbage pointers (null, misaligned, out
  * of kernel range) - it cannot tell a plausible pointer from one that's
@@ -17,12 +14,9 @@
  * still goes through probe_kernel_read/write rather than trusting kptr_ok()
  * alone.
  *
- * Was two copies (nks4_inject.c's oa_read8/32/oa_write8/oa_read_ptr,
- * midi_bridge.c's tap_read8/32/readn), byte-identical where they overlapped -
- * merged 2026-09-19 so a future fix to the pointer-plausibility rule lands
- * in both modules at once instead of needing to be found and applied twice.
- * Each module keeps its own call-site names (oa_read8/tap_read8 etc.) as
- * thin macros over these, so nothing at either module's call sites changed.
+ * Originally two copies (nks4_inject.c/midi_bridge.c), merged into this
+ * shared header so fixes land in both modules. Each module uses its own
+ * call-site macro names (oa_read8/tap_read8) over these functions.
  */
 #ifndef OA_SAFE_H
 #define OA_SAFE_H
